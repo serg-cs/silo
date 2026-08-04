@@ -1,0 +1,9 @@
+[package]
+name = "silo"
+version = "0.1.0"
+edition = "2024"
+
+[lints.clippy]
+pedantic = "deny"
+
+[dependencies]
