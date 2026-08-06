@@ -14,8 +14,9 @@ pub const DOCKERFILE: &str = include_str!("silo.dockerfile");
 
 const CONTAINER_BIN: &str = "container";
 
-/// Home directory of the container's default user (root on Alpine).
-const CONTAINER_HOME: &str = "/root";
+/// Home directory of the container's `silo` user; the shared project
+/// directory is mounted into it as `<home>/<project-name>`.
+const CONTAINER_HOME: &str = "/home/silo";
 
 /// Temporary build directory that removes itself on drop, so cleanup also
 /// runs on error paths.
@@ -58,22 +59,30 @@ pub fn build_image() -> Result<ExitCode> {
     execute(&mut build_command(&build_dir.dockerfile(), build_dir.path()))
 }
 
+/// Host user and group ids, forwarded to the container so its `silo` user can
+/// be remapped to them and keep the shared directory writable on both sides.
+struct HostIds {
+    uid: String,
+    gid: String,
+}
+
 /// Runs the container from the built image, replacing this process so that
 /// signals sent to `silo` reach the container and its exit status is passed
 /// through directly.
 ///
 /// # Errors
 ///
-/// Returns an error when the image is not built yet or the container CLI is
-/// missing.
+/// Returns an error when the image is not built yet, the host ids cannot be
+/// determined, or the container CLI is missing.
 pub fn run_image() -> Result<ExitCode> {
     let (exists, stderr) = inspect_image()?;
     if !exists {
         return Err(inspect_error(&stderr));
     }
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    let ids = host_ids()?;
     Err(spawn_error(
-        run_command(std::io::stdin().is_terminal(), &cwd)?.exec(),
+        run_command(std::io::stdin().is_terminal(), &cwd, &ids)?.exec(),
     ))
 }
 
@@ -134,15 +143,43 @@ fn build_command(dockerfile: &Path, context: &Path) -> Command {
     command
 }
 
+/// Returns the host user's uid and gid, forwarded to the container so files
+/// created there are owned by the host user.
+///
+/// # Errors
+///
+/// Returns an error when `id` cannot be run or one of the ids cannot be read.
+fn host_ids() -> Result<HostIds> {
+    Ok(HostIds {
+        uid: id_of("-u")?,
+        gid: id_of("-g")?,
+    })
+}
+
+fn id_of(flag: &str) -> Result<String> {
+    let output = Command::new("id")
+        .arg(flag)
+        .output()
+        .with_context(|| format!("failed to run `id {flag}`"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`id {flag}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Builds the `container run` command that shares the current directory with
-/// the container, mounting it inside the container's home so the shell starts
-/// there with all files reachable.
+/// the container, mounting it inside the `silo` user's home so the shell
+/// starts there with all files reachable, and forwards the host user's ids
+/// for uid remapping.
 ///
 /// # Errors
 ///
 /// Returns an error when the current directory has no name (e.g. `/`) or its
 /// path cannot be expressed in a volume spec.
-fn run_command(interactive: bool, cwd: &Path) -> Result<Command> {
+fn run_command(interactive: bool, cwd: &Path, host_ids: &HostIds) -> Result<Command> {
     let shared_dir = shared_dir_name(cwd)?;
     let host_dir = volume_host_path(cwd)?;
     let mut command = Command::new(CONTAINER_BIN);
@@ -156,6 +193,10 @@ fn run_command(interactive: bool, cwd: &Path) -> Result<Command> {
         .arg(format!("{host_dir}:{}", shared_dir.display()))
         .arg("-w")
         .arg(shared_dir)
+        .arg("--env")
+        .arg(format!("SILO_UID={}", host_ids.uid))
+        .arg("--env")
+        .arg(format!("SILO_GID={}", host_ids.gid))
         .arg(IMAGE_TAG);
     Ok(command)
 }
@@ -179,7 +220,7 @@ fn volume_host_path(cwd: &Path) -> Result<&str> {
 }
 
 /// Returns where the shared directory lands in the container, i.e. the
-/// current directory's last component placed inside the container home.
+/// current directory's last component placed inside the `silo` user's home.
 ///
 /// # Errors
 ///

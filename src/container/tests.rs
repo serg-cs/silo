@@ -2,11 +2,11 @@ use super::*;
 use std::path::Path;
 
 #[test]
-fn dockerfile_embeds_alpine_latest() {
+fn dockerfile_embeds_ubuntu_latest() {
     assert!(
         DOCKERFILE
             .lines()
-            .any(|line| line.trim() == "FROM alpine:latest")
+            .any(|line| line.trim() == "FROM ubuntu:latest")
     );
 }
 
@@ -32,7 +32,11 @@ fn build_command_targets_embedded_dockerfile() {
 
 #[test]
 fn run_command_starts_interactive_shell() {
-    let command = run_command(true, Path::new("/tmp/project")).expect("command builds");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let command = run_command(true, Path::new("/tmp/project"), &ids).expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -45,9 +49,13 @@ fn run_command_starts_interactive_shell() {
             "-i",
             "-t",
             "-v",
-            "/tmp/project:/root/project",
+            "/tmp/project:/home/silo/project",
             "-w",
-            "/root/project",
+            "/home/silo/project",
+            "--env",
+            "SILO_UID=501",
+            "--env",
+            "SILO_GID=20",
             "silo:latest",
         ]
     );
@@ -55,7 +63,11 @@ fn run_command_starts_interactive_shell() {
 
 #[test]
 fn run_command_omits_pty_when_not_interactive() {
-    let command = run_command(false, Path::new("/tmp/project")).expect("command builds");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let command = run_command(false, Path::new("/tmp/project"), &ids).expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -67,9 +79,13 @@ fn run_command_omits_pty_when_not_interactive() {
             "--rm",
             "-i",
             "-v",
-            "/tmp/project:/root/project",
+            "/tmp/project:/home/silo/project",
             "-w",
-            "/root/project",
+            "/home/silo/project",
+            "--env",
+            "SILO_UID=501",
+            "--env",
+            "SILO_GID=20",
             "silo:latest",
         ]
     );
@@ -77,7 +93,11 @@ fn run_command_omits_pty_when_not_interactive() {
 
 #[test]
 fn run_command_places_shared_dir_in_container_home() {
-    let command = run_command(true, Path::new("/home/user/src/silo")).expect("command builds");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let command = run_command(true, Path::new("/home/user/src/silo"), &ids).expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -86,25 +106,33 @@ fn run_command_places_shared_dir_in_container_home() {
         args[
             args.iter().position(|arg| *arg == "-v").expect("volume flag") + 1
         ],
-        "/home/user/src/silo:/root/silo"
+        "/home/user/src/silo:/home/silo/silo"
     );
     assert_eq!(
         args[
             args.iter().position(|arg| *arg == "-w").expect("workdir flag") + 1
         ],
-        "/root/silo"
+        "/home/silo/silo"
     );
 }
 
 #[test]
 fn run_command_rejects_sharing_root() {
-    let err = run_command(true, Path::new("/")).expect_err("root has no name");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let err = run_command(true, Path::new("/"), &ids).expect_err("root has no name");
     assert!(err.to_string().contains("cannot share the root directory"));
 }
 
 #[test]
 fn run_command_rejects_paths_with_colons() {
-    let err = run_command(true, Path::new("/tmp/foo:bar")).expect_err("colon is a separator");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let err = run_command(true, Path::new("/tmp/foo:bar"), &ids).expect_err("colon is a separator");
     assert!(err.to_string().contains("cannot share"));
     assert!(err.to_string().contains("without `:`"));
 }
@@ -115,10 +143,22 @@ fn run_command_rejects_non_utf8_paths() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
     let path = Path::new(OsStr::from_bytes(b"/tmp/bad\xFFdir"));
-    let err = run_command(true, path).expect_err("name is not valid UTF-8");
+    let err = run_command(true, path, &ids).expect_err("name is not valid UTF-8");
     assert!(err.to_string().contains("cannot share"));
     assert!(err.to_string().contains("valid UTF-8"));
+}
+
+#[cfg(unix)]
+#[test]
+fn host_ids_reports_numeric_ids() {
+    let ids = host_ids().expect("host ids resolve");
+    assert!(ids.uid.chars().all(|c| c.is_ascii_digit()));
+    assert!(ids.gid.chars().all(|c| c.is_ascii_digit()));
 }
 
 #[test]
