@@ -14,6 +14,9 @@ pub const DOCKERFILE: &str = include_str!("silo.dockerfile");
 
 const CONTAINER_BIN: &str = "container";
 
+/// Home directory of the container's default user (root on Alpine).
+const CONTAINER_HOME: &str = "/root";
+
 /// Temporary build directory that removes itself on drop, so cleanup also
 /// runs on error paths.
 struct BuildDir(PathBuf);
@@ -68,7 +71,10 @@ pub fn run_image() -> Result<ExitCode> {
     if !exists {
         return Err(inspect_error(&stderr));
     }
-    Err(spawn_error(run_command(std::io::stdin().is_terminal()).exec()))
+    let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    Err(spawn_error(
+        run_command(std::io::stdin().is_terminal(), &cwd)?.exec(),
+    ))
 }
 
 /// Builds the error reported when the image check failed, treating a missing
@@ -128,15 +134,61 @@ fn build_command(dockerfile: &Path, context: &Path) -> Command {
     command
 }
 
-fn run_command(interactive: bool) -> Command {
+/// Builds the `container run` command that shares the current directory with
+/// the container, mounting it inside the container's home so the shell starts
+/// there with all files reachable.
+///
+/// # Errors
+///
+/// Returns an error when the current directory has no name (e.g. `/`) or its
+/// path cannot be expressed in a volume spec.
+fn run_command(interactive: bool, cwd: &Path) -> Result<Command> {
+    let shared_dir = shared_dir_name(cwd)?;
+    let host_dir = volume_host_path(cwd)?;
     let mut command = Command::new(CONTAINER_BIN);
     command.arg("run").arg("--rm").arg("-i");
     if interactive {
         // Allocating a pty without a terminal fails with ENOTTY.
         command.arg("-t");
     }
-    command.arg(IMAGE_TAG);
     command
+        .arg("-v")
+        .arg(format!("{host_dir}:{}", shared_dir.display()))
+        .arg("-w")
+        .arg(shared_dir)
+        .arg(IMAGE_TAG);
+    Ok(command)
+}
+
+/// Returns the host side of the volume spec, rejecting paths the container
+/// CLI cannot parse: `:` separates host and container paths, and the spec is
+/// built with `format!`, so the path must be valid UTF-8.
+///
+/// # Errors
+///
+/// Returns an error when the path is not valid UTF-8 or contains `:`.
+fn volume_host_path(cwd: &Path) -> Result<&str> {
+    cwd.to_str()
+        .filter(|path| !path.contains(':'))
+        .ok_or_else(|| {
+            anyhow!(
+                "cannot share `{}`: the path must be valid UTF-8 without `:`",
+                cwd.display()
+            )
+        })
+}
+
+/// Returns where the shared directory lands in the container, i.e. the
+/// current directory's last component placed inside the container home.
+///
+/// # Errors
+///
+/// Returns an error when the current directory has no name (e.g. `/`).
+fn shared_dir_name(cwd: &Path) -> Result<PathBuf> {
+    let name = cwd
+        .file_name()
+        .ok_or_else(|| anyhow!("cannot share the root directory `{}`", cwd.display()))?;
+    Ok(Path::new(CONTAINER_HOME).join(name))
 }
 
 fn spawn_error(err: io::Error) -> anyhow::Error {

@@ -32,22 +32,93 @@ fn build_command_targets_embedded_dockerfile() {
 
 #[test]
 fn run_command_starts_interactive_shell() {
-    let command = run_command(true);
+    let command = run_command(true, Path::new("/tmp/project")).expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
         .collect();
-    assert_eq!(args, ["run", "--rm", "-i", "-t", "silo:latest"]);
+    assert_eq!(
+        args,
+        [
+            "run",
+            "--rm",
+            "-i",
+            "-t",
+            "-v",
+            "/tmp/project:/root/project",
+            "-w",
+            "/root/project",
+            "silo:latest",
+        ]
+    );
 }
 
 #[test]
 fn run_command_omits_pty_when_not_interactive() {
-    let command = run_command(false);
+    let command = run_command(false, Path::new("/tmp/project")).expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
         .collect();
-    assert_eq!(args, ["run", "--rm", "-i", "silo:latest"]);
+    assert_eq!(
+        args,
+        [
+            "run",
+            "--rm",
+            "-i",
+            "-v",
+            "/tmp/project:/root/project",
+            "-w",
+            "/root/project",
+            "silo:latest",
+        ]
+    );
+}
+
+#[test]
+fn run_command_places_shared_dir_in_container_home() {
+    let command = run_command(true, Path::new("/home/user/src/silo")).expect("command builds");
+    let args: Vec<&str> = command
+        .get_args()
+        .map(|arg| arg.to_str().expect("arg is UTF-8"))
+        .collect();
+    assert_eq!(
+        args[
+            args.iter().position(|arg| *arg == "-v").expect("volume flag") + 1
+        ],
+        "/home/user/src/silo:/root/silo"
+    );
+    assert_eq!(
+        args[
+            args.iter().position(|arg| *arg == "-w").expect("workdir flag") + 1
+        ],
+        "/root/silo"
+    );
+}
+
+#[test]
+fn run_command_rejects_sharing_root() {
+    let err = run_command(true, Path::new("/")).expect_err("root has no name");
+    assert!(err.to_string().contains("cannot share the root directory"));
+}
+
+#[test]
+fn run_command_rejects_paths_with_colons() {
+    let err = run_command(true, Path::new("/tmp/foo:bar")).expect_err("colon is a separator");
+    assert!(err.to_string().contains("cannot share"));
+    assert!(err.to_string().contains("without `:`"));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_command_rejects_non_utf8_paths() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = Path::new(OsStr::from_bytes(b"/tmp/bad\xFFdir"));
+    let err = run_command(true, path).expect_err("name is not valid UTF-8");
+    assert!(err.to_string().contains("cannot share"));
+    assert!(err.to_string().contains("valid UTF-8"));
 }
 
 #[test]
