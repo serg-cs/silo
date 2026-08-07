@@ -20,10 +20,23 @@ use serde::Deserialize;
 const DEFAULT_CONFIG: &str = include_str!("default.toml");
 
 /// User configuration, loaded once at startup and passed to commands.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub image: Image,
+    /// Whether the project's `.git` directory is mounted read-only in the
+    /// container, so tools inside it cannot modify version control state.
+    pub read_only_git: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            image: Image::default(),
+            // Protection on by default; disable it in the config file.
+            read_only_git: true,
+        }
+    }
 }
 
 /// Image settings.

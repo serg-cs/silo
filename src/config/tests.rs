@@ -43,6 +43,31 @@ fn image_section_sets_dockerfile() {
 }
 
 #[test]
+fn read_only_git_is_enabled_by_default() {
+    let config = Config::parse("").expect("empty config parses");
+    assert!(config.read_only_git);
+    assert!(Config::default().read_only_git);
+}
+
+#[test]
+fn read_only_git_can_be_disabled() {
+    let config = Config::parse("read_only_git = false").expect("config parses");
+    assert!(!config.read_only_git);
+}
+
+#[test]
+fn read_only_git_can_be_enabled_explicitly() {
+    let config = Config::parse("read_only_git = true").expect("config parses");
+    assert!(config.read_only_git);
+}
+
+#[test]
+fn default_config_file_matches_builtin_defaults() {
+    let from_file = Config::parse(DEFAULT_CONFIG).expect("default file parses");
+    assert_eq!(from_file.read_only_git, Config::default().read_only_git);
+}
+
+#[test]
 fn unknown_keys_are_ignored() {
     let config = Config::parse("[image]\nfuture_key = 42\n[future]\nsome_setting = \"bar\"")
         .expect("config with unknown keys parses");
@@ -162,4 +187,19 @@ fn run_dir_ignores_relative_xdg_config_home() {
 #[test]
 fn run_dir_returns_none_without_home() {
     assert!(run_dir_from(None, None).is_none());
+}
+
+#[test]
+fn old_config_without_the_key_still_protects() {
+    // A config written before `read_only_git` existed: only `[image]`.
+    let config =
+        Config::parse("[image]\ndockerfile = \"/tmp/Dockerfile\"\n").expect("config parses");
+    assert!(
+        config.read_only_git,
+        "missing key falls back to the default"
+    );
+    assert_eq!(
+        config.image.dockerfile.as_deref(),
+        Some(Path::new("/tmp/Dockerfile"))
+    );
 }

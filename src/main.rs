@@ -42,7 +42,7 @@ fn main() -> ExitCode {
         Command::Image {
             command: ImageCommand::Build,
         } => container::build_image(&config),
-        Command::Run => container::run_image(),
+        Command::Run => container::run_image(&config),
     }
     .unwrap_or_else(|err| fail(&err))
 }

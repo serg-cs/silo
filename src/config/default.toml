@@ -13,3 +13,9 @@
 # Dockerfile that defines the image `silo image build` builds and `silo run`
 # runs. When unset, the built-in silo image is used.
 # dockerfile = "/path/to/your/Dockerfile"
+
+# Mount this project's `.git` directory read-only in the container, so tools
+# inside it cannot modify version control state (history, refs, staging
+# area, config). The directory stays readable; only writes are blocked. Set
+# to false to let tools in the container manage the repository.
+read_only_git = true

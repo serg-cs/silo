@@ -50,6 +50,7 @@ fn run_command_starts_interactive_shell() {
         Path::new("/tmp/project"),
         &ids,
         &RunFiles::default(),
+        None,
         "silo-123",
     )
     .expect("command builds");
@@ -90,6 +91,7 @@ fn run_command_omits_pty_when_not_interactive() {
         Path::new("/tmp/project"),
         &ids,
         &RunFiles::default(),
+        None,
         "silo-123",
     )
     .expect("command builds");
@@ -129,6 +131,7 @@ fn run_command_places_shared_dir_in_container_home() {
         Path::new("/home/user/src/silo"),
         &ids,
         &RunFiles::default(),
+        None,
         "silo-123",
     )
     .expect("command builds");
@@ -160,8 +163,15 @@ fn run_command_rejects_sharing_root() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let err = run_command(true, Path::new("/"), &ids, &RunFiles::default(), "silo-123")
-        .expect_err("root has no name");
+    let err = run_command(
+        true,
+        Path::new("/"),
+        &ids,
+        &RunFiles::default(),
+        None,
+        "silo-123",
+    )
+    .expect_err("root has no name");
     assert!(err.to_string().contains("cannot share the root directory"));
 }
 
@@ -176,6 +186,7 @@ fn run_command_rejects_paths_with_colons() {
         Path::new("/tmp/foo:bar"),
         &ids,
         &RunFiles::default(),
+        None,
         "silo-123",
     )
     .expect_err("colon is a separator");
@@ -194,7 +205,7 @@ fn run_command_rejects_non_utf8_paths() {
         gid: "20".into(),
     };
     let path = Path::new(OsStr::from_bytes(b"/tmp/bad\xFFdir"));
-    let err = run_command(true, path, &ids, &RunFiles::default(), "silo-123")
+    let err = run_command(true, path, &ids, &RunFiles::default(), None, "silo-123")
         .expect_err("name is not valid UTF-8");
     assert!(err.to_string().contains("cannot share"));
     assert!(err.to_string().contains("valid UTF-8"));
@@ -342,6 +353,7 @@ fn run_command_injects_run_files() {
         Path::new("/tmp/project"),
         &ids,
         &run_files,
+        None,
         "silo-123",
     )
     .expect("command builds");
@@ -375,6 +387,107 @@ fn run_command_injects_run_files() {
             "silo:latest",
         ]
     );
+}
+
+/// Returns the `-v` volume specs of the command, in order.
+fn volume_specs(command: &Command) -> Vec<String> {
+    let args: Vec<&str> = command
+        .get_args()
+        .map(|arg| arg.to_str().expect("arg is UTF-8"))
+        .collect();
+    args.windows(2)
+        .filter(|pair| pair[0] == "-v")
+        .map(|pair| pair[1].to_string())
+        .collect()
+}
+
+/// The canonical form of a path, as `git_mount_host` emits it: the tests
+/// must compare against the resolved path, since e.g. macOS `/var` is a
+/// symlink to `/private/var` while `dir.path()` is the lexical path.
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).expect("path resolves")
+}
+
+#[test]
+fn run_command_mounts_git_read_only() {
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let command = run_command(
+        true,
+        Path::new("/tmp/project"),
+        &ids,
+        &RunFiles::default(),
+        Some(Path::new("/tmp/project/.git")),
+        "silo-123",
+    )
+    .expect("command builds");
+    assert_eq!(
+        volume_specs(&command),
+        [
+            "/tmp/project:/home/silo/project",
+            "/tmp/project/.git:/home/silo/project/.git:ro",
+        ]
+    );
+}
+
+#[test]
+fn run_command_omits_git_mount_when_absent() {
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let command = run_command(
+        true,
+        Path::new("/tmp/project"),
+        &ids,
+        &RunFiles::default(),
+        None,
+        "silo-123",
+    )
+    .expect("command builds");
+    assert_eq!(volume_specs(&command), ["/tmp/project:/home/silo/project"]);
+}
+
+#[test]
+fn git_mount_host_returns_canonical_git_when_enabled() {
+    let dir = TestDir::new("git-mount");
+    fs::create_dir_all(dir.path().join(".git")).expect("mkdir succeeds");
+    assert_eq!(
+        git_mount_host(dir.path(), true),
+        Some(canonical(&dir.path().join(".git")))
+    );
+}
+
+#[test]
+fn git_mount_host_disabled_returns_none() {
+    let dir = TestDir::new("git-off");
+    fs::create_dir_all(dir.path().join(".git")).expect("mkdir succeeds");
+    assert!(git_mount_host(dir.path(), false).is_none());
+}
+
+#[test]
+fn git_mount_host_returns_none_without_git() {
+    let dir = TestDir::new("no-git");
+    assert!(git_mount_host(dir.path(), true).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn git_mount_host_skips_git_escaping_the_project() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TestDir::new("git-escape");
+    let outside = std::env::temp_dir().join(format!("silo-test-outside-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&outside);
+    fs::create_dir_all(&outside).expect("mkdir succeeds");
+    symlink(&outside, dir.path().join(".git")).expect("symlink succeeds");
+    assert!(
+        git_mount_host(dir.path(), true).is_none(),
+        "an escaping .git symlink must not become a mount"
+    );
+    let _ = fs::remove_dir_all(&outside);
 }
 
 #[test]

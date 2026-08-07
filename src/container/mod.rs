@@ -80,6 +80,27 @@ struct RunMount {
     dest: PathBuf,
 }
 
+/// Returns the host side of the read-only `.git` mount: the canonical path
+/// of the project's `.git` when the config enables the mount and `.git`
+/// resolves to a real path inside the project. A symlink escaping the
+/// project is not mounted, so no host path outside it becomes visible.
+fn git_mount_host(cwd: &Path, read_only_git: bool) -> Option<PathBuf> {
+    if !read_only_git {
+        return None;
+    }
+    let root = fs::canonicalize(cwd).ok()?;
+    mount_host(&cwd.join(".git"), &root)
+}
+
+/// Returns the canonical path of `path` when it resolves to a real path
+/// inside `root_canonical`, or `None` otherwise (a symlink pointing away
+/// must not become a mount, since the container runtime would mount the
+/// link's target).
+fn mount_host(path: &Path, root_canonical: &Path) -> Option<PathBuf> {
+    let host = fs::canonicalize(path).ok()?;
+    host.starts_with(root_canonical).then_some(host)
+}
+
 impl RunFiles {
     /// Scans the run directory for what to inject at container start: the
     /// `env` file becomes the `--env-file`, and every other top-level entry
@@ -288,14 +309,16 @@ struct HostIds {
 /// passed through. If silo itself is killed hard (e.g. `kill -9`), the
 /// container ID stays marked in the state directory and the next `silo run`
 /// sweeps it. Files and env vars from the run directory
-/// (`~/.config/silo/run`) are injected at start.
+/// (`~/.config/silo/run`) are injected at start, and the project's `.git`
+/// directory is mounted read-only on top of the read-write project mount
+/// when the config enables it.
 ///
 /// # Errors
 ///
 /// Returns an error when the image is not built yet, the host ids cannot be
 /// determined, the run directory cannot be scanned, a signal handler cannot
 /// be installed, or the container CLI is missing.
-pub fn run_image() -> Result<ExitCode> {
+pub fn run_image(config: &Config) -> Result<ExitCode> {
     let (exists, stderr) = inspect_image()?;
     if !exists {
         return Err(inspect_error(&stderr));
@@ -307,7 +330,15 @@ pub fn run_image() -> Result<ExitCode> {
     let id = container_id();
     // Build the command first: it only fails on path validation, before any
     // container exists or a marker is written.
-    let mut command = run_command(std::io::stdin().is_terminal(), &cwd, &ids, &run_files, &id)?;
+    let git_mount = git_mount_host(&cwd, config.read_only_git);
+    let mut command = run_command(
+        std::io::stdin().is_terminal(),
+        &cwd,
+        &ids,
+        &run_files,
+        git_mount.as_deref(),
+        &id,
+    )?;
     sweep_stale_containers();
     register_container(&id);
     // Captured before the child starts, so it holds the pre-raw-mode state.
@@ -684,18 +715,20 @@ fn id_of(flag: &str) -> Result<String> {
 /// the container, mounting it inside the `silo` user's home so the shell
 /// starts there with all files reachable, forwards the host user's ids for
 /// uid remapping, injects the run directory's files and env vars
-/// ([`RunFiles`]), and names the container [`container_id`] so its ID is
-/// known up front for cleanup.
+/// ([`RunFiles`]), mounts the project's `.git` read-only when `git_mount` is
+/// given, and names the container [`container_id`] so its ID is known up
+/// front for cleanup.
 ///
 /// # Errors
 ///
 /// Returns an error when the current directory has no name (e.g. `/`), or
-/// its path or a run mount's path cannot be expressed in a volume spec.
+/// its path or a mount's path cannot be expressed in a volume spec.
 fn run_command(
     interactive: bool,
     cwd: &Path,
     host_ids: &HostIds,
     run_files: &RunFiles,
+    git_mount: Option<&Path>,
     id: &str,
 ) -> Result<Command> {
     let shared_dir = shared_dir_name(cwd)?;
@@ -715,7 +748,16 @@ fn run_command(
         .arg("-v")
         .arg(format!("{host_dir}:{}", shared_dir.display()))
         .arg("-w")
-        .arg(shared_dir);
+        .arg(&shared_dir);
+    if let Some(host) = git_mount {
+        // The project's `.git` is mounted read-only on top of the
+        // read-write project mount, so tools in the container cannot modify
+        // version control state.
+        let host = mount_host_path(host)?;
+        command
+            .arg("-v")
+            .arg(format!("{host}:{}:ro", shared_dir.join(".git").display()));
+    }
     for mount in &run_files.mounts {
         let host = mount_host_path(&mount.host)?;
         command
