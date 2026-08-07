@@ -1,6 +1,13 @@
 # silo configuration.
 #
 # All keys are optional; when a key is absent, the built-in default applies.
+#
+# Files and environment variables injected into every container live in the
+# run directory beside this file (~/.config/silo/run). Its `env` file holds
+# KEY=VALUE entries passed to the container at start, and every other entry
+# is mounted read-only into the container home at the matching path. The
+# directory is created with a commented `env` template on the first `silo
+# run`.
 
 [image]
 # Dockerfile that defines the image `silo image build` builds and `silo run`

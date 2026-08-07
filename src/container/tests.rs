@@ -37,7 +37,7 @@ fn run_command_starts_interactive_shell() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(true, Path::new("/tmp/project"), &ids).expect("command builds");
+    let command = run_command(true, Path::new("/tmp/project"), &ids, &RunFiles::default()).expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -68,7 +68,7 @@ fn run_command_omits_pty_when_not_interactive() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(false, Path::new("/tmp/project"), &ids).expect("command builds");
+    let command = run_command(false, Path::new("/tmp/project"), &ids, &RunFiles::default()).expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -98,7 +98,7 @@ fn run_command_places_shared_dir_in_container_home() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(true, Path::new("/home/user/src/silo"), &ids).expect("command builds");
+    let command = run_command(true, Path::new("/home/user/src/silo"), &ids, &RunFiles::default()).expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -123,7 +123,7 @@ fn run_command_rejects_sharing_root() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let err = run_command(true, Path::new("/"), &ids).expect_err("root has no name");
+    let err = run_command(true, Path::new("/"), &ids, &RunFiles::default()).expect_err("root has no name");
     assert!(err.to_string().contains("cannot share the root directory"));
 }
 
@@ -133,7 +133,7 @@ fn run_command_rejects_paths_with_colons() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let err = run_command(true, Path::new("/tmp/foo:bar"), &ids).expect_err("colon is a separator");
+    let err = run_command(true, Path::new("/tmp/foo:bar"), &ids, &RunFiles::default()).expect_err("colon is a separator");
     assert!(err.to_string().contains("cannot share"));
     assert!(err.to_string().contains("without `:`"));
 }
@@ -149,7 +149,7 @@ fn run_command_rejects_non_utf8_paths() {
         gid: "20".into(),
     };
     let path = Path::new(OsStr::from_bytes(b"/tmp/bad\xFFdir"));
-    let err = run_command(true, path, &ids).expect_err("name is not valid UTF-8");
+    let err = run_command(true, path, &ids, &RunFiles::default()).expect_err("name is not valid UTF-8");
     assert!(err.to_string().contains("cannot share"));
     assert!(err.to_string().contains("valid UTF-8"));
 }
@@ -246,4 +246,210 @@ fn dockerfile_context_resolves_relative_parents() {
 #[test]
 fn dockerfile_context_falls_back_to_current_directory() {
     assert_eq!(dockerfile_context(Path::new("Dockerfile")), Path::new("."));
+}
+
+/// Temporary directory that removes itself on drop, so cleanup also runs on
+/// test failures.
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "silo-container-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("test dir creation succeeds");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn run_command_injects_run_files() {
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let run_files = RunFiles {
+        env_file: Some(PathBuf::from("/home/user/.config/silo/run/env")),
+        mounts: vec![
+            RunMount {
+                host: PathBuf::from("/home/user/.agents"),
+                dest: PathBuf::from("/home/silo/.agents"),
+            },
+            RunMount {
+                host: PathBuf::from("/home/user/.config/opencode"),
+                dest: PathBuf::from("/home/silo/.config/opencode"),
+            },
+        ],
+    };
+    let command = run_command(true, Path::new("/tmp/project"), &ids, &run_files)
+        .expect("command builds");
+    let args: Vec<&str> = command
+        .get_args()
+        .map(|arg| arg.to_str().expect("arg is UTF-8"))
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "run",
+            "--rm",
+            "-i",
+            "-t",
+            "-v",
+            "/tmp/project:/home/silo/project",
+            "-w",
+            "/home/silo/project",
+            "-v",
+            "/home/user/.agents:/home/silo/.agents:ro",
+            "-v",
+            "/home/user/.config/opencode:/home/silo/.config/opencode:ro",
+            "--env-file",
+            "/home/user/.config/silo/run/env",
+            "--env",
+            "SILO_UID=501",
+            "--env",
+            "SILO_GID=20",
+            "silo:latest",
+        ]
+    );
+}
+
+#[test]
+fn discover_returns_empty_for_missing_run_dir() {
+    let dir = TestDir::new("missing");
+    let run_files = RunFiles::discover(&dir.path().join("run")).expect("missing dir is empty");
+    assert_eq!(run_files, RunFiles::default());
+}
+
+#[test]
+fn discover_skips_env_and_collects_mounts() {
+    let dir = TestDir::new("discover");
+    let run_dir = dir.path().join("run");
+    fs::create_dir_all(run_dir.join(".config/opencode")).expect("dir creation succeeds");
+    fs::create_dir_all(run_dir.join(".agents")).expect("dir creation succeeds");
+    fs::write(run_dir.join(".gitconfig"), "[user]\n").expect("write succeeds");
+    fs::write(run_dir.join("README"), "hello\n").expect("write succeeds");
+    fs::write(run_dir.join("env"), "OPENAI_API_KEY=x\n").expect("write succeeds");
+
+    let run_files = RunFiles::discover(&run_dir).expect("discover succeeds");
+    assert_eq!(run_files.env_file, Some(run_dir.join("env")));
+    assert_eq!(
+        run_files.mounts,
+        vec![
+            RunMount {
+                host: fs::canonicalize(run_dir.join(".agents")).expect("host resolves"),
+                dest: PathBuf::from("/home/silo/.agents"),
+            },
+            RunMount {
+                host: fs::canonicalize(run_dir.join(".config")).expect("host resolves"),
+                dest: PathBuf::from("/home/silo/.config"),
+            },
+            RunMount {
+                host: fs::canonicalize(run_dir.join(".gitconfig")).expect("host resolves"),
+                dest: PathBuf::from("/home/silo/.gitconfig"),
+            },
+            RunMount {
+                host: fs::canonicalize(run_dir.join("README")).expect("host resolves"),
+                dest: PathBuf::from("/home/silo/README"),
+            },
+        ]
+    );
+}
+
+#[test]
+fn discover_rejects_directory_named_env() {
+    let dir = TestDir::new("env-dir");
+    let run_dir = dir.path().join("run");
+    fs::create_dir_all(run_dir.join("env")).expect("dir creation succeeds");
+
+    let err = RunFiles::discover(&run_dir).expect_err("env must be a file");
+    assert!(err.to_string().contains("`env`"));
+    assert!(err.to_string().contains("is not a file"));
+}
+
+#[test]
+fn discover_rejects_names_with_colons() {
+    let dir = TestDir::new("colon");
+    let run_dir = dir.path().join("run");
+    fs::create_dir_all(&run_dir).expect("dir creation succeeds");
+    fs::write(run_dir.join("foo:bar"), "x").expect("write succeeds");
+
+    let err = RunFiles::discover(&run_dir).expect_err("colon breaks the volume spec");
+    assert!(err.to_string().contains("cannot mount"));
+    assert!(err.to_string().contains("without `:`"));
+}
+
+#[cfg(unix)]
+#[test]
+fn discover_rejects_non_utf8_names() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = TestDir::new("non-utf8");
+    let run_dir = dir.path().join("run");
+    fs::create_dir_all(&run_dir).expect("dir creation succeeds");
+    fs::write(run_dir.join(OsStr::from_bytes(b".agents\xFF")), "x").expect("write succeeds");
+
+    let err = RunFiles::discover(&run_dir).expect_err("name is not valid UTF-8");
+    assert!(err.to_string().contains("cannot mount"));
+    assert!(err.to_string().contains("valid UTF-8"));
+}
+
+#[cfg(unix)]
+#[test]
+fn discover_resolves_symlinked_entries() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TestDir::new("symlink");
+    let run_dir = dir.path().join("run");
+    let target = dir.path().join("real-agents");
+    fs::create_dir_all(&run_dir).expect("dir creation succeeds");
+    fs::create_dir_all(&target).expect("dir creation succeeds");
+    fs::write(target.join("agent.toml"), "x").expect("write succeeds");
+    symlink(&target, run_dir.join(".agents")).expect("symlink creation succeeds");
+
+    let run_files = RunFiles::discover(&run_dir).expect("discover succeeds");
+    assert_eq!(
+        run_files.mounts,
+        vec![RunMount {
+            host: fs::canonicalize(&target).expect("target canonicalizes"),
+            dest: PathBuf::from("/home/silo/.agents"),
+        }]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn discover_rejects_broken_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TestDir::new("broken-link");
+    let run_dir = dir.path().join("run");
+    fs::create_dir_all(&run_dir).expect("dir creation succeeds");
+    symlink(dir.path().join("missing"), run_dir.join(".agents"))
+        .expect("symlink creation succeeds");
+
+    let err = RunFiles::discover(&run_dir).expect_err("broken symlink errors");
+    assert!(err.to_string().contains(".agents"));
+    assert!(err.to_string().contains("cannot resolve"));
+}
+
+#[test]
+fn discover_rejects_existing_non_directory() {
+    let dir = TestDir::new("not-a-dir");
+    fs::write(dir.path().join("run"), "x").expect("write succeeds");
+
+    let err = RunFiles::discover(&dir.path().join("run")).expect_err("file is not a directory");
+    assert!(err.to_string().contains("is not a directory"));
 }

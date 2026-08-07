@@ -90,17 +90,41 @@ fn config_path() -> Option<PathBuf> {
     )
 }
 
+/// Returns the run directory: `$XDG_CONFIG_HOME/silo/run` when the variable
+/// is set, otherwise `~/.config/silo/run`. Files and env vars placed there
+/// are injected into the container at start (see `silo run`). Returns `None`
+/// when no home directory can be determined.
+pub(crate) fn run_dir() -> Option<PathBuf> {
+    run_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
 /// Pure version of [`config_path`], taking the environment values as
 /// arguments so the resolution rules are testable without mutating the
 /// process environment.
 fn config_path_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    config_dir_from(xdg, home).map(|dir| dir.join("config.toml"))
+}
+
+/// Pure version of [`run_dir`], taking the environment values as arguments
+/// so the resolution rules are testable without mutating the process
+/// environment.
+fn run_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    config_dir_from(xdg, home).map(|dir| dir.join("run"))
+}
+
+/// Shared resolution of the silo config directory, ignoring relative XDG
+/// paths per the XDG spec.
+fn config_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     let base = match xdg {
         // The XDG spec only allows absolute paths; relative values are
         // ignored and the `~/.config` fallback applies.
         Some(dir) if !dir.is_empty() && Path::new(dir).is_absolute() => PathBuf::from(dir),
         _ => PathBuf::from(home?).join(".config"),
     };
-    Some(base.join("silo").join("config.toml"))
+    Some(base.join("silo"))
 }
 
 /// Writes the default config file, warning instead of failing when it cannot

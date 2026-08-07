@@ -128,3 +128,28 @@ fn config_path_ignores_relative_xdg_config_home() {
 fn config_path_returns_none_without_home() {
     assert!(config_path_from(None, None).is_none());
 }
+
+#[test]
+fn run_dir_prefers_xdg_config_home() {
+    let path = run_dir_from(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/user")))
+        .expect("path resolves");
+    assert_eq!(path, Path::new("/xdg/silo/run"));
+}
+
+#[test]
+fn run_dir_falls_back_to_home_config() {
+    let path = run_dir_from(None, Some(OsStr::new("/home/user"))).expect("path resolves");
+    assert_eq!(path, Path::new("/home/user/.config/silo/run"));
+}
+
+#[test]
+fn run_dir_ignores_relative_xdg_config_home() {
+    let path = run_dir_from(Some(OsStr::new("relative/xdg")), Some(OsStr::new("/home/user")))
+        .expect("path resolves");
+    assert_eq!(path, Path::new("/home/user/.config/silo/run"));
+}
+
+#[test]
+fn run_dir_returns_none_without_home() {
+    assert!(run_dir_from(None, None).is_none());
+}
