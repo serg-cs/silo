@@ -1,9 +1,12 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, IsTerminal};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -16,6 +19,18 @@ pub const IMAGE_TAG: &str = "silo:latest";
 pub const DOCKERFILE: &str = include_str!("silo.dockerfile");
 
 const CONTAINER_BIN: &str = "container";
+
+/// Prefix of the `--name` silo passes to `container run`; the container CLI
+/// uses the name as the container ID, so silo knows its container's ID
+/// before the run starts and leftovers are recognizable.
+const CONTAINER_NAME_PREFIX: &str = "silo-";
+
+/// Name of the directory under the config directory holding one marker file
+/// per container silo has started but not yet confirmed removed. The file
+/// name is the container ID, which embeds the pid of the silo that started
+/// it; a marker whose silo is dead means the run was killed and the
+/// container is swept by the next run.
+const CONTAINER_STATE_DIR: &str = "containers";
 
 /// Home directory of the container's `silo` user; the shared project
 /// directory is mounted into it as `<home>/<project-name>`.
@@ -258,27 +273,288 @@ struct HostIds {
     gid: String,
 }
 
-/// Runs the container from the built image, replacing this process so that
-/// signals sent to `silo` reach the container and its exit status is passed
-/// through directly. Files and env vars from the run directory
+/// Runs the container from the built image. `container run --rm` is spawned
+/// as a child instead of replacing this process, so silo outlives it and
+/// always cleans up afterwards: signals (SIGINT, SIGTERM, SIGHUP, SIGQUIT)
+/// are forwarded to the child so the container shuts down, and once the
+/// child exits for any reason the container is force-deleted (killed if
+/// still running), the terminal is restored, and the run's exit status is
+/// passed through. If silo itself is killed hard (e.g. `kill -9`), the
+/// container ID stays marked in the state directory and the next `silo run`
+/// sweeps it. Files and env vars from the run directory
 /// (`~/.config/silo/run`) are injected at start.
 ///
 /// # Errors
 ///
 /// Returns an error when the image is not built yet, the host ids cannot be
-/// determined, the run directory cannot be scanned, or the container CLI is
-/// missing.
+/// determined, the run directory cannot be scanned, a signal handler cannot
+/// be installed, or the container CLI is missing.
 pub fn run_image() -> Result<ExitCode> {
     let (exists, stderr) = inspect_image()?;
     if !exists {
         return Err(inspect_error(&stderr));
     }
+    install_signal_handlers()?;
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
     let ids = host_ids()?;
     let run_files = run_files()?;
-    Err(spawn_error(
-        run_command(std::io::stdin().is_terminal(), &cwd, &ids, &run_files)?.exec(),
+    let id = container_id();
+    // Build the command first: it only fails on path validation, before any
+    // container exists or a marker is written.
+    let mut command = run_command(std::io::stdin().is_terminal(), &cwd, &ids, &run_files, &id)?;
+    sweep_stale_containers();
+    register_container(&id);
+    // Captured before the child starts, so it holds the pre-raw-mode state.
+    let terminal = SavedTerminal::capture();
+    let mut child = command.spawn().map_err(spawn_error)?;
+    let pid = libc::pid_t::try_from(child.id()).expect("child pid fits in pid_t");
+    let status = wait_for_child(&mut child, pid);
+    if let Some(terminal) = &terminal {
+        terminal.restore();
+    }
+    cleanup_container(&id);
+    status.map(exit_code)
+}
+
+/// Returns the ID of this run's container, `<prefix><pid>`. The container
+/// CLI uses the `--name` value as the container ID, so silo knows it before
+/// the run starts and can remove the container afterwards without parsing
+/// any output.
+fn container_id() -> String {
+    format!("{CONTAINER_NAME_PREFIX}{}", std::process::id())
+}
+
+/// Signal received by silo while the container runs, recorded by the
+/// handler and forwarded to the `container run` child. `0` means none.
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// Records the signal for the main loop, which forwards it to the
+/// `container run` child. Only async-signal-safe operations.
+extern "C" fn record_signal(signal: libc::c_int) {
+    PENDING_SIGNAL.store(signal, Ordering::Relaxed);
+}
+
+/// Installs handlers for the signals that should stop the container
+/// (SIGINT, SIGTERM, SIGHUP, SIGQUIT), so silo survives them long enough to
+/// remove the container and restore the terminal after the child exits.
+///
+/// # Errors
+///
+/// Returns an error when a handler cannot be installed.
+fn install_signal_handlers() -> Result<()> {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        // The handler is a plain function pointer; `sighandler_t` is an
+        // integer type on macOS, hence the two-step cast.
+        if unsafe { libc::signal(signal, record_signal as *const () as libc::sighandler_t) }
+            == libc::SIG_ERR
+        {
+            return Err(anyhow!(
+                "failed to install handler for signal {signal}: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Waits for the `container run` child to exit, forwarding any signal
+/// received by silo to the child so the container shuts down. The child
+/// also receives terminal signals directly, being in the same process
+/// group; forwarding a signal the child already handled is a harmless
+/// no-op, and the child's own handlers decide what to do.
+///
+/// # Errors
+///
+/// Returns an error when the child cannot be waited on.
+fn wait_for_child(child: &mut Child, pid: libc::pid_t) -> Result<ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        let signal = PENDING_SIGNAL.swap(0, Ordering::Relaxed);
+        if signal != 0 {
+            // Ignored: the child may have exited between `try_wait` and
+            // here, in which case `kill` fails with ESRCH.
+            unsafe { libc::kill(pid, signal) };
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Terminal state of stdin captured before the container child starts and
+/// restored after it exits. The container CLI puts the terminal into raw
+/// mode while the container runs and does not restore it when it dies from
+/// a signal (e.g. Ctrl+C in interactive mode), so silo restores it itself.
+struct SavedTerminal(libc::termios);
+
+impl SavedTerminal {
+    /// Captures the current terminal state of stdin, or `None` when stdin is
+    /// not a terminal (nothing to restore).
+    fn capture() -> Option<Self> {
+        let mut attrs = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, attrs.as_mut_ptr()) } == 0 {
+            Some(Self(unsafe { attrs.assume_init() }))
+        } else {
+            None
+        }
+    }
+
+    /// Restores the captured terminal state of stdin.
+    fn restore(&self) {
+        // Best effort: restoring the same state twice (the CLI already
+        // restored on a normal exit) is harmless.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const self.0) };
+    }
+}
+
+/// Returns the state directory holding the container markers, derived from
+/// the config directory. `None` when no home directory can be determined.
+fn container_state_dir() -> Option<PathBuf> {
+    container_state_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Pure version of [`container_state_dir`], taking the environment values
+/// as arguments so the resolution rules are testable without mutating the
+/// process environment.
+fn container_state_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    crate::config::config_dir_from(xdg, home).map(|dir| dir.join(CONTAINER_STATE_DIR))
+}
+
+/// Records this run's container ID in the state directory before the child
+/// starts, so a silo killed hard (e.g. `kill -9`) leaves a marker the next
+/// run sweeps. Best effort: a warning is printed instead of failing the
+/// run.
+fn register_container(id: &str) {
+    let Some(dir) = container_state_dir() else {
+        return;
+    };
+    if let Err(err) = register_container_in(&dir, id) {
+        eprintln!(
+            "warning: could not record container `{id}` at `{}`: {err:#}",
+            dir.join(id).display()
+        );
+    }
+}
+
+/// Writes the marker file for container `id` into `dir`.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be created or the marker
+/// cannot be written.
+fn register_container_in(dir: &Path, id: &str) -> Result<()> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create state dir `{}`", dir.display()))?;
+    fs::write(dir.join(id), format!("{id}\n"))
+        .with_context(|| format!("failed to write marker for container `{id}`"))
+}
+
+/// Removes the state marker of a container that is confirmed gone.
+fn unregister_container(id: &str) {
+    if let Some(dir) = container_state_dir() {
+        unregister_container_in(&dir, id);
+    }
+}
+
+/// Removes the marker file for container `id` from `dir`, if present.
+fn unregister_container_in(dir: &Path, id: &str) {
+    let _ = fs::remove_file(dir.join(id));
+}
+
+/// Force-deletes containers left behind by silo runs that died before
+/// cleaning up (killed, crashed): every marked container whose silo process
+/// is no longer alive. Containers of concurrent, still-running silo
+/// sessions are left alone (their marker's pid is alive). Markers are
+/// removed once their container is gone.
+fn sweep_stale_containers() {
+    let Some(dir) = container_state_dir() else {
+        return;
+    };
+    sweep_stale_in(&dir, delete_container);
+}
+
+/// Pure version of [`sweep_stale_containers`], taking the state directory
+/// and the delete operation so the sweep logic is testable without a
+/// container CLI.
+fn sweep_stale_in(dir: &Path, mut delete: impl FnMut(&str) -> Result<()>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let id = entry.file_name();
+        let Some(id) = id.to_str() else {
+            continue;
+        };
+        let Some(pid) = id
+            .strip_prefix(CONTAINER_NAME_PREFIX)
+            .and_then(|rest| rest.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        if owner_alive(pid) {
+            continue;
+        }
+        match delete(id) {
+            Ok(()) => unregister_container_in(dir, id),
+            Err(err) => eprintln!("warning: could not remove stale container `{id}`: {err:#}"),
+        }
+    }
+}
+
+/// Returns whether the process `pid` is alive, i.e. the silo that started
+/// the container is still running and its container must not be touched.
+fn owner_alive(pid: libc::pid_t) -> bool {
+    // Signal 0 only checks for existence; no signal is delivered.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    // The process exists but belongs to another user.
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Returns whether the `container delete` result means the container is
+/// gone: a successful exit, or a failure because it was already removed
+/// ("not found"), which is the normal case after `--rm` cleaned up.
+fn delete_succeeded(status: ExitStatus, stderr: &str) -> bool {
+    status.success() || stderr.to_lowercase().contains("not found")
+}
+
+/// Force-deletes the container `id`, killing it first if it is still
+/// running. A container that is already gone ("not found") counts as
+/// success, since `--rm` normally removes the container when it exits.
+///
+/// # Errors
+///
+/// Returns an error when the container CLI is missing or deletion fails.
+fn delete_container(id: &str) -> Result<()> {
+    let output = Command::new(CONTAINER_BIN)
+        .args(["delete", "--force", id])
+        .output()
+        .map_err(spawn_error)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if delete_succeeded(output.status, &stderr) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "`{CONTAINER_BIN} delete --force {id}` failed: {}",
+        stderr.trim()
     ))
+}
+
+/// Removes this run's container after the `container run` child has exited,
+/// whatever the reason, and forgets its ID once it is gone. `--rm` already
+/// removes the container on a normal exit, so this is a safety net for runs
+/// killed or crashed; a leftover stays marked and is swept by the next run.
+fn cleanup_container(id: &str) {
+    match delete_container(id) {
+        Ok(()) => unregister_container(id),
+        Err(err) => eprintln!(
+            "warning: could not remove container `{id}`: {err:#} (it will be removed at the next `silo run`)"
+        ),
+    }
 }
 
 /// Discovers the run directory contents to inject into the container,
@@ -401,8 +677,9 @@ fn id_of(flag: &str) -> Result<String> {
 /// Builds the `container run` command that shares the current directory with
 /// the container, mounting it inside the `silo` user's home so the shell
 /// starts there with all files reachable, forwards the host user's ids for
-/// uid remapping, and injects the run directory's files and env vars
-/// ([`RunFiles`]).
+/// uid remapping, injects the run directory's files and env vars
+/// ([`RunFiles`]), and names the container [`container_id`] so its ID is
+/// known up front for cleanup.
 ///
 /// # Errors
 ///
@@ -413,11 +690,12 @@ fn run_command(
     cwd: &Path,
     host_ids: &HostIds,
     run_files: &RunFiles,
+    id: &str,
 ) -> Result<Command> {
     let shared_dir = shared_dir_name(cwd)?;
     let host_dir = volume_host_path(cwd)?;
     let mut command = Command::new(CONTAINER_BIN);
-    command.arg("run").arg("--rm").arg("-i");
+    command.arg("run").arg("--name").arg(id).arg("--rm").arg("-i");
     if interactive {
         // Allocating a pty without a terminal fails with ENOTTY.
         command.arg("-t");

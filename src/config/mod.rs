@@ -80,22 +80,22 @@ impl Config {
     }
 }
 
-/// Returns the config file path: `$XDG_CONFIG_HOME/silo/config.toml` when the
-/// variable is set, otherwise `~/.config/silo/config.toml`. Returns `None`
-/// when no home directory can be determined.
-fn config_path() -> Option<PathBuf> {
-    config_path_from(
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    )
-}
-
 /// Returns the run directory: `$XDG_CONFIG_HOME/silo/run` when the variable
 /// is set, otherwise `~/.config/silo/run`. Files and env vars placed there
 /// are injected into the container at start (see `silo run`). Returns `None`
 /// when no home directory can be determined.
 pub(crate) fn run_dir() -> Option<PathBuf> {
     run_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Returns the config file path: `$XDG_CONFIG_HOME/silo/config.toml` when the
+/// variable is set, otherwise `~/.config/silo/config.toml`. Returns `None`
+/// when no home directory can be determined.
+fn config_path() -> Option<PathBuf> {
+    config_path_from(
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
@@ -115,9 +115,10 @@ fn run_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     config_dir_from(xdg, home).map(|dir| dir.join("run"))
 }
 
-/// Shared resolution of the silo config directory, ignoring relative XDG
-/// paths per the XDG spec.
-fn config_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+/// Pure version of the config directory resolution, taking the environment
+/// values as arguments so the rules are testable without mutating the
+/// process environment. Ignores relative XDG paths per the XDG spec.
+pub(crate) fn config_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     let base = match xdg {
         // The XDG spec only allows absolute paths; relative values are
         // ignored and the `~/.config` fallback applies.

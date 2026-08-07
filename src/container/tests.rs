@@ -37,7 +37,8 @@ fn run_command_starts_interactive_shell() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(true, Path::new("/tmp/project"), &ids, &RunFiles::default()).expect("command builds");
+    let command = run_command(true, Path::new("/tmp/project"), &ids, &RunFiles::default(), "silo-123")
+        .expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -46,6 +47,8 @@ fn run_command_starts_interactive_shell() {
         args,
         [
             "run",
+            "--name",
+            "silo-123",
             "--rm",
             "-i",
             "-t",
@@ -68,7 +71,8 @@ fn run_command_omits_pty_when_not_interactive() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(false, Path::new("/tmp/project"), &ids, &RunFiles::default()).expect("command builds");
+    let command = run_command(false, Path::new("/tmp/project"), &ids, &RunFiles::default(), "silo-123")
+        .expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -77,6 +81,8 @@ fn run_command_omits_pty_when_not_interactive() {
         args,
         [
             "run",
+            "--name",
+            "silo-123",
             "--rm",
             "-i",
             "-v",
@@ -98,7 +104,8 @@ fn run_command_places_shared_dir_in_container_home() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(true, Path::new("/home/user/src/silo"), &ids, &RunFiles::default()).expect("command builds");
+    let command = run_command(true, Path::new("/home/user/src/silo"), &ids, &RunFiles::default(), "silo-123")
+        .expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -123,7 +130,8 @@ fn run_command_rejects_sharing_root() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let err = run_command(true, Path::new("/"), &ids, &RunFiles::default()).expect_err("root has no name");
+    let err = run_command(true, Path::new("/"), &ids, &RunFiles::default(), "silo-123")
+        .expect_err("root has no name");
     assert!(err.to_string().contains("cannot share the root directory"));
 }
 
@@ -133,7 +141,8 @@ fn run_command_rejects_paths_with_colons() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let err = run_command(true, Path::new("/tmp/foo:bar"), &ids, &RunFiles::default()).expect_err("colon is a separator");
+    let err = run_command(true, Path::new("/tmp/foo:bar"), &ids, &RunFiles::default(), "silo-123")
+        .expect_err("colon is a separator");
     assert!(err.to_string().contains("cannot share"));
     assert!(err.to_string().contains("without `:`"));
 }
@@ -149,7 +158,8 @@ fn run_command_rejects_non_utf8_paths() {
         gid: "20".into(),
     };
     let path = Path::new(OsStr::from_bytes(b"/tmp/bad\xFFdir"));
-    let err = run_command(true, path, &ids, &RunFiles::default()).expect_err("name is not valid UTF-8");
+    let err = run_command(true, path, &ids, &RunFiles::default(), "silo-123")
+        .expect_err("name is not valid UTF-8");
     assert!(err.to_string().contains("cannot share"));
     assert!(err.to_string().contains("valid UTF-8"));
 }
@@ -293,7 +303,7 @@ fn run_command_injects_run_files() {
             },
         ],
     };
-    let command = run_command(true, Path::new("/tmp/project"), &ids, &run_files)
+    let command = run_command(true, Path::new("/tmp/project"), &ids, &run_files, "silo-123")
         .expect("command builds");
     let args: Vec<&str> = command
         .get_args()
@@ -303,6 +313,8 @@ fn run_command_injects_run_files() {
         args,
         [
             "run",
+            "--name",
+            "silo-123",
             "--rm",
             "-i",
             "-t",
@@ -452,4 +464,114 @@ fn discover_rejects_existing_non_directory() {
 
     let err = RunFiles::discover(&dir.path().join("run")).expect_err("file is not a directory");
     assert!(err.to_string().contains("is not a directory"));
+}
+
+#[test]
+fn container_id_embeds_the_pid() {
+    assert_eq!(container_id(), format!("silo-{}", std::process::id()));
+}
+
+#[test]
+fn container_id_starts_with_the_prefix() {
+    assert!(container_id().starts_with(CONTAINER_NAME_PREFIX));
+}
+
+#[test]
+fn state_dir_follows_the_config_dir() {
+    assert_eq!(
+        container_state_dir_from(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/user"))),
+        Some(PathBuf::from("/xdg/silo/containers"))
+    );
+    assert_eq!(
+        container_state_dir_from(None, Some(OsStr::new("/home/user"))),
+        Some(PathBuf::from("/home/user/.config/silo/containers"))
+    );
+    assert_eq!(container_state_dir_from(None, None), None);
+}
+
+#[test]
+fn register_and_unregister_markers() {
+    let dir = TestDir::new("markers");
+    register_container_in(dir.path(), "silo-123").expect("register succeeds");
+    assert!(dir.path().join("silo-123").is_file());
+    unregister_container_in(dir.path(), "silo-123");
+    assert!(!dir.path().join("silo-123").exists());
+}
+
+#[test]
+fn owner_alive_detects_live_processes() {
+    let pid = libc::pid_t::try_from(std::process::id()).expect("pid fits in pid_t");
+    assert!(owner_alive(pid));
+}
+
+#[test]
+fn owner_alive_detects_dead_processes() {
+    let mut child = Command::new("true").spawn().expect("spawn succeeds");
+    let pid = libc::pid_t::try_from(child.id()).expect("pid fits in pid_t");
+    child.wait().expect("wait succeeds");
+    assert!(!owner_alive(pid));
+}
+
+#[test]
+fn sweep_removes_markers_of_dead_owners_only() {
+    let dir = TestDir::new("sweep");
+    // Live owner (this process): its container must be left alone.
+    let live = format!("silo-{}", std::process::id());
+    register_container_in(dir.path(), &live).expect("register succeeds");
+    // Dead owner: its container must be swept.
+    let mut child = Command::new("true").spawn().expect("spawn succeeds");
+    let dead_pid = child.id();
+    child.wait().expect("wait succeeds");
+    let dead = format!("silo-{dead_pid}");
+    register_container_in(dir.path(), &dead).expect("register succeeds");
+    // Foreign marker: must be ignored.
+    fs::write(dir.path().join("other"), "x").expect("write succeeds");
+    // Malformed silo marker: must be ignored.
+    fs::write(dir.path().join("silo-not-a-pid"), "x").expect("write succeeds");
+
+    let mut deleted = Vec::new();
+    sweep_stale_in(dir.path(), |id| {
+        deleted.push(id.to_string());
+        Ok(())
+    });
+
+    assert_eq!(deleted, vec![dead.clone()]);
+    assert!(dir.path().join(&live).exists());
+    assert!(!dir.path().join(&dead).exists());
+    assert!(dir.path().join("other").exists());
+    assert!(dir.path().join("silo-not-a-pid").exists());
+}
+
+#[test]
+fn sweep_keeps_markers_when_delete_fails() {
+    let dir = TestDir::new("sweep-fail");
+    let mut child = Command::new("true").spawn().expect("spawn succeeds");
+    let dead_pid = child.id();
+    child.wait().expect("wait succeeds");
+    let dead = format!("silo-{dead_pid}");
+    register_container_in(dir.path(), &dead).expect("register succeeds");
+
+    sweep_stale_in(dir.path(), |_| Err(anyhow!("delete failed")));
+
+    assert!(dir.path().join(&dead).exists());
+}
+
+#[test]
+fn delete_succeeded_accepts_success() {
+    let status = Command::new("true").status().expect("true runs");
+    assert!(delete_succeeded(status, ""));
+}
+
+#[test]
+fn delete_succeeded_accepts_not_found() {
+    let status = Command::new("false").status().expect("false runs");
+    let stderr = "error: container with ID silo-123 not found";
+    assert!(delete_succeeded(status, stderr));
+}
+
+#[test]
+fn delete_succeeded_rejects_other_failures() {
+    let status = Command::new("false").status().expect("false runs");
+    let stderr = "error: container silo-123 is running and can not be deleted";
+    assert!(!delete_succeeded(status, stderr));
 }
