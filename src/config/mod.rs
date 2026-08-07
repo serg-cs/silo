@@ -8,11 +8,12 @@
 //! resulting [`Config`] is passed down, so flags can override later without a
 //! refactor.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 /// Contents of a freshly created config file; every key is documented there,
@@ -27,6 +28,11 @@ pub struct Config {
     /// Whether the project's `.git` directory is mounted read-only in the
     /// container, so tools inside it cannot modify version control state.
     pub read_only_git: bool,
+    /// Quick commands: `silo <name>` runs this command inside the container
+    /// without typing `silo run --` every time. The key is what you type;
+    /// the value is the command (and any fixed arguments) executed inside
+    /// the container. Extra arguments from the invocation are appended.
+    pub quick: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Config {
@@ -35,6 +41,7 @@ impl Default for Config {
             image: Image::default(),
             // Protection on by default; disable it in the config file.
             read_only_git: true,
+            quick: BTreeMap::new(),
         }
     }
 }
@@ -89,6 +96,46 @@ impl Config {
     /// config schema; the error includes the offending line and column.
     pub fn parse(text: &str) -> Result<Self> {
         Ok(toml::from_str(text)?)
+    }
+
+    /// Returns an error when a quick command name can never be reached: a
+    /// name colliding with one of the project's built-in subcommand names
+    /// (the built-in command always wins when the user types it), or a name
+    /// starting with `-` (silo reserves flag-shaped tokens for the CLI's own
+    /// options). Such a name is unreachable, so the caller reports it as a
+    /// warning instead of failing the invocation.
+    ///
+    /// `builtins` is the project's actual command set, supplied by the CLI
+    /// layer (which enumerates it from the command definitions), so the
+    /// built-in check stays in sync with the commands the project defines
+    /// instead of hardcoding a list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing every unusable quick command name.
+    pub fn check_quick_names<S: AsRef<str>>(&self, builtins: &[S]) -> Result<()> {
+        let mut problems: Vec<String> = Vec::new();
+        for name in self.quick.keys() {
+            if name.starts_with('-') {
+                problems.push(format!(
+                    "`{name}` starts with `-`, which silo reserves for its own options"
+                ));
+            } else if builtins
+                .iter()
+                .any(|builtin| builtin.as_ref() == name.as_str())
+            {
+                problems.push(format!("`{name}` is shadowed by a built-in command"));
+            }
+        }
+        if problems.is_empty() {
+            return Ok(());
+        }
+        let noun = if problems.len() == 1 { "name" } else { "names" };
+        let pronoun = if problems.len() == 1 { "it" } else { "them" };
+        Err(anyhow!(
+            "unusable quick command {noun}: {}; rename {pronoun} in the `[quick]` section of the config file",
+            problems.join("; ")
+        ))
     }
 }
 

@@ -203,3 +203,63 @@ fn old_config_without_the_key_still_protects() {
         Some(Path::new("/tmp/Dockerfile"))
     );
 }
+
+#[test]
+fn quick_defaults_to_empty() {
+    // A config written before `quick` existed has no quick commands.
+    let config = Config::parse("[image]\n").expect("config parses");
+    assert!(config.quick.is_empty());
+}
+
+#[test]
+fn quick_parses_names_to_commands() {
+    let config =
+        Config::parse("[quick]\ncodex = [\"codex\"]\ncx = [\"codex\", \"--model\", \"compact\"]\n")
+            .expect("config parses");
+    assert_eq!(config.quick["codex"], ["codex"]);
+    assert_eq!(config.quick["cx"], ["codex", "--model", "compact"]);
+}
+
+#[test]
+fn quick_rejects_names_shadowed_by_builtins() {
+    let config = Config::parse("[quick]\nrun = [\"bash\"]\n").expect("config parses");
+    let msg = config
+        .check_quick_names(&["run", "image", "help"])
+        .expect_err("`run` collides with the built-in command")
+        .to_string();
+    assert!(msg.contains("`run`"), "names the offender: {msg}");
+    assert!(msg.contains("shadowed"), "explains why: {msg}");
+}
+
+#[test]
+fn quick_lists_every_shadowed_name() {
+    let config =
+        Config::parse("[quick]\nrun = [\"bash\"]\nimage = [\"bash\"]\ncodex = [\"codex\"]\n")
+            .expect("config parses");
+    let msg = config
+        .check_quick_names(&["run", "image", "help"])
+        .expect_err("two names collide")
+        .to_string();
+    assert!(msg.contains("`run`"), "{msg}");
+    assert!(msg.contains("`image`"), "{msg}");
+    assert!(!msg.contains("`codex`"), "non-colliding name stays: {msg}");
+}
+
+#[test]
+fn quick_accepts_names_that_do_not_collide() {
+    let config = Config::parse("[quick]\ncodex = [\"codex\"]\n").expect("config parses");
+    config
+        .check_quick_names(&["run", "image", "help"])
+        .expect("no collision");
+}
+
+#[test]
+fn quick_rejects_flag_shaped_names() {
+    let config = Config::parse("[quick]\n\"-h\" = [\"codex\"]\n").expect("config parses");
+    let msg = config
+        .check_quick_names(&["run", "image", "help"])
+        .expect_err("`-h` collides with the CLI's own options")
+        .to_string();
+    assert!(msg.contains("`-h`"), "{msg}");
+    assert!(msg.contains("starts with `-`"), "{msg}");
+}

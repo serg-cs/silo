@@ -1,4 +1,5 @@
 use super::*;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
@@ -52,6 +53,7 @@ fn run_command_starts_interactive_shell() {
         &RunFiles::default(),
         None,
         "silo-123",
+        &[],
     )
     .expect("command builds");
     let args: Vec<&str> = command
@@ -93,6 +95,7 @@ fn run_command_omits_pty_when_not_interactive() {
         &RunFiles::default(),
         None,
         "silo-123",
+        &[],
     )
     .expect("command builds");
     let args: Vec<&str> = command
@@ -133,6 +136,7 @@ fn run_command_places_shared_dir_in_container_home() {
         &RunFiles::default(),
         None,
         "silo-123",
+        &[],
     )
     .expect("command builds");
     let args: Vec<&str> = command
@@ -170,6 +174,7 @@ fn run_command_rejects_sharing_root() {
         &RunFiles::default(),
         None,
         "silo-123",
+        &[],
     )
     .expect_err("root has no name");
     assert!(err.to_string().contains("cannot share the root directory"));
@@ -188,6 +193,7 @@ fn run_command_rejects_paths_with_colons() {
         &RunFiles::default(),
         None,
         "silo-123",
+        &[],
     )
     .expect_err("colon is a separator");
     assert!(err.to_string().contains("cannot share"));
@@ -205,8 +211,16 @@ fn run_command_rejects_non_utf8_paths() {
         gid: "20".into(),
     };
     let path = Path::new(OsStr::from_bytes(b"/tmp/bad\xFFdir"));
-    let err = run_command(true, path, &ids, &RunFiles::default(), None, "silo-123")
-        .expect_err("name is not valid UTF-8");
+    let err = run_command(
+        true,
+        path,
+        &ids,
+        &RunFiles::default(),
+        None,
+        "silo-123",
+        &[],
+    )
+    .expect_err("name is not valid UTF-8");
     assert!(err.to_string().contains("cannot share"));
     assert!(err.to_string().contains("valid UTF-8"));
 }
@@ -355,6 +369,7 @@ fn run_command_injects_run_files() {
         &run_files,
         None,
         "silo-123",
+        &[],
     )
     .expect("command builds");
     let args: Vec<&str> = command
@@ -385,6 +400,54 @@ fn run_command_injects_run_files() {
             "--env",
             "SILO_GID=20",
             "silo:latest",
+        ]
+    );
+}
+
+#[test]
+fn run_command_appends_the_passed_command() {
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let command = run_command(
+        false,
+        Path::new("/tmp/project"),
+        &ids,
+        &RunFiles::default(),
+        None,
+        "silo-123",
+        &[
+            OsString::from("codex"),
+            OsString::from("--model"),
+            OsString::from("compact"),
+        ],
+    )
+    .expect("command builds");
+    let args: Vec<&str> = command
+        .get_args()
+        .map(|arg| arg.to_str().expect("arg is UTF-8"))
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "run",
+            "--name",
+            "silo-123",
+            "--rm",
+            "-i",
+            "-v",
+            "/tmp/project:/home/silo/project",
+            "-w",
+            "/home/silo/project",
+            "--env",
+            "SILO_UID=501",
+            "--env",
+            "SILO_GID=20",
+            "silo:latest",
+            "codex",
+            "--model",
+            "compact",
         ]
     );
 }
@@ -421,6 +484,7 @@ fn run_command_mounts_git_read_only() {
         &RunFiles::default(),
         Some(Path::new("/tmp/project/.git")),
         "silo-123",
+        &[],
     )
     .expect("command builds");
     assert_eq!(
@@ -445,6 +509,7 @@ fn run_command_omits_git_mount_when_absent() {
         &RunFiles::default(),
         None,
         "silo-123",
+        &[],
     )
     .expect("command builds");
     assert_eq!(volume_specs(&command), ["/tmp/project:/home/silo/project"]);

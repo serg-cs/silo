@@ -19,3 +19,17 @@
 # area, config). The directory stays readable; only writes are blocked. Set
 # to false to let tools in the container manage the repository.
 read_only_git = true
+
+[quick]
+# Quick commands: `silo <name>` runs the command inside the container, like
+# `silo run -- <command>` without the boilerplate. The key is what you type;
+# the value is the command (and any fixed arguments) executed inside the
+# container. Arguments you pass on the command line are appended to it.
+#
+#   codex = ["codex"]
+#   cx    = ["codex", "--model", "compact"]
+#
+# A name must not collide with a built-in command (`run`, `image`, `help`)
+# and must not start with `-`: the built-in command always wins, and flag-
+# shaped tokens are reserved for silo's own options, so such a quick command
+# could never run. Unusable names are reported as a warning when silo runs.

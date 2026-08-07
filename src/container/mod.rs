@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::os::unix::process::ExitStatusExt;
@@ -300,7 +300,8 @@ struct HostIds {
     gid: String,
 }
 
-/// Runs the container from the built image. `container run --rm` is spawned
+/// Runs the container from the built image, executing `command` inside it
+/// (empty runs the default shell). `container run --rm` is spawned
 /// as a child instead of replacing this process, so silo outlives it and
 /// always cleans up afterwards: signals (SIGINT, SIGTERM, SIGHUP, SIGQUIT)
 /// are forwarded to the child so the container shuts down, and once the
@@ -318,7 +319,7 @@ struct HostIds {
 /// Returns an error when the image is not built yet, the host ids cannot be
 /// determined, the run directory cannot be scanned, a signal handler cannot
 /// be installed, or the container CLI is missing.
-pub fn run_image(config: &Config) -> Result<ExitCode> {
+pub fn run_image(config: &Config, command: &[OsString]) -> Result<ExitCode> {
     let (exists, stderr) = inspect_image()?;
     if !exists {
         return Err(inspect_error(&stderr));
@@ -331,19 +332,20 @@ pub fn run_image(config: &Config) -> Result<ExitCode> {
     // Build the command first: it only fails on path validation, before any
     // container exists or a marker is written.
     let git_mount = git_mount_host(&cwd, config.read_only_git);
-    let mut command = run_command(
+    let mut run = run_command(
         std::io::stdin().is_terminal(),
         &cwd,
         &ids,
         &run_files,
         git_mount.as_deref(),
         &id,
+        command,
     )?;
     sweep_stale_containers();
     register_container(&id);
     // Captured before the child starts, so it holds the pre-raw-mode state.
     let terminal = SavedTerminal::capture();
-    let mut child = command.spawn().map_err(spawn_error)?;
+    let mut child = run.spawn().map_err(spawn_error)?;
     let pid = libc::pid_t::try_from(child.id()).expect("child pid fits in pid_t");
     let status = wait_for_child(&mut child, pid);
     if let Some(terminal) = &terminal {
@@ -716,8 +718,9 @@ fn id_of(flag: &str) -> Result<String> {
 /// starts there with all files reachable, forwards the host user's ids for
 /// uid remapping, injects the run directory's files and env vars
 /// ([`RunFiles`]), mounts the project's `.git` read-only when `git_mount` is
-/// given, and names the container [`container_id`] so its ID is known up
-/// front for cleanup.
+/// given, names the container [`container_id`] so its ID is known up
+/// front for cleanup, and runs `command` inside it (empty runs the image's
+/// default command, the shell).
 ///
 /// # Errors
 ///
@@ -730,22 +733,17 @@ fn run_command(
     run_files: &RunFiles,
     git_mount: Option<&Path>,
     id: &str,
+    command: &[OsString],
 ) -> Result<Command> {
     let shared_dir = shared_dir_name(cwd)?;
     let host_dir = volume_host_path(cwd)?;
-    let mut command = Command::new(CONTAINER_BIN);
-    command
-        .arg("run")
-        .arg("--name")
-        .arg(id)
-        .arg("--rm")
-        .arg("-i");
+    let mut run = Command::new(CONTAINER_BIN);
+    run.arg("run").arg("--name").arg(id).arg("--rm").arg("-i");
     if interactive {
         // Allocating a pty without a terminal fails with ENOTTY.
-        command.arg("-t");
+        run.arg("-t");
     }
-    command
-        .arg("-v")
+    run.arg("-v")
         .arg(format!("{host_dir}:{}", shared_dir.display()))
         .arg("-w")
         .arg(&shared_dir);
@@ -754,26 +752,24 @@ fn run_command(
         // read-write project mount, so tools in the container cannot modify
         // version control state.
         let host = mount_host_path(host)?;
-        command
-            .arg("-v")
+        run.arg("-v")
             .arg(format!("{host}:{}:ro", shared_dir.join(".git").display()));
     }
     for mount in &run_files.mounts {
         let host = mount_host_path(&mount.host)?;
-        command
-            .arg("-v")
+        run.arg("-v")
             .arg(format!("{host}:{}:ro", mount.dest.display()));
     }
     if let Some(env_file) = &run_files.env_file {
-        command.arg("--env-file").arg(env_file);
+        run.arg("--env-file").arg(env_file);
     }
-    command
-        .arg("--env")
+    run.arg("--env")
         .arg(format!("SILO_UID={}", host_ids.uid))
         .arg("--env")
         .arg(format!("SILO_GID={}", host_ids.gid))
-        .arg(IMAGE_TAG);
-    Ok(command)
+        .arg(IMAGE_TAG)
+        .args(command);
+    Ok(run)
 }
 
 /// Returns the host side of the shared-directory volume spec, rejecting
