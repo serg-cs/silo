@@ -9,10 +9,8 @@ struct TestDir(PathBuf);
 
 impl TestDir {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "silo-config-test-{}-{name}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("silo-config-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("test dir creation succeeds");
         Self(path)
@@ -37,8 +35,7 @@ fn empty_config_uses_builtin_image() {
 
 #[test]
 fn image_section_sets_dockerfile() {
-    let config =
-        Config::parse("[image]\ndockerfile = \"/tmp/Dockerfile\"").expect("config parses");
+    let config = Config::parse("[image]\ndockerfile = \"/tmp/Dockerfile\"").expect("config parses");
     assert_eq!(
         config.image.dockerfile.as_deref(),
         Some(Path::new("/tmp/Dockerfile"))
@@ -47,10 +44,8 @@ fn image_section_sets_dockerfile() {
 
 #[test]
 fn unknown_keys_are_ignored() {
-    let config = Config::parse(
-        "[image]\nfuture_key = 42\n[future]\nsome_setting = \"bar\"",
-    )
-    .expect("config with unknown keys parses");
+    let config = Config::parse("[image]\nfuture_key = 42\n[future]\nsome_setting = \"bar\"")
+        .expect("config with unknown keys parses");
     assert!(config.image.dockerfile.is_none());
 }
 
@@ -58,8 +53,14 @@ fn unknown_keys_are_ignored() {
 fn invalid_toml_reports_line_and_column() {
     let err = Config::parse("dockerfile =").expect_err("unterminated value is invalid");
     let msg = err.to_string();
-    assert!(msg.contains("line 1"), "error points at the location: {msg}");
-    assert!(msg.contains("column"), "error points at the location: {msg}");
+    assert!(
+        msg.contains("line 1"),
+        "error points at the location: {msg}"
+    );
+    assert!(
+        msg.contains("column"),
+        "error points at the location: {msg}"
+    );
 }
 
 #[test]
@@ -94,7 +95,10 @@ fn load_from_rejects_invalid_config_with_path_and_location() {
     // `{:#}` prints the full chain, including the TOML location from the source.
     let msg = format!("{err:#}");
     assert!(msg.contains(path.to_str().expect("path is UTF-8")));
-    assert!(msg.contains("line 1"), "error points at the location: {msg}");
+    assert!(
+        msg.contains("line 1"),
+        "error points at the location: {msg}"
+    );
 }
 
 #[test]
@@ -119,8 +123,11 @@ fn config_path_ignores_empty_xdg_config_home() {
 
 #[test]
 fn config_path_ignores_relative_xdg_config_home() {
-    let path = config_path_from(Some(OsStr::new("relative/xdg")), Some(OsStr::new("/home/user")))
-        .expect("path resolves");
+    let path = config_path_from(
+        Some(OsStr::new("relative/xdg")),
+        Some(OsStr::new("/home/user")),
+    )
+    .expect("path resolves");
     assert_eq!(path, Path::new("/home/user/.config/silo/config.toml"));
 }
 
@@ -144,8 +151,11 @@ fn run_dir_falls_back_to_home_config() {
 
 #[test]
 fn run_dir_ignores_relative_xdg_config_home() {
-    let path = run_dir_from(Some(OsStr::new("relative/xdg")), Some(OsStr::new("/home/user")))
-        .expect("path resolves");
+    let path = run_dir_from(
+        Some(OsStr::new("relative/xdg")),
+        Some(OsStr::new("/home/user")),
+    )
+    .expect("path resolves");
     assert_eq!(path, Path::new("/home/user/.config/silo/run"));
 }
 

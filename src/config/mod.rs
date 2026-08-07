@@ -65,8 +65,7 @@ impl Config {
         }
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file `{}`", path.display()))?;
-        Self::parse(&text)
-            .with_context(|| format!("invalid config in `{}`", path.display()))
+        Self::parse(&text).with_context(|| format!("invalid config in `{}`", path.display()))
     }
 
     /// Parses the config from TOML text, filling missing keys with defaults.

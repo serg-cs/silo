@@ -27,7 +27,15 @@ fn build_command_targets_embedded_dockerfile() {
     assert_eq!(program, CONTAINER_BIN);
     assert_eq!(
         args,
-        ["build", "--file", "/tmp/Dockerfile", "--tag", "silo:latest", "--pull", "/tmp/context"]
+        [
+            "build",
+            "--file",
+            "/tmp/Dockerfile",
+            "--tag",
+            "silo:latest",
+            "--pull",
+            "/tmp/context"
+        ]
     );
 }
 
@@ -37,8 +45,14 @@ fn run_command_starts_interactive_shell() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(true, Path::new("/tmp/project"), &ids, &RunFiles::default(), "silo-123")
-        .expect("command builds");
+    let command = run_command(
+        true,
+        Path::new("/tmp/project"),
+        &ids,
+        &RunFiles::default(),
+        "silo-123",
+    )
+    .expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -71,8 +85,14 @@ fn run_command_omits_pty_when_not_interactive() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(false, Path::new("/tmp/project"), &ids, &RunFiles::default(), "silo-123")
-        .expect("command builds");
+    let command = run_command(
+        false,
+        Path::new("/tmp/project"),
+        &ids,
+        &RunFiles::default(),
+        "silo-123",
+    )
+    .expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -104,22 +124,32 @@ fn run_command_places_shared_dir_in_container_home() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(true, Path::new("/home/user/src/silo"), &ids, &RunFiles::default(), "silo-123")
-        .expect("command builds");
+    let command = run_command(
+        true,
+        Path::new("/home/user/src/silo"),
+        &ids,
+        &RunFiles::default(),
+        "silo-123",
+    )
+    .expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
         .collect();
     assert_eq!(
-        args[
-            args.iter().position(|arg| *arg == "-v").expect("volume flag") + 1
-        ],
+        args[args
+            .iter()
+            .position(|arg| *arg == "-v")
+            .expect("volume flag")
+            + 1],
         "/home/user/src/silo:/home/silo/silo"
     );
     assert_eq!(
-        args[
-            args.iter().position(|arg| *arg == "-w").expect("workdir flag") + 1
-        ],
+        args[args
+            .iter()
+            .position(|arg| *arg == "-w")
+            .expect("workdir flag")
+            + 1],
         "/home/silo/silo"
     );
 }
@@ -141,8 +171,14 @@ fn run_command_rejects_paths_with_colons() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let err = run_command(true, Path::new("/tmp/foo:bar"), &ids, &RunFiles::default(), "silo-123")
-        .expect_err("colon is a separator");
+    let err = run_command(
+        true,
+        Path::new("/tmp/foo:bar"),
+        &ids,
+        &RunFiles::default(),
+        "silo-123",
+    )
+    .expect_err("colon is a separator");
     assert!(err.to_string().contains("cannot share"));
     assert!(err.to_string().contains("without `:`"));
 }
@@ -264,10 +300,8 @@ struct TestDir(PathBuf);
 
 impl TestDir {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "silo-container-test-{}-{name}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("silo-container-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("test dir creation succeeds");
         Self(path)
@@ -303,8 +337,14 @@ fn run_command_injects_run_files() {
             },
         ],
     };
-    let command = run_command(true, Path::new("/tmp/project"), &ids, &run_files, "silo-123")
-        .expect("command builds");
+    let command = run_command(
+        true,
+        Path::new("/tmp/project"),
+        &ids,
+        &run_files,
+        "silo-123",
+    )
+    .expect("command builds");
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -408,12 +448,8 @@ fn discover_rejects_non_utf8_names() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
-    let dir = TestDir::new("non-utf8");
-    let run_dir = dir.path().join("run");
-    fs::create_dir_all(&run_dir).expect("dir creation succeeds");
-    fs::write(run_dir.join(OsStr::from_bytes(b".agents\xFF")), "x").expect("write succeeds");
-
-    let err = RunFiles::discover(&run_dir).expect_err("name is not valid UTF-8");
+    let name = OsStr::from_bytes(b".agents\xFF");
+    let err = mount_for(Path::new("/tmp"), name).expect_err("name is not valid UTF-8");
     assert!(err.to_string().contains("cannot mount"));
     assert!(err.to_string().contains("valid UTF-8"));
 }

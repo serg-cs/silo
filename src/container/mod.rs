@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use crate::config::Config;
 
@@ -224,11 +224,17 @@ impl Drop for BuildDir {
 pub fn build_image(config: &Config) -> Result<ExitCode> {
     if let Some(dockerfile) = &config.image.dockerfile {
         validate_dockerfile(dockerfile)?;
-        return execute(&mut build_command(dockerfile, dockerfile_context(dockerfile)));
+        return execute(&mut build_command(
+            dockerfile,
+            dockerfile_context(dockerfile),
+        ));
     }
     let build_dir = BuildDir::create()?;
     fs::write(build_dir.dockerfile(), DOCKERFILE).context("failed to write Dockerfile")?;
-    execute(&mut build_command(&build_dir.dockerfile(), build_dir.path()))
+    execute(&mut build_command(
+        &build_dir.dockerfile(),
+        build_dir.path(),
+    ))
 }
 
 /// Checks that a configured Dockerfile path is usable: non-empty, existing,
@@ -695,7 +701,12 @@ fn run_command(
     let shared_dir = shared_dir_name(cwd)?;
     let host_dir = volume_host_path(cwd)?;
     let mut command = Command::new(CONTAINER_BIN);
-    command.arg("run").arg("--name").arg(id).arg("--rm").arg("-i");
+    command
+        .arg("run")
+        .arg("--name")
+        .arg(id)
+        .arg("--rm")
+        .arg("-i");
     if interactive {
         // Allocating a pty without a terminal fails with ENOTTY.
         command.arg("-t");
@@ -741,14 +752,12 @@ fn mount_host_path(path: &Path) -> Result<&str> {
 }
 
 fn spec_host_path<'a>(path: &'a Path, verb: &str) -> Result<&'a str> {
-    path.to_str()
-        .filter(|p| !p.contains(':'))
-        .ok_or_else(|| {
-            anyhow!(
-                "cannot {verb} `{}`: the path must be valid UTF-8 without `:`",
-                path.display()
-            )
-        })
+    path.to_str().filter(|p| !p.contains(':')).ok_or_else(|| {
+        anyhow!(
+            "cannot {verb} `{}`: the path must be valid UTF-8 without `:`",
+            path.display()
+        )
+    })
 }
 
 /// Returns where the shared directory lands in the container, i.e. the
