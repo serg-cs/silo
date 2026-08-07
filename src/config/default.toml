@@ -1,0 +1,8 @@
+# silo configuration.
+#
+# All keys are optional; when a key is absent, the built-in default applies.
+
+[image]
+# Dockerfile that defines the image `silo image build` builds and `silo run`
+# runs. When unset, the built-in silo image is used.
+# dockerfile = "/path/to/your/Dockerfile"

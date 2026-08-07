@@ -1,4 +1,5 @@
 use super::*;
+use std::fs;
 use std::path::Path;
 
 #[test]
@@ -191,4 +192,58 @@ fn build_dir_removes_itself_on_drop() {
     assert!(path.exists());
     drop(build_dir);
     assert!(!path.exists());
+}
+
+#[test]
+fn validate_dockerfile_rejects_empty_paths() {
+    let err = validate_dockerfile(Path::new("")).expect_err("empty path is invalid");
+    assert!(err.to_string().contains("empty"));
+}
+
+#[test]
+fn validate_dockerfile_rejects_missing_paths() {
+    let path = std::env::temp_dir().join(format!("silo-test-missing-{}", std::process::id()));
+    let _ = fs::remove_file(&path);
+    let err = validate_dockerfile(&path).expect_err("missing path is invalid");
+    assert!(err.to_string().contains("does not exist"));
+}
+
+#[test]
+fn validate_dockerfile_rejects_directories() {
+    let path = std::env::temp_dir().join(format!("silo-test-dir-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&path);
+    fs::create_dir_all(&path).expect("test dir creation succeeds");
+    let err = validate_dockerfile(&path).expect_err("directory is not a file");
+    assert!(err.to_string().contains("is not a file"));
+    let _ = fs::remove_dir_all(&path);
+}
+
+#[test]
+fn validate_dockerfile_accepts_regular_files() {
+    let path = std::env::temp_dir().join(format!("silo-test-file-{}", std::process::id()));
+    let _ = fs::remove_file(&path);
+    fs::write(&path, "FROM scratch").expect("write succeeds");
+    validate_dockerfile(&path).expect("regular file is valid");
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn dockerfile_context_uses_the_dockerfile_directory() {
+    assert_eq!(
+        dockerfile_context(Path::new("/home/user/project/Dockerfile")),
+        Path::new("/home/user/project")
+    );
+}
+
+#[test]
+fn dockerfile_context_resolves_relative_parents() {
+    assert_eq!(
+        dockerfile_context(Path::new("images/dev/Dockerfile")),
+        Path::new("images/dev")
+    );
+}
+
+#[test]
+fn dockerfile_context_falls_back_to_current_directory() {
+    assert_eq!(dockerfile_context(Path::new("Dockerfile")), Path::new("."));
 }

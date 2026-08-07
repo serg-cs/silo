@@ -6,6 +6,8 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::config::Config;
+
 /// Name of the image this tool builds and runs.
 pub const IMAGE_TAG: &str = "silo:latest";
 
@@ -47,16 +49,57 @@ impl Drop for BuildDir {
     }
 }
 
-/// Builds the image from the embedded Dockerfile.
+/// Builds the image: the embedded Dockerfile by default, or the Dockerfile
+/// configured in `[image] dockerfile`, which is then the user's own image.
 ///
 /// # Errors
 ///
-/// Returns an error when the container CLI is missing, the Dockerfile cannot
-/// be written, or the build itself fails.
-pub fn build_image() -> Result<ExitCode> {
+/// Returns an error when the configured Dockerfile path is empty, missing or
+/// not a file, when the container CLI is missing, when the Dockerfile cannot
+/// be written, or when the build itself fails.
+pub fn build_image(config: &Config) -> Result<ExitCode> {
+    if let Some(dockerfile) = &config.image.dockerfile {
+        validate_dockerfile(dockerfile)?;
+        return execute(&mut build_command(dockerfile, dockerfile_context(dockerfile)));
+    }
     let build_dir = BuildDir::create()?;
     fs::write(build_dir.dockerfile(), DOCKERFILE).context("failed to write Dockerfile")?;
     execute(&mut build_command(&build_dir.dockerfile(), build_dir.path()))
+}
+
+/// Checks that a configured Dockerfile path is usable: non-empty, existing,
+/// and a regular file (a symlink to one counts as a file).
+///
+/// # Errors
+///
+/// Returns an error when the path is empty, does not exist, or is not a file.
+fn validate_dockerfile(dockerfile: &Path) -> Result<()> {
+    if dockerfile.as_os_str().is_empty() {
+        return Err(anyhow!("image dockerfile path is empty"));
+    }
+    if !dockerfile.exists() {
+        return Err(anyhow!(
+            "image dockerfile `{}` does not exist",
+            dockerfile.display()
+        ));
+    }
+    if !dockerfile.is_file() {
+        return Err(anyhow!(
+            "image dockerfile `{}` is not a file",
+            dockerfile.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Returns the build context for a configured Dockerfile: its own directory,
+/// so relative COPY/ADD paths resolve as the author wrote them. A bare file
+/// name without a directory component falls back to the current directory.
+fn dockerfile_context(dockerfile: &Path) -> &Path {
+    dockerfile
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 /// Host user and group ids, forwarded to the container so its `silo` user can
@@ -122,7 +165,8 @@ fn exit_code(status: ExitStatus) -> ExitCode {
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
         .clamp(0, 255);
-    ExitCode::from(u8::try_from(code).expect("clamped to u8 range"))
+    // `code` is clamped to 0..=255 above, so the conversion never fails.
+    ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
 }
 
 fn build_dir() -> PathBuf {
