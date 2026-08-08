@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::{Permission, Shared};
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
@@ -245,6 +246,255 @@ fn inspect_error_reports_probe_failures() {
     let err = inspect_error("error: container runtime is not running");
     assert!(!err.to_string().contains("not built yet"));
     assert!(err.to_string().contains("runtime is not running"));
+}
+
+#[test]
+fn system_not_started_matches_the_cli_hint() {
+    let stderr = "Error: XPC connection error\n\
+                  Ensure container system service has been started with \
+                  `container system start`.";
+    assert!(system_not_started(stderr), "{stderr}");
+}
+
+#[test]
+fn system_not_started_matches_the_older_wording() {
+    assert!(system_not_started(
+        "error: container system start has not been run"
+    ));
+}
+
+#[test]
+fn system_not_started_ignores_other_failures() {
+    assert!(!system_not_started(
+        "error: container runtime is not running"
+    ));
+    assert!(!system_not_started("Error: image not found: silo:latest"));
+    assert!(!system_not_started(""));
+}
+
+#[test]
+fn run_captured_keeps_stderr_and_status() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "echo to-stderr >&2; exit 3"]);
+    let captured = run_captured(&mut command).expect("command runs");
+    assert_eq!(captured.status.code(), Some(3));
+    assert_eq!(
+        String::from_utf8(captured.stderr).expect("stderr is UTF-8"),
+        "to-stderr\n"
+    );
+}
+
+#[test]
+fn trim_captured_keeps_the_tail() {
+    let mut captured = vec![b'a'; 300 * 1024];
+    captured.extend_from_slice(b"not-started-hint");
+    trim_captured(&mut captured);
+    assert_eq!(captured.len(), 256 * 1024);
+    assert!(captured.ends_with(&b"not-started-hint"[..]));
+    assert!(captured.iter().take(4).all(|&byte| byte == b'a'));
+}
+
+#[test]
+fn trim_captured_leaves_small_output_untouched() {
+    let mut captured = b"small".to_vec();
+    trim_captured(&mut captured);
+    assert_eq!(captured, b"small");
+}
+
+/// Appends one line to `path`; the fake probe/boot closures and the shell
+/// commands in the orchestration tests write here to record event order.
+fn append_log(path: &Path, line: &str) {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("log opens");
+    writeln!(file, "{line}").expect("log writes");
+}
+
+fn read_log(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .map(|text| text.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+const NOT_STARTED_HINT: &str =
+    "Ensure container system service has been started with `container system start`.";
+
+#[test]
+fn execute_build_boots_before_building_when_the_probe_says_not_started() {
+    let dir = TestDir::new("build-boot-first");
+    let log = dir.path().join("log");
+    let log_path = log.display();
+    let boots = Cell::new(0);
+    let mut command = Command::new("sh");
+    command.args(["-c", &format!("echo build >> '{log_path}'")]);
+    let result = execute_build_with(
+        &mut command,
+        || Ok((false, NOT_STARTED_HINT.to_string())),
+        || {
+            boots.set(boots.get() + 1);
+            append_log(&log, "boot");
+            true
+        },
+    )
+    .expect("build runs");
+    assert_eq!(result, ExitCode::from(0));
+    assert_eq!(boots.get(), 1);
+    assert_eq!(read_log(&log), ["boot", "build"]);
+}
+
+#[test]
+fn execute_build_does_not_boot_when_the_probe_says_the_system_is_up() {
+    let dir = TestDir::new("build-no-boot");
+    let log = dir.path().join("log");
+    let log_path = log.display();
+    let boots = Cell::new(0);
+    let mut command = Command::new("sh");
+    command.args(["-c", &format!("echo build >> '{log_path}'")]);
+    let result = execute_build_with(
+        &mut command,
+        || Ok((false, "Error: image not found: silo:latest".to_string())),
+        || {
+            boots.set(boots.get() + 1);
+            true
+        },
+    )
+    .expect("build runs");
+    assert_eq!(result, ExitCode::from(0));
+    assert_eq!(boots.get(), 0);
+    assert_eq!(read_log(&log), ["build"]);
+}
+
+#[test]
+fn execute_build_boots_and_retries_once_when_the_probe_misses() {
+    let dir = TestDir::new("build-retry");
+    let log = dir.path().join("log");
+    let marker = dir.path().join("built");
+    let log_path = log.display();
+    let marker_path = marker.display();
+    let boots = Cell::new(0);
+    // The probe thinks the system is up (the image is simply not found), so
+    // no pre-build boot happens; the build then fails with the not-started
+    // hint, the fallback boots, and the retried build succeeds.
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        &format!(
+            "echo build >> '{log_path}'; \
+         if [ ! -e '{marker_path}' ]; then \
+           touch '{marker_path}'; \
+           echo '{NOT_STARTED_HINT}' >&2; \
+           exit 1; \
+         fi"
+        ),
+    ]);
+    let result = execute_build_with(
+        &mut command,
+        || Ok((false, "Error: image not found: silo:latest".to_string())),
+        || {
+            boots.set(boots.get() + 1);
+            append_log(&log, "boot");
+            true
+        },
+    )
+    .expect("build runs");
+    assert_eq!(result, ExitCode::from(0));
+    assert_eq!(boots.get(), 1);
+    assert_eq!(read_log(&log), ["build", "boot", "build"]);
+}
+
+#[test]
+fn execute_build_passes_through_failures_unrelated_to_the_system() {
+    let boots = Cell::new(0);
+    let mut command = Command::new("sh");
+    command.args(["-c", "echo 'Error: Dockerfile is missing' >&2; exit 2"]);
+    let result = execute_build_with(
+        &mut command,
+        || Ok((false, "Error: image not found: silo:latest".to_string())),
+        || {
+            boots.set(boots.get() + 1);
+            true
+        },
+    )
+    .expect("build runs");
+    assert_eq!(result, ExitCode::from(2));
+    assert_eq!(boots.get(), 0);
+}
+
+#[test]
+fn execute_build_passes_through_the_first_exit_code_when_the_boot_fails() {
+    let boots = Cell::new(0);
+    let mut command = Command::new("sh");
+    command.args(["-c", &format!("echo '{NOT_STARTED_HINT}' >&2; exit 1")]);
+    let result = execute_build_with(
+        &mut command,
+        || Ok((false, "Error: image not found: silo:latest".to_string())),
+        || {
+            boots.set(boots.get() + 1);
+            false
+        },
+    )
+    .expect("build runs");
+    assert_eq!(result, ExitCode::from(1));
+    assert_eq!(boots.get(), 1);
+}
+
+#[test]
+fn inspect_image_boots_and_reprobes_when_the_system_is_not_started() {
+    let probes = Cell::new(0);
+    let boots = Cell::new(0);
+    let (exists, _) = inspect_image_with(
+        || {
+            probes.set(probes.get() + 1);
+            if probes.get() == 1 {
+                Ok((false, NOT_STARTED_HINT.to_string()))
+            } else {
+                Ok((true, String::new()))
+            }
+        },
+        || {
+            boots.set(boots.get() + 1);
+            true
+        },
+    )
+    .expect("probe runs");
+    assert!(exists);
+    assert_eq!(probes.get(), 2);
+    assert_eq!(boots.get(), 1);
+}
+
+#[test]
+fn inspect_image_reports_the_original_stderr_when_the_boot_fails() {
+    let boots = Cell::new(0);
+    let (exists, stderr) = inspect_image_with(
+        || Ok((false, NOT_STARTED_HINT.to_string())),
+        || {
+            boots.set(boots.get() + 1);
+            false
+        },
+    )
+    .expect("probe runs");
+    assert!(!exists);
+    assert_eq!(stderr, NOT_STARTED_HINT);
+    assert_eq!(boots.get(), 1);
+}
+
+#[test]
+fn inspect_image_does_not_boot_when_the_system_is_up() {
+    let boots = Cell::new(0);
+    let (exists, stderr) = inspect_image_with(
+        || Ok((false, "Error: image not found: silo:latest".to_string())),
+        || {
+            boots.set(boots.get() + 1);
+            true
+        },
+    )
+    .expect("probe runs");
+    assert!(!exists);
+    assert_eq!(stderr, "Error: image not found: silo:latest");
+    assert_eq!(boots.get(), 0);
 }
 
 #[cfg(unix)]

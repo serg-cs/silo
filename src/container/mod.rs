@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
@@ -342,6 +342,8 @@ impl Drop for BuildDir {
 
 /// Builds the image: the embedded Dockerfile by default, or the Dockerfile
 /// configured in `[image] dockerfile`, which is then the user's own image.
+/// When the container system has not been started, boots it first so the
+/// build does not fail and get retried for that.
 ///
 /// # Errors
 ///
@@ -351,14 +353,14 @@ impl Drop for BuildDir {
 pub fn build_image(config: &Config) -> Result<ExitCode> {
     if let Some(dockerfile) = &config.image.dockerfile {
         validate_dockerfile(dockerfile)?;
-        return execute(&mut build_command(
+        return execute_build(&mut build_command(
             dockerfile,
             dockerfile_context(dockerfile),
         ));
     }
     let build_dir = BuildDir::create()?;
     fs::write(build_dir.dockerfile(), DOCKERFILE).context("failed to write Dockerfile")?;
-    execute(&mut build_command(
+    execute_build(&mut build_command(
         &build_dir.dockerfile(),
         build_dir.path(),
     ))
@@ -407,7 +409,9 @@ struct HostIds {
 }
 
 /// Runs the container from the built image, executing `command` inside it
-/// (empty runs the default shell). `container run --rm` is spawned
+/// (empty runs the default shell). When the container system has not been
+/// started yet, boots it first with `container system start`. `container
+/// run --rm` is spawned
 /// as a child instead of replacing this process, so silo outlives it and
 /// always cleans up afterwards: signals (SIGINT, SIGTERM, SIGHUP, SIGQUIT)
 /// are forwarded to the child so the container shuts down, and once the
@@ -768,9 +772,51 @@ fn inspect_error(stderr: &str) -> anyhow::Error {
     }
 }
 
+/// Returns whether the container CLI's stderr indicates the container system
+/// (the VM behind the CLI) has not been started. The CLI's own hint is
+/// "Ensure container system service has been started with `container system
+/// start`."; older releases worded it as "container system start has not
+/// been run".
+fn system_not_started(stderr: &str) -> bool {
+    let stderr = stderr.to_lowercase();
+    stderr.contains("container system start")
+        && (stderr.contains("has been started") || stderr.contains("has not been run"))
+}
+
+/// Boots the container system with `container system start`, passing its
+/// output through so the user sees the boot. Returns whether it started
+/// successfully.
+fn start_container_system() -> bool {
+    Command::new(CONTAINER_BIN)
+        .args(["system", "start"])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Runs `container image inspect`, returning whether the image exists and the
-/// probe's stderr (which explains why the check failed, when it did).
+/// probe's stderr (which explains why the check failed, when it did). When
+/// the probe fails because the container system has not been started, boots
+/// it first and probes again once; if the boot fails, the probe's stderr is
+/// reported unchanged so the user still sees the original failure.
 fn inspect_image() -> Result<(bool, String)> {
+    inspect_image_with(probe_image, start_container_system)
+}
+
+/// The probe/boot/reprobe logic behind [`inspect_image`], separated so tests
+/// can substitute fakes for the `container` CLI.
+fn inspect_image_with(
+    probe: impl Fn() -> Result<(bool, String)>,
+    boot: impl Fn() -> bool,
+) -> Result<(bool, String)> {
+    let (exists, stderr) = probe()?;
+    if !exists && system_not_started(&stderr) && boot() {
+        return probe();
+    }
+    Ok((exists, stderr))
+}
+
+/// Runs the raw `container image inspect` probe, without booting anything.
+fn probe_image() -> Result<(bool, String)> {
     let output = Command::new(CONTAINER_BIN)
         .args(["image", "inspect", IMAGE_TAG])
         .stdout(Stdio::null())
@@ -783,6 +829,109 @@ fn inspect_image() -> Result<(bool, String)> {
 fn execute(command: &mut Command) -> Result<ExitCode> {
     let status = command.status().map_err(spawn_error)?;
     Ok(exit_code(status))
+}
+
+/// Runs a build command, booting the container system first when it has not
+/// been started, so the routine first-build case does not fail and get
+/// retried. The system's state is detected with the same probe `silo run`
+/// uses; the boot is best effort, and the build itself reports whatever is
+/// wrong if it fails. The build's stderr is forwarded to silo's stderr
+/// live, so progress and errors stay visible, while a bounded copy of its
+/// tail is kept for inspection: if the build still fails because the system
+/// was not started — the probe missed — the system is booted and the build
+/// retried once.
+///
+/// # Errors
+///
+/// Returns an error when the container CLI is missing.
+fn execute_build(command: &mut Command) -> Result<ExitCode> {
+    execute_build_with(command, probe_image, start_container_system)
+}
+
+/// The probe/boot/retry logic behind [`execute_build`], separated so tests
+/// can substitute fakes for the `container` CLI.
+fn execute_build_with(
+    command: &mut Command,
+    probe: impl Fn() -> Result<(bool, String)>,
+    boot: impl Fn() -> bool,
+) -> Result<ExitCode> {
+    // Boot before building when the probe says the system is not started.
+    // The boot's outcome is deliberately ignored: if it failed, the build
+    // itself fails and reports why, and the retry below boots again.
+    if let Ok((_, stderr)) = probe()
+        && system_not_started(&stderr)
+    {
+        boot();
+    }
+    let captured = run_captured(command)?;
+    if !captured.status.success()
+        && system_not_started(&String::from_utf8_lossy(&captured.stderr))
+        && boot()
+    {
+        // The system is up now; retry with normal stdio. If the boot
+        // failed, the first attempt's error was already shown and its exit
+        // code is passed through below.
+        command.stderr(Stdio::inherit());
+        return execute(command);
+    }
+    Ok(exit_code(captured.status))
+}
+
+/// Result of a command run with [`run_captured`]: the exit status and the
+/// stderr it produced (bounded to a tail large enough to recognize the
+/// not-started hint).
+struct CapturedOutput {
+    status: ExitStatus,
+    stderr: Vec<u8>,
+}
+
+/// Runs `command` with stderr piped, forwarding every chunk to silo's own
+/// stderr as it arrives while keeping a bounded copy of the tail for later
+/// inspection. Only stderr is piped — stdout stays inherited — so reading it
+/// to EOF before waiting cannot deadlock: the child only ever blocks on a
+/// full stderr pipe, which this loop keeps drained.
+///
+/// # Errors
+///
+/// Returns an error when the command cannot be spawned or waited on.
+fn run_captured(command: &mut Command) -> Result<CapturedOutput> {
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(spawn_error)?;
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let mut captured = Vec::new();
+    // `io::stderr()` is line-buffered, so flush after every chunk or
+    // newline-free progress output would not show up as it arrives.
+    let mut out = io::stderr();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = &chunk[..n];
+                let _ = out.write_all(chunk);
+                let _ = out.flush();
+                captured.extend_from_slice(chunk);
+                trim_captured(&mut captured);
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let status = child.wait().map_err(spawn_error)?;
+    Ok(CapturedOutput {
+        status,
+        stderr: captured,
+    })
+}
+
+/// Keeps only the tail of the captured stderr: the retry decision only looks
+/// at the final error text, and a chatty build must not accumulate unbounded
+/// output in memory.
+fn trim_captured(captured: &mut Vec<u8>) {
+    const MAX_CAPTURED_STDERR: usize = 256 * 1024;
+    if captured.len() > MAX_CAPTURED_STDERR {
+        captured.drain(..captured.len() - MAX_CAPTURED_STDERR);
+    }
 }
 
 fn exit_code(status: ExitStatus) -> ExitCode {
