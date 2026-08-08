@@ -263,3 +263,161 @@ fn quick_rejects_flag_shaped_names() {
     assert!(msg.contains("`-h`"), "{msg}");
     assert!(msg.contains("starts with `-`"), "{msg}");
 }
+
+#[test]
+fn shared_default_to_empty() {
+    // A config written before `shared` existed has no shared mounts.
+    let config = Config::parse("[image]\n").expect("config parses");
+    assert!(config.shared.is_empty());
+}
+
+#[test]
+fn shared_parse_source_target_and_permission() {
+    let config = Config::parse(
+        "[[shared]]\n\
+         source = \"~/notes\"\n\
+         target = \"/home/silo/notes\"\n\
+         permission = \"read-write\"\n\
+         [[shared]]\n\
+         source = \"~/.ssh\"\n\
+         target = \"/home/silo/.ssh\"\n\
+         permission = \"read-only\"\n",
+    )
+    .expect("config parses");
+    assert_eq!(config.shared.len(), 2);
+    assert_eq!(config.shared[0].source, PathBuf::from("~/notes"));
+    assert_eq!(config.shared[0].target, PathBuf::from("/home/silo/notes"));
+    assert_eq!(config.shared[0].permission, Permission::ReadWrite);
+    assert_eq!(config.shared[1].source, PathBuf::from("~/.ssh"));
+    assert_eq!(config.shared[1].target, PathBuf::from("/home/silo/.ssh"));
+    assert_eq!(config.shared[1].permission, Permission::ReadOnly);
+}
+
+#[test]
+fn shared_permission_defaults_to_read_only() {
+    let config = Config::parse("[[shared]]\nsource = \"~/notes\"\ntarget = \"/home/silo/notes\"\n")
+        .expect("config parses");
+    assert_eq!(config.shared[0].permission, Permission::ReadOnly);
+}
+
+#[test]
+fn shared_rejects_unknown_permissions() {
+    let config = Config::parse(
+        "[[shared]]\n\
+         source = \"~/notes\"\n\
+         target = \"/home/silo/notes\"\n\
+         permission = \"write\"\n",
+    )
+    .expect_err("unknown permission value is invalid");
+    let msg = config.to_string();
+    assert!(msg.contains("unknown variant"), "{msg}");
+    assert!(msg.contains("read-only"), "{msg}");
+    assert!(msg.contains("read-write"), "{msg}");
+}
+
+#[test]
+fn shared_rejects_boolean_permissions() {
+    let config = Config::parse(
+        "[[shared]]\n\
+         source = \"~/notes\"\n\
+         target = \"/home/silo/notes\"\n\
+         permission = false\n",
+    )
+    .expect_err("a boolean is not a permission");
+    // The error points at the offending line; the exact wording of the type
+    // error belongs to the TOML parser and is not asserted here.
+    assert!(config.to_string().contains("line 4"));
+}
+
+#[test]
+fn shared_reject_relative_sources() {
+    let config = Config::parse("[[shared]]\nsource = \"notes\"\ntarget = \"/home/silo/notes\"\n")
+        .expect_err("relative source is invalid");
+    let msg = config.to_string();
+    assert!(msg.contains("does not start with a bare `~`"), "{msg}");
+    assert!(msg.contains("`~/notes`"), "{msg}");
+}
+
+#[test]
+fn shared_rejects_user_tilde_paths() {
+    // `~user/x` starts with `~` as text but not as a path component;
+    // only a bare `~` is expanded, so such sources must not be mounted
+    // against the working directory.
+    let config = Config::parse(
+        "[[shared]]\n\
+         source = \"~user/notes\"\n\
+         target = \"/home/silo/notes\"\n",
+    )
+    .expect_err("~user source is invalid");
+    let msg = config.to_string();
+    assert!(msg.contains("does not start with a bare `~`"), "{msg}");
+    assert!(msg.contains("`~user` paths are not supported"), "{msg}");
+}
+
+#[test]
+fn shared_accepts_tilde_sources() {
+    let config = Config::parse("[[shared]]\nsource = \"~/notes\"\ntarget = \"/home/silo/notes\"\n")
+        .expect("tilde source is valid");
+    assert_eq!(config.shared[0].source, PathBuf::from("~/notes"));
+}
+
+#[test]
+fn shared_ignores_unknown_keys() {
+    // A config written for a future silo still works: unknown keys in a
+    // shared entry are ignored.
+    let config = Config::parse(
+        "[[shared]]\n\
+         source = \"~/notes\"\n\
+         target = \"/home/silo/notes\"\n\
+         future_key = 42\n",
+    )
+    .expect("unknown key is ignored");
+    assert_eq!(config.shared[0].permission, Permission::ReadOnly);
+}
+
+#[test]
+fn shared_reject_relative_targets() {
+    let config = Config::parse("[[shared]]\nsource = \"~/notes\"\ntarget = \"notes\"\n")
+        .expect_err("relative target is invalid");
+    let msg = config.to_string();
+    assert!(msg.contains("shared entry 1"), "{msg}");
+    assert!(msg.contains("target path is not absolute"), "{msg}");
+}
+
+#[test]
+fn shared_reject_empty_source() {
+    let config = Config::parse("[[shared]]\nsource = \"\"\ntarget = \"/home/silo/notes\"\n")
+        .expect_err("empty source is invalid");
+    let msg = config.to_string();
+    assert!(msg.contains("source path is empty"), "{msg}");
+}
+
+#[test]
+fn shared_reject_empty_target() {
+    let config = Config::parse("[[shared]]\nsource = \"~/notes\"\ntarget = \"\"\n")
+        .expect_err("empty target is invalid");
+    assert!(config.to_string().contains("target path is empty"));
+}
+
+#[test]
+fn shared_reject_colon_paths() {
+    let config =
+        Config::parse("[[shared]]\nsource = \"/tmp/a:b\"\ntarget = \"/home/silo/notes\"\n")
+            .expect_err("colon breaks the volume spec");
+    let msg = config.to_string();
+    assert!(msg.contains("source path contains `:`"), "{msg}");
+}
+
+#[test]
+fn shared_report_every_invalid_entry() {
+    let config = Config::parse(
+        "[[shared]]\nsource = \"~/a\"\ntarget = \"relative\"\n\
+         [[shared]]\nsource = \"~/b\"\ntarget = \"/tmp/c:d\"\n",
+    )
+    .expect_err("both shared entries are invalid");
+    let msg = config.to_string();
+    assert!(msg.contains("shared entry 1"), "{msg}");
+    assert!(msg.contains("shared entry 2"), "{msg}");
+    assert!(msg.contains("not absolute"), "{msg}");
+    assert!(msg.contains("target path contains `:`"), "{msg}");
+}

@@ -7,6 +7,11 @@
 //! no config-mirroring flags yet, but `load` is called once at startup and the
 //! resulting [`Config`] is passed down, so flags can override later without a
 //! refactor.
+//!
+//! On top of the built-in mounts (the shared project directory, the run
+//! directory, and the optional read-only `.git`), the `[[shared]]` section
+//! mounts additional host paths into the container, each read-only or
+//! read-write (see [`Shared`]).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -28,6 +33,10 @@ pub struct Config {
     /// Whether the project's `.git` directory is mounted read-only in the
     /// container, so tools inside it cannot modify version control state.
     pub read_only_git: bool,
+    /// Configurable shared mounts, applied at every `silo run`: each entry
+    /// mounts a path on the host (`source`) into the container at `target`,
+    /// read-only or read-write.
+    pub shared: Vec<Shared>,
     /// Quick commands: `silo <name>` runs this command inside the container
     /// without typing `silo run --` every time. The key is what you type;
     /// the value is the command (and any fixed arguments) executed inside
@@ -41,6 +50,7 @@ impl Default for Config {
             image: Image::default(),
             // Protection on by default; disable it in the config file.
             read_only_git: true,
+            shared: Vec::new(),
             quick: BTreeMap::new(),
         }
     }
@@ -53,6 +63,41 @@ pub struct Image {
     /// Path to a Dockerfile defining a custom image; `None` uses the
     /// built-in image.
     pub dockerfile: Option<PathBuf>,
+}
+
+/// One configurable shared mount: `source` on the host is mounted into the
+/// container at `target`, with the given [`Permission`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct Shared {
+    /// Path on the host to mount: an absolute path, or a `~`-prefixed path
+    /// like `~/notes` (a bare `~` is the home directory itself; expanded at
+    /// `silo run`; `~user` paths are not supported). The path must exist at
+    /// `silo run` or the run fails.
+    pub source: PathBuf,
+    /// Absolute path inside the container where the source is mounted.
+    pub target: PathBuf,
+    /// How the mount may be used inside the container. Defaults to
+    /// [`Permission::ReadOnly`] — protection on by default, like
+    /// `read_only_git`.
+    #[serde(default = "default_permission")]
+    pub permission: Permission,
+}
+
+/// How a shared mount may be used inside the container. An enum rather
+/// than a boolean, so new permissions can be added later without reshaping
+/// the config schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Permission {
+    /// The container can read the source but not modify it.
+    ReadOnly,
+    /// The container can read and modify the source.
+    ReadWrite,
+}
+
+/// Shared mounts are read-only unless the config says otherwise.
+fn default_permission() -> Permission {
+    Permission::ReadOnly
 }
 
 impl Config {
@@ -95,7 +140,9 @@ impl Config {
     /// Returns an error when the text is not valid TOML or does not match the
     /// config schema; the error includes the offending line and column.
     pub fn parse(text: &str) -> Result<Self> {
-        Ok(toml::from_str(text)?)
+        let config: Self = toml::from_str(text)?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Returns an error when a quick command name can never be reached: a
@@ -137,6 +184,72 @@ impl Config {
             problems.join("; ")
         ))
     }
+
+    /// Rejects shared mounts that can never be mounted: an empty source or
+    /// target, a source that is neither absolute nor `~`-prefixed (a
+    /// relative path would resolve against the invocation's working
+    /// directory, and `~user` paths are unsupported, so neither must be
+    /// mounted silently), a target that is
+    /// not an absolute container path, or a path the container CLI cannot
+    /// parse (valid UTF-8 without `:`). Whether the source actually exists
+    /// is checked later at `silo run`, when the entry is resolved against
+    /// the file system, since the file system can change between commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing every invalid entry.
+    fn validate(&self) -> Result<()> {
+        let mut problems: Vec<String> = Vec::new();
+        for (index, entry) in self.shared.iter().enumerate() {
+            let label = format!(
+                "shared entry {} (`{}` -> `{}`)",
+                index + 1,
+                entry.source.display(),
+                entry.target.display()
+            );
+            if entry.source.as_os_str().is_empty() {
+                problems.push(format!("{label}: source path is empty"));
+            } else if !entry.source.is_absolute() && !entry.source.starts_with("~") {
+                problems.push(format!(
+                    "{label}: source path is not absolute and does not start with a bare `~`; use an absolute path or a `~`-prefixed path like `~/notes` (expanded to your home directory; `~user` paths are not supported)"
+                ));
+            } else if let Err(reason) = spec_path(&entry.source) {
+                problems.push(format!("{label}: source {reason}"));
+            }
+            if entry.target.as_os_str().is_empty() {
+                problems.push(format!("{label}: target path is empty"));
+            } else if !entry.target.is_absolute() {
+                problems.push(format!("{label}: target path is not absolute"));
+            } else if let Err(reason) = spec_path(&entry.target) {
+                problems.push(format!("{label}: target {reason}"));
+            }
+        }
+        if problems.is_empty() {
+            return Ok(());
+        }
+        let noun = if problems.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        Err(anyhow!(
+            "invalid shared {noun} in the `[[shared]]` section of the config file: {}",
+            problems.join("; ")
+        ))
+    }
+}
+
+/// Returns `Ok` when `path` can appear in a container volume spec: valid
+/// UTF-8 without `:` (the `:` separates the host and container sides of the
+/// spec).
+fn spec_path(path: &Path) -> Result<()> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| anyhow!("path is not valid UTF-8"))?;
+    if text.contains(':') {
+        return Err(anyhow!("path contains `:`"));
+    }
+    Ok(())
 }
 
 /// Returns the run directory: `$XDG_CONFIG_HOME/silo/run` when the variable

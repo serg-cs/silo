@@ -7,7 +7,7 @@
 # KEY=VALUE entries passed to the container at start, and every other entry
 # is mounted read-only into the container home at the matching path. The
 # directory is created with a commented `env` template on the first `silo
-# run`.
+# run`. Additional bind mounts are configured under [[shared]] below.
 
 [image]
 # Dockerfile that defines the image `silo image build` builds and `silo run`
@@ -19,6 +19,23 @@
 # area, config). The directory stays readable; only writes are blocked. Set
 # to false to let tools in the container manage the repository.
 read_only_git = true
+
+# [[shared]]
+# Shared mounts applied to every container, on top of the project directory
+# and the run directory. Each entry mounts a path on this machine (`source`)
+# into the container at `target`, with a `permission` of `read-only` (the
+# default) or `read-write`:
+#
+#   source = "~/.ssh"             # host path; `~` means your home directory
+#   target = "/home/silo/.ssh"    # absolute path inside the container
+#   permission = "read-only"      # or "read-write" to let tools write through
+#
+# The source must be an absolute path or a `~`-prefixed path like `~/notes`
+# (a bare `~` is your home directory; `~user` paths are not supported), and
+# must exist when `silo run` starts, or the run fails. Mounts are passed to
+# the container CLI in this order: project directory, `.git` (read-only),
+# shared mounts, run directory — when two mounts share a target, the last
+# one passed wins.
 
 [quick]
 # Quick commands: `silo <name>` runs the command inside the container, like

@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::{Permission, Shared};
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
@@ -51,7 +52,7 @@ fn run_command_starts_interactive_shell() {
         Path::new("/tmp/project"),
         &ids,
         &RunFiles::default(),
-        None,
+        &ConfigMounts::default(),
         "silo-123",
         &[],
     )
@@ -93,7 +94,7 @@ fn run_command_omits_pty_when_not_interactive() {
         Path::new("/tmp/project"),
         &ids,
         &RunFiles::default(),
-        None,
+        &ConfigMounts::default(),
         "silo-123",
         &[],
     )
@@ -134,7 +135,7 @@ fn run_command_places_shared_dir_in_container_home() {
         Path::new("/home/user/src/silo"),
         &ids,
         &RunFiles::default(),
-        None,
+        &ConfigMounts::default(),
         "silo-123",
         &[],
     )
@@ -172,7 +173,7 @@ fn run_command_rejects_sharing_root() {
         Path::new("/"),
         &ids,
         &RunFiles::default(),
-        None,
+        &ConfigMounts::default(),
         "silo-123",
         &[],
     )
@@ -191,7 +192,7 @@ fn run_command_rejects_paths_with_colons() {
         Path::new("/tmp/foo:bar"),
         &ids,
         &RunFiles::default(),
-        None,
+        &ConfigMounts::default(),
         "silo-123",
         &[],
     )
@@ -216,7 +217,7 @@ fn run_command_rejects_non_utf8_paths() {
         path,
         &ids,
         &RunFiles::default(),
-        None,
+        &ConfigMounts::default(),
         "silo-123",
         &[],
     )
@@ -367,7 +368,7 @@ fn run_command_injects_run_files() {
         Path::new("/tmp/project"),
         &ids,
         &run_files,
-        None,
+        &ConfigMounts::default(),
         "silo-123",
         &[],
     )
@@ -415,7 +416,7 @@ fn run_command_appends_the_passed_command() {
         Path::new("/tmp/project"),
         &ids,
         &RunFiles::default(),
-        None,
+        &ConfigMounts::default(),
         "silo-123",
         &[
             OsString::from("codex"),
@@ -482,7 +483,10 @@ fn run_command_mounts_git_read_only() {
         Path::new("/tmp/project"),
         &ids,
         &RunFiles::default(),
-        Some(Path::new("/tmp/project/.git")),
+        &ConfigMounts {
+            git: Some(PathBuf::from("/tmp/project/.git")),
+            shared: vec![],
+        },
         "silo-123",
         &[],
     )
@@ -507,12 +511,252 @@ fn run_command_omits_git_mount_when_absent() {
         Path::new("/tmp/project"),
         &ids,
         &RunFiles::default(),
-        None,
+        &ConfigMounts::default(),
         "silo-123",
         &[],
     )
     .expect("command builds");
     assert_eq!(volume_specs(&command), ["/tmp/project:/home/silo/project"]);
+}
+
+#[test]
+fn run_command_mounts_configured_shared() {
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let shared = vec![
+        ResolvedShared {
+            host: PathBuf::from("/home/user/.ssh"),
+            dest: PathBuf::from("/home/silo/.ssh"),
+            permission: Permission::ReadOnly,
+        },
+        ResolvedShared {
+            host: PathBuf::from("/home/user/Downloads"),
+            dest: PathBuf::from("/home/silo/Downloads"),
+            permission: Permission::ReadWrite,
+        },
+    ];
+    let command = run_command(
+        true,
+        Path::new("/tmp/project"),
+        &ids,
+        &RunFiles::default(),
+        &ConfigMounts { git: None, shared },
+        "silo-123",
+        &[],
+    )
+    .expect("command builds");
+    assert_eq!(
+        volume_specs(&command),
+        [
+            "/tmp/project:/home/silo/project",
+            "/home/user/.ssh:/home/silo/.ssh:ro",
+            "/home/user/Downloads:/home/silo/Downloads",
+        ]
+    );
+}
+
+#[test]
+fn run_command_orders_git_then_shared_then_run_files() {
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let run_files = RunFiles {
+        env_file: None,
+        mounts: vec![RunMount {
+            host: PathBuf::from("/home/user/.agents"),
+            dest: PathBuf::from("/home/silo/.agents"),
+        }],
+    };
+    let shared = vec![ResolvedShared {
+        host: PathBuf::from("/home/user/data"),
+        dest: PathBuf::from("/data"),
+        permission: Permission::ReadWrite,
+    }];
+    let command = run_command(
+        true,
+        Path::new("/tmp/project"),
+        &ids,
+        &run_files,
+        &ConfigMounts {
+            git: Some(PathBuf::from("/tmp/project/.git")),
+            shared,
+        },
+        "silo-123",
+        &[],
+    )
+    .expect("command builds");
+    assert_eq!(
+        volume_specs(&command),
+        [
+            "/tmp/project:/home/silo/project",
+            "/tmp/project/.git:/home/silo/project/.git:ro",
+            "/home/user/data:/data",
+            "/home/user/.agents:/home/silo/.agents:ro",
+        ]
+    );
+}
+
+#[test]
+fn mount_conflicts_reports_run_file_overriding_shared() {
+    let conflicts = mount_conflicts(
+        Path::new("/home/silo/project"),
+        false,
+        &[ResolvedShared {
+            host: PathBuf::from("/home/user/.ssh"),
+            dest: PathBuf::from("/home/silo/.ssh"),
+            permission: Permission::ReadWrite,
+        }],
+        &RunFiles {
+            env_file: None,
+            mounts: vec![RunMount {
+                host: PathBuf::from("/home/user/run/.ssh"),
+                dest: PathBuf::from("/home/silo/.ssh"),
+            }],
+        },
+    );
+    assert_eq!(conflicts.len(), 1);
+    let msg = &conflicts[0];
+    assert!(msg.contains("/home/user/.ssh"), "{msg}");
+    assert!(msg.contains("/home/silo/.ssh"), "{msg}");
+    assert!(msg.contains("always read-only"), "{msg}");
+}
+
+#[test]
+fn mount_conflicts_reports_read_write_shared_over_git() {
+    let conflicts = mount_conflicts(
+        Path::new("/home/silo/project"),
+        true,
+        &[ResolvedShared {
+            host: PathBuf::from("/home/user/git"),
+            dest: PathBuf::from("/home/silo/project/.git"),
+            permission: Permission::ReadWrite,
+        }],
+        &RunFiles::default(),
+    );
+    assert_eq!(conflicts.len(), 1);
+    let msg = &conflicts[0];
+    assert!(msg.contains("read-write shared mount"), "{msg}");
+    assert!(msg.contains("`.git`"), "{msg}");
+}
+
+#[test]
+fn mount_conflicts_reports_read_write_shared_under_git() {
+    // A read-write mount at `.git/objects` is a deeper, independent mount
+    // and really is writable, so the `.git` protection is defeated.
+    let conflicts = mount_conflicts(
+        Path::new("/home/silo/project"),
+        true,
+        &[ResolvedShared {
+            host: PathBuf::from("/home/user/git"),
+            dest: PathBuf::from("/home/silo/project/.git/objects"),
+            permission: Permission::ReadWrite,
+        }],
+        &RunFiles::default(),
+    );
+    assert_eq!(conflicts.len(), 1);
+    assert!(
+        conflicts[0].contains("read-write shared mount"),
+        "{}",
+        conflicts[0]
+    );
+    assert!(conflicts[0].contains(".git"), "{}", conflicts[0]);
+}
+
+#[test]
+fn mount_conflicts_keeps_gitignore_silent() {
+    // `.gitignore` is a sibling of `.git`, not a descendant: component
+    // comparison must not flag it.
+    let conflicts = mount_conflicts(
+        Path::new("/home/silo/project"),
+        true,
+        &[ResolvedShared {
+            host: PathBuf::from("/home/user/gitignore"),
+            dest: PathBuf::from("/home/silo/project/.gitignore"),
+            permission: Permission::ReadWrite,
+        }],
+        &RunFiles::default(),
+    );
+    assert!(conflicts.is_empty());
+}
+
+#[test]
+fn mount_conflicts_keeps_ancestor_shared_silent() {
+    // A mount at an ancestor does not hide the child `.git` mount: the
+    // read-only protection stays in place, so no warning.
+    let conflicts = mount_conflicts(
+        Path::new("/home/silo/project"),
+        true,
+        &[ResolvedShared {
+            host: PathBuf::from("/home/user/project"),
+            dest: PathBuf::from("/home/silo/project"),
+            permission: Permission::ReadWrite,
+        }],
+        &RunFiles::default(),
+    );
+    assert!(conflicts.is_empty());
+}
+
+#[test]
+fn mount_conflicts_reports_run_file_nested_under_shared() {
+    // A run directory entry at a deeper target replaces part of the shared
+    // mount's content.
+    let conflicts = mount_conflicts(
+        Path::new("/home/silo/project"),
+        false,
+        &[ResolvedShared {
+            host: PathBuf::from("/home/user/config"),
+            dest: PathBuf::from("/home/silo/.config"),
+            permission: Permission::ReadWrite,
+        }],
+        &RunFiles {
+            env_file: None,
+            mounts: vec![RunMount {
+                host: PathBuf::from("/home/user/run/opencode"),
+                dest: PathBuf::from("/home/silo/.config/opencode"),
+            }],
+        },
+    );
+    assert_eq!(conflicts.len(), 1);
+    assert!(
+        conflicts[0].contains("/home/silo/.config/opencode"),
+        "{}",
+        conflicts[0]
+    );
+}
+
+#[test]
+fn mount_conflicts_keeps_read_only_shared_over_git_silent() {
+    // Read-only over read-only is harmless: the `.git` protection stays
+    // intact either way.
+    let conflicts = mount_conflicts(
+        Path::new("/home/silo/project"),
+        true,
+        &[ResolvedShared {
+            host: PathBuf::from("/home/user/git"),
+            dest: PathBuf::from("/home/silo/project/.git"),
+            permission: Permission::ReadOnly,
+        }],
+        &RunFiles::default(),
+    );
+    assert!(conflicts.is_empty());
+}
+
+#[test]
+fn mount_conflicts_is_silent_without_overlaps() {
+    let conflicts = mount_conflicts(
+        Path::new("/home/silo/project"),
+        true,
+        &[ResolvedShared {
+            host: PathBuf::from("/home/user/data"),
+            dest: PathBuf::from("/data"),
+            permission: Permission::ReadWrite,
+        }],
+        &RunFiles::default(),
+    );
+    assert!(conflicts.is_empty());
 }
 
 #[test]
@@ -553,6 +797,147 @@ fn git_mount_host_skips_git_escaping_the_project() {
         "an escaping .git symlink must not become a mount"
     );
     let _ = fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn resolve_shared_returns_empty_without_shared_mounts() {
+    let dir = TestDir::new("shared-empty");
+    let resolved = resolve_shared(&[], Some(dir.path())).expect("no shared mounts resolve");
+    assert!(resolved.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_shared_expands_tilde_and_canonicalizes_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TestDir::new("shared-tilde");
+    let real = dir.path().join("real-agents");
+    fs::create_dir_all(&real).expect("mkdir succeeds");
+    symlink(&real, dir.path().join("agents")).expect("symlink succeeds");
+    let shared = [Shared {
+        source: PathBuf::from("~/agents"),
+        target: PathBuf::from("/home/silo/.agents"),
+        permission: Permission::ReadOnly,
+    }];
+    let resolved = resolve_shared(&shared, Some(dir.path())).expect("shared mount resolves");
+    assert_eq!(
+        resolved,
+        vec![ResolvedShared {
+            host: canonical(&real),
+            dest: PathBuf::from("/home/silo/.agents"),
+            permission: Permission::ReadOnly,
+        }]
+    );
+}
+
+#[test]
+fn resolve_shared_keeps_absolute_sources() {
+    let dir = TestDir::new("shared-abs");
+    let source = dir.path().join("data");
+    fs::create_dir_all(&source).expect("mkdir succeeds");
+    let shared = [Shared {
+        source: source.clone(),
+        target: PathBuf::from("/data"),
+        permission: Permission::ReadWrite,
+    }];
+    let resolved = resolve_shared(&shared, Some(dir.path())).expect("shared mount resolves");
+    assert_eq!(
+        resolved,
+        vec![ResolvedShared {
+            host: canonical(&source),
+            dest: PathBuf::from("/data"),
+            permission: Permission::ReadWrite,
+        }]
+    );
+}
+
+#[test]
+fn resolve_shared_errors_on_missing_sources() {
+    let dir = TestDir::new("shared-missing");
+    let shared = [Shared {
+        source: PathBuf::from("~/nope"),
+        target: PathBuf::from("/home/silo/nope"),
+        permission: Permission::ReadOnly,
+    }];
+    let err = resolve_shared(&shared, Some(dir.path())).expect_err("missing source errors");
+    let msg = err.to_string();
+    assert!(msg.contains("cannot resolve source"), "{msg}");
+    assert!(msg.contains("`~/nope`"), "{msg}");
+    assert!(msg.contains("/home/silo/nope"), "{msg}");
+}
+
+#[test]
+fn resolve_shared_keeps_config_order() {
+    let dir = TestDir::new("shared-order");
+    let first = dir.path().join("a");
+    let second = dir.path().join("b");
+    fs::create_dir_all(&first).expect("mkdir succeeds");
+    fs::create_dir_all(&second).expect("mkdir succeeds");
+    let shared = [
+        Shared {
+            source: PathBuf::from("~/a"),
+            target: PathBuf::from("/mnt/shared"),
+            permission: Permission::ReadOnly,
+        },
+        Shared {
+            source: PathBuf::from("~/b"),
+            target: PathBuf::from("/mnt/shared"),
+            permission: Permission::ReadWrite,
+        },
+    ];
+    let resolved = resolve_shared(&shared, Some(dir.path())).expect("shared mounts resolve");
+    assert_eq!(resolved.len(), 2);
+    assert_eq!(resolved[0].host, canonical(&first));
+    assert_eq!(resolved[1].host, canonical(&second));
+}
+
+#[test]
+fn expand_tilde_replaces_leading_tilde() {
+    let home = Path::new("/home/user");
+    assert_eq!(
+        expand_tilde(Path::new("~/notes"), Some(home)),
+        PathBuf::from("/home/user/notes")
+    );
+    assert_eq!(
+        expand_tilde(Path::new("~"), Some(home)),
+        PathBuf::from("/home/user")
+    );
+}
+
+#[test]
+fn expand_tilde_leaves_other_paths_untouched() {
+    let home = Path::new("/home/user");
+    assert_eq!(
+        expand_tilde(Path::new("/abs/path"), Some(home)),
+        PathBuf::from("/abs/path")
+    );
+    assert_eq!(
+        expand_tilde(Path::new("~other/x"), Some(home)),
+        PathBuf::from("~other/x")
+    );
+    assert_eq!(
+        expand_tilde(Path::new("rel/path"), Some(home)),
+        PathBuf::from("rel/path")
+    );
+}
+
+#[test]
+fn expand_tilde_without_home_keeps_tilde_paths() {
+    assert_eq!(
+        expand_tilde(Path::new("~/notes"), None),
+        PathBuf::from("~/notes")
+    );
+}
+
+#[test]
+fn expand_tilde_with_empty_home_keeps_tilde_paths() {
+    // An empty HOME must behave like an unset one: expanding against it
+    // would turn `~/x` into a relative path resolved against the cwd.
+    assert_eq!(
+        expand_tilde(Path::new("~/notes"), Some(Path::new(""))),
+        PathBuf::from("~/notes")
+    );
 }
 
 #[test]

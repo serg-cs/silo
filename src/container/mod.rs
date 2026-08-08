@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::Config;
+use crate::config::{Config, Permission, Shared};
 
 /// Name of the image this tool builds and runs.
 pub const IMAGE_TAG: &str = "silo:latest";
@@ -78,6 +78,25 @@ struct RunFiles {
 struct RunMount {
     host: PathBuf,
     dest: PathBuf,
+}
+
+/// One configured shared mount resolved for this run: `host` is the
+/// canonical source path on this machine, `dest` where it is mounted inside
+/// the container, and `permission` how it may be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedShared {
+    host: PathBuf,
+    dest: PathBuf,
+    permission: Permission,
+}
+
+/// Config-driven mounts applied on top of the shared project directory and
+/// the run directory files: the optional read-only `.git` and the
+/// configured shared mounts.
+#[derive(Default)]
+struct ConfigMounts {
+    git: Option<PathBuf>,
+    shared: Vec<ResolvedShared>,
 }
 
 /// Returns the host side of the read-only `.git` mount: the canonical path
@@ -205,6 +224,93 @@ fn mount_for(run_dir: &Path, name: &OsStr) -> Result<RunMount> {
     })
 }
 
+/// Resolves the configured shared mounts into mounts for this run: expands
+/// a leading `~` in each source to the home directory and canonicalizes it
+/// (symlinks mount their target, like the run directory), keeping the
+/// configured container target and permission. Entries keep their config
+/// order, so a later shared mount can override an earlier one at the same
+/// target.
+///
+/// # Errors
+///
+/// Returns an error naming the shared mount when its source does not exist
+/// or cannot be resolved (e.g. a broken symlink).
+fn resolve_shared(shared: &[Shared], home: Option<&Path>) -> Result<Vec<ResolvedShared>> {
+    let mut resolved = Vec::with_capacity(shared.len());
+    for entry in shared {
+        let host = fs::canonicalize(expand_tilde(&entry.source, home)).with_context(|| {
+            format!(
+                "cannot resolve source `{}` for the shared mount at `{}` (missing path or broken symlink?)",
+                entry.source.display(),
+                entry.target.display()
+            )
+        })?;
+        resolved.push(ResolvedShared {
+            host,
+            dest: entry.target.clone(),
+            permission: entry.permission,
+        });
+    }
+    Ok(resolved)
+}
+
+/// Expands a leading `~` in `path` to the home directory: `~` and `~/x`
+/// become `<home>` and `<home>/x`. Any other path (absolute, `~user`, plain
+/// relative) is returned unchanged. Without a known, non-empty home
+/// directory nothing is expanded, so an unset or empty `HOME` leaves the
+/// path relative and the later `canonicalize` fails loudly instead of
+/// resolving against the working directory.
+fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) else {
+        return path.to_path_buf();
+    };
+    match path.strip_prefix("~") {
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// Returns warnings for shared mounts whose intent a later mount silently
+/// defeats: a run directory entry at the same or a deeper target replaces
+/// part or all of the shared mount's content (the run directory is mounted
+/// after the shared mounts and is always read-only), or a read-write shared
+/// mount at or under the `.git` target lets tools in the container modify
+/// version control state despite the read-only `.git` mount. An ancestor
+/// mount does not hide a child mount, so only these directions conflict.
+fn mount_conflicts(
+    project_dest: &Path,
+    git_mounted: bool,
+    shared: &[ResolvedShared],
+    run_files: &RunFiles,
+) -> Vec<String> {
+    let git_dest = git_mounted.then(|| project_dest.join(".git"));
+    let mut warnings = Vec::new();
+    for entry in shared {
+        for mount in &run_files.mounts {
+            if mount.dest.starts_with(&entry.dest) {
+                warnings.push(format!(
+                    "the run directory entry at `{}` replaces the shared mount of `{}` at `{}` or part of it: the run directory is mounted after the shared mounts and is always read-only",
+                    mount.dest.display(),
+                    entry.host.display(),
+                    entry.dest.display()
+                ));
+            }
+        }
+        if entry.permission == Permission::ReadWrite
+            && git_dest
+                .as_deref()
+                .is_some_and(|git_dest| entry.dest.starts_with(git_dest))
+        {
+            warnings.push(format!(
+                "the read-write shared mount of `{}` at `{}` overlaps the read-only `.git` mount, so tools in the container can modify version control state",
+                entry.host.display(),
+                entry.dest.display()
+            ));
+        }
+    }
+    warnings
+}
+
 /// Temporary build directory that removes itself on drop, so cleanup also
 /// runs on error paths.
 struct BuildDir(PathBuf);
@@ -310,9 +416,10 @@ struct HostIds {
 /// passed through. If silo itself is killed hard (e.g. `kill -9`), the
 /// container ID stays marked in the state directory and the next `silo run`
 /// sweeps it. Files and env vars from the run directory
-/// (`~/.config/silo/run`) are injected at start, and the project's `.git`
-/// directory is mounted read-only on top of the read-write project mount
-/// when the config enables it.
+/// (`~/.config/silo/run`) are injected at start, the configured `[[shared]]`
+/// mounts are resolved and applied, and the project's `.git` directory is
+/// mounted read-only on top of the read-write project mount when the config
+/// enables it.
 ///
 /// # Errors
 ///
@@ -328,19 +435,38 @@ pub fn run_image(config: &Config, command: &[OsString]) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
     let ids = host_ids()?;
     let run_files = run_files()?;
+    let shared = resolve_shared(
+        &config.shared,
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )?;
     let id = container_id();
     // Build the command first: it only fails on path validation, before any
     // container exists or a marker is written.
     let git_mount = git_mount_host(&cwd, config.read_only_git);
+    let config_mounts = ConfigMounts {
+        git: git_mount,
+        shared,
+    };
     let mut run = run_command(
         std::io::stdin().is_terminal(),
         &cwd,
         &ids,
         &run_files,
-        git_mount.as_deref(),
+        &config_mounts,
         &id,
         command,
     )?;
+    // Warn about shared mounts whose intent a later mount defeats, e.g. a
+    // run directory entry shadowing a read-write shared mount.
+    let shared_dir = shared_dir_name(&cwd)?;
+    for warning in mount_conflicts(
+        &shared_dir,
+        config_mounts.git.is_some(),
+        &config_mounts.shared,
+        &run_files,
+    ) {
+        eprintln!("warning: {warning}");
+    }
     sweep_stale_containers();
     register_container(&id);
     // Captured before the child starts, so it holds the pre-raw-mode state.
@@ -717,8 +843,9 @@ fn id_of(flag: &str) -> Result<String> {
 /// the container, mounting it inside the `silo` user's home so the shell
 /// starts there with all files reachable, forwards the host user's ids for
 /// uid remapping, injects the run directory's files and env vars
-/// ([`RunFiles`]), mounts the project's `.git` read-only when `git_mount` is
-/// given, names the container [`container_id`] so its ID is known up
+/// ([`RunFiles`]), applies the config-driven mounts ([`ConfigMounts`]: the
+/// project's `.git` read-only and the configured shared mounts, read-only
+/// or read-write), names the container [`container_id`] so its ID is known up
 /// front for cleanup, and runs `command` inside it (empty runs the image's
 /// default command, the shell).
 ///
@@ -731,7 +858,7 @@ fn run_command(
     cwd: &Path,
     host_ids: &HostIds,
     run_files: &RunFiles,
-    git_mount: Option<&Path>,
+    config_mounts: &ConfigMounts,
     id: &str,
     command: &[OsString],
 ) -> Result<Command> {
@@ -747,13 +874,23 @@ fn run_command(
         .arg(format!("{host_dir}:{}", shared_dir.display()))
         .arg("-w")
         .arg(&shared_dir);
-    if let Some(host) = git_mount {
+    if let Some(host) = &config_mounts.git {
         // The project's `.git` is mounted read-only on top of the
         // read-write project mount, so tools in the container cannot modify
         // version control state.
         let host = mount_host_path(host)?;
         run.arg("-v")
             .arg(format!("{host}:{}:ro", shared_dir.join(".git").display()));
+    }
+    for entry in &config_mounts.shared {
+        // Configured shared mounts: read-only mounts get the `:ro` suffix,
+        // read-write mounts use the volume default.
+        let host = mount_host_path(&entry.host)?;
+        let spec = match entry.permission {
+            Permission::ReadOnly => format!("{host}:{}:ro", entry.dest.display()),
+            Permission::ReadWrite => format!("{host}:{}", entry.dest.display()),
+        };
+        run.arg("-v").arg(spec);
     }
     for mount in &run_files.mounts {
         let host = mount_host_path(&mount.host)?;
