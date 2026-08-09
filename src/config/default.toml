@@ -2,12 +2,16 @@
 #
 # All keys are optional; when a key is absent, the built-in default applies.
 #
-# Every container shares the current project directory (mounted read-write
-# at /home/silo/<project-name>), plus whatever you configure below: the
-# optional read-only `.git` and the `[[shared]]` mounts. A project container
-# stays running after its last session. Run `silo stop` to stop and delete
-# it. Image rebuilds and changes to mount entries or read_only_git take
-# effect after `silo stop` and the next run.
+# Every container shares the discovered project directory (mounted read-write
+# at /home/silo/<project-name>). Silo uses the nearest ancestor containing a
+# `.silo.toml` file, otherwise the nearest ancestor containing a `.git`
+# directory, otherwise the current directory. The `.silo.toml` file is only a
+# project marker; settings continue to come from this config file.
+#
+# The optional read-only `.git` and the `[[shared]]` mounts are applied on top
+# of the project directory. A project container stays running after its last
+# session. Run `silo stop` to stop and delete it. Image rebuilds and changes to
+# mount entries or read_only_git take effect after `silo stop` and the next run.
 
 [image]
 # Dockerfile that defines the image `silo image build` builds and `silo run`

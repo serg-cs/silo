@@ -25,6 +25,12 @@ pub const DOCKERFILE: &str = include_str!("silo.dockerfile");
 
 const CONTAINER_BIN: &str = "container";
 
+/// File that explicitly marks a directory as a Silo project root.
+const PROJECT_MARKER: &str = ".silo.toml";
+
+/// Directory that implicitly marks a project root when no Silo marker exists.
+const GIT_DIR: &str = ".git";
+
 /// Prefix of every `--name` silo passes to `container run`.
 const CONTAINER_NAME_PREFIX: &str = "silo-";
 
@@ -74,22 +80,36 @@ struct Project {
 }
 
 impl Project {
-    /// Resolves the current project through symlinks before deriving its ID.
+    /// Discovers the current project through symlinks before deriving its ID.
     fn current() -> Result<Self> {
         let cwd = std::env::current_dir().context("failed to determine current directory")?;
         Self::from_path(&cwd)
     }
 
-    /// Pure-path entry point used to validate canonical identity behavior.
+    /// Canonicalizes a starting directory and discovers its project root.
     fn from_path(cwd: &Path) -> Result<Self> {
-        let root = fs::canonicalize(cwd)
+        let cwd = fs::canonicalize(cwd)
             .with_context(|| format!("failed to resolve project directory `{}`", cwd.display()))?;
+        let root = discover_project_root(&cwd);
         // Validate before persisting the path in JSON or a volume spec.
         volume_host_path(&root)?;
         let workdir = shared_dir_name(&root)?;
         let id = project_container_id(&root);
         Ok(Self { root, workdir, id })
     }
+}
+
+/// Selects a project root from an already-canonical starting directory.
+///
+/// An explicit Silo marker anywhere in the ancestor chain takes precedence
+/// over every Git directory. Within each marker type, the nearest ancestor
+/// wins. Without either marker, the exact starting directory is the project.
+fn discover_project_root(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|dir| dir.join(PROJECT_MARKER).is_file())
+        .or_else(|| cwd.ancestors().find(|dir| dir.join(GIT_DIR).is_dir()))
+        .unwrap_or(cwd)
+        .to_path_buf()
 }
 
 /// State reported by `container inspect` for one deterministic container ID.
@@ -159,12 +179,12 @@ impl Drop for ProjectLock {
 /// of the project's `.git` when the config enables the mount and `.git`
 /// resolves to a real path inside the project. A symlink escaping the
 /// project is not mounted, so no host path outside it becomes visible.
-fn git_mount_host(cwd: &Path, read_only_git: bool) -> Option<PathBuf> {
+fn git_mount_host(project_root: &Path, read_only_git: bool) -> Option<PathBuf> {
     if !read_only_git {
         return None;
     }
-    let root = fs::canonicalize(cwd).ok()?;
-    mount_host(&cwd.join(".git"), &root)
+    let root = fs::canonicalize(project_root).ok()?;
+    mount_host(&project_root.join(GIT_DIR), &root)
 }
 
 /// Returns the canonical path of `path` when it resolves to a real path
@@ -373,7 +393,7 @@ fn uses_isolated_lifecycle(config: &Config, isolated: bool) -> bool {
 
 /// Runs the existing ephemeral `container run --rm` lifecycle.
 fn run_isolated(config: &Config, command: &[OsString]) -> Result<ExitCode> {
-    let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    let project = Project::current()?;
     let ids = host_ids()?;
     let shared = resolve_shared(
         &config.shared,
@@ -382,14 +402,14 @@ fn run_isolated(config: &Config, command: &[OsString]) -> Result<ExitCode> {
     let id = isolated_container_id();
     // Build the command first: it only fails on path validation, before any
     // container exists or a marker is written.
-    let git_mount = git_mount_host(&cwd, config.read_only_git);
+    let git_mount = git_mount_host(&project.root, config.read_only_git);
     let config_mounts = ConfigMounts {
         git: git_mount,
         shared,
     };
     let mut run = isolated_run_command(
         std::io::stdin().is_terminal(),
-        &cwd,
+        &project.root,
         &ids,
         &config_mounts,
         &id,
@@ -397,9 +417,8 @@ fn run_isolated(config: &Config, command: &[OsString]) -> Result<ExitCode> {
     )?;
     // Warn about shared mounts whose intent a later mount defeats, e.g. a
     // read-write shared mount overlapping the read-only `.git`.
-    let shared_dir = shared_dir_name(&cwd)?;
     for warning in mount_conflicts(
-        &shared_dir,
+        &project.workdir,
         config_mounts.git.is_some(),
         &config_mounts.shared,
     ) {
@@ -447,9 +466,9 @@ fn run_shared(config: &Config, command: &[OsString]) -> Result<ExitCode> {
 }
 
 /// Resolves all creation-time config mounts for a project.
-fn resolve_config_mounts(config: &Config, cwd: &Path) -> Result<ConfigMounts> {
+fn resolve_config_mounts(config: &Config, project_root: &Path) -> Result<ConfigMounts> {
     Ok(ConfigMounts {
-        git: git_mount_host(cwd, config.read_only_git),
+        git: git_mount_host(project_root, config.read_only_git),
         shared: resolve_shared(
             &config.shared,
             std::env::var_os("HOME").as_deref().map(Path::new),
@@ -1367,24 +1386,24 @@ fn id_of(flag: &str) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Returns an error when the current directory has no name (e.g. `/`), or
-/// its path or a mount's path cannot be expressed in a volume spec.
+/// Returns an error when the project root has no name (e.g. `/`), or its path
+/// or a mount's path cannot be expressed in a volume spec.
 fn isolated_run_command(
     interactive: bool,
-    cwd: &Path,
+    project_root: &Path,
     host_ids: &HostIds,
     config_mounts: &ConfigMounts,
     id: &str,
     command: &[OsString],
 ) -> Result<Command> {
-    let shared_dir = shared_dir_name(cwd)?;
+    let shared_dir = shared_dir_name(project_root)?;
     let mut run = Command::new(CONTAINER_BIN);
     run.arg("run").arg("--name").arg(id).arg("--rm").arg("-i");
     if interactive {
         // Allocating a pty without a terminal fails with ENOTTY.
         run.arg("-t");
     }
-    append_creation_mounts(&mut run, cwd, &shared_dir, config_mounts)?;
+    append_creation_mounts(&mut run, project_root, &shared_dir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
     run.arg(IMAGE_TAG).args(command);
     Ok(run)
@@ -1413,11 +1432,11 @@ fn create_command(
 /// Adds mounts in their established override order and selects the workdir.
 fn append_creation_mounts(
     run: &mut Command,
-    cwd: &Path,
+    project_root: &Path,
     shared_dir: &Path,
     config_mounts: &ConfigMounts,
 ) -> Result<()> {
-    let host_dir = volume_host_path(cwd)?;
+    let host_dir = volume_host_path(project_root)?;
     run.arg("-v")
         .arg(format!("{host_dir}:{}", shared_dir.display()))
         .arg("-w")
@@ -1481,8 +1500,8 @@ fn exec_command(interactive: bool, project: &Project, command: &[OsString]) -> C
 /// # Errors
 ///
 /// Returns an error when the path is not valid UTF-8 or contains `:`.
-fn volume_host_path(cwd: &Path) -> Result<&str> {
-    spec_host_path(cwd, "share")
+fn volume_host_path(project_root: &Path) -> Result<&str> {
+    spec_host_path(project_root, "share")
 }
 
 /// Like [`volume_host_path`], for the shared and `.git` mount paths.
@@ -1500,15 +1519,18 @@ fn spec_host_path<'a>(path: &'a Path, verb: &str) -> Result<&'a str> {
 }
 
 /// Returns where the shared directory lands in the container, i.e. the
-/// current directory's last component placed inside the `silo` user's home.
+/// project root's last component placed inside the `silo` user's home.
 ///
 /// # Errors
 ///
-/// Returns an error when the current directory has no name (e.g. `/`).
-fn shared_dir_name(cwd: &Path) -> Result<PathBuf> {
-    let name = cwd
-        .file_name()
-        .ok_or_else(|| anyhow!("cannot share the root directory `{}`", cwd.display()))?;
+/// Returns an error when the project root has no name (e.g. `/`).
+fn shared_dir_name(project_root: &Path) -> Result<PathBuf> {
+    let name = project_root.file_name().ok_or_else(|| {
+        anyhow!(
+            "cannot share the root directory `{}`",
+            project_root.display()
+        )
+    })?;
     Ok(Path::new(CONTAINER_HOME).join(name))
 }
 

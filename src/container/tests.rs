@@ -1091,6 +1091,105 @@ fn project_container_id_is_stable_and_path_specific() {
     );
 }
 
+#[test]
+fn project_prefers_the_nearest_silo_marker() {
+    let dir = TestDir::new("project-nearest-silo");
+    let outer = dir.path().join("outer");
+    let inner = outer.join("inner");
+    let cwd = inner.join("src");
+    fs::create_dir_all(&cwd).expect("nested project creates");
+    fs::write(outer.join(PROJECT_MARKER), "").expect("outer marker creates");
+    fs::write(inner.join(PROJECT_MARKER), "").expect("inner marker creates");
+
+    let project = Project::from_path(&cwd).expect("project resolves");
+
+    let expected_root = canonical(&inner);
+    assert_eq!(project.root, expected_root);
+    assert_eq!(project.workdir, PathBuf::from("/home/silo/inner"));
+    assert_eq!(project.id, project_container_id(&expected_root));
+}
+
+#[test]
+fn project_silo_marker_outranks_a_closer_git_directory() {
+    let dir = TestDir::new("project-silo-before-git");
+    let silo_root = dir.path().join("workspace");
+    let git_root = silo_root.join("package");
+    let cwd = git_root.join("src");
+    fs::create_dir_all(cwd.as_path()).expect("nested project creates");
+    fs::write(silo_root.join(PROJECT_MARKER), "").expect("silo marker creates");
+    fs::create_dir(git_root.join(GIT_DIR)).expect("git directory creates");
+
+    let project = Project::from_path(&cwd).expect("project resolves");
+
+    assert_eq!(project.root, canonical(&silo_root));
+    assert_eq!(project.workdir, PathBuf::from("/home/silo/workspace"));
+}
+
+#[test]
+fn project_uses_the_nearest_git_directory_without_a_silo_marker() {
+    let dir = TestDir::new("project-nearest-git");
+    let outer = dir.path().join("outer");
+    let inner = outer.join("inner");
+    let cwd = inner.join("src");
+    fs::create_dir_all(&cwd).expect("nested project creates");
+    fs::create_dir(outer.join(GIT_DIR)).expect("outer git directory creates");
+    fs::create_dir(inner.join(GIT_DIR)).expect("inner git directory creates");
+
+    let project = Project::from_path(&cwd).expect("project resolves");
+
+    assert_eq!(project.root, canonical(&inner));
+    assert_eq!(project.workdir, PathBuf::from("/home/silo/inner"));
+}
+
+#[test]
+fn project_without_markers_uses_the_exact_directory() {
+    // Use a synthetic absolute path so markers in the test runner's own
+    // temporary-directory ancestors cannot affect this pure fallback check.
+    let cwd = Path::new("/silo-test-unmarked-project/src");
+
+    assert_eq!(discover_project_root(cwd), cwd);
+}
+
+#[test]
+fn project_ignores_markers_with_the_wrong_entry_type() {
+    let dir = TestDir::new("project-wrong-marker-types");
+    let candidate = dir.path().join("candidate");
+    let cwd = candidate.join("src");
+    fs::create_dir_all(&cwd).expect("working directory creates");
+    fs::write(dir.path().join(PROJECT_MARKER), "").expect("outer marker creates");
+    fs::create_dir(candidate.join(PROJECT_MARKER)).expect("marker directory creates");
+    fs::write(candidate.join(GIT_DIR), "gitdir: elsewhere").expect("git file creates");
+
+    let project = Project::from_path(&cwd).expect("project resolves");
+
+    assert_eq!(project.root, canonical(dir.path()));
+}
+
+#[test]
+fn discovered_project_root_drives_shared_and_isolated_mounts() {
+    let dir = TestDir::new("project-lifecycle-root");
+    let root = dir.path().join("workspace");
+    let cwd = root.join("package").join("src");
+    fs::create_dir_all(&cwd).expect("nested project creates");
+    fs::write(root.join(PROJECT_MARKER), "").expect("project marker creates");
+    let project = Project::from_path(&cwd).expect("project resolves");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let mounts = ConfigMounts::default();
+    let expected = format!("{}:/home/silo/workspace", project.root.display());
+
+    let isolated = isolated_run_command(false, &project.root, &ids, &mounts, "silo-123", &[])
+        .expect("isolated command builds");
+    let shared = create_command(&project, &ids, &mounts, Path::new("/tmp/project.cid"))
+        .expect("shared command builds");
+
+    assert_eq!(volume_specs(&isolated), std::slice::from_ref(&expected));
+    assert_eq!(volume_specs(&shared), [expected]);
+    assert_eq!(ContainerMarker::new(&project).project, canonical(&root));
+}
+
 #[cfg(unix)]
 #[test]
 fn project_identity_canonicalizes_symlinked_working_directories() {
@@ -1098,11 +1197,13 @@ fn project_identity_canonicalizes_symlinked_working_directories() {
 
     let dir = TestDir::new("project-symlink");
     let project_dir = dir.path().join("real-project");
+    let nested = project_dir.join("src");
     let link = dir.path().join("project-link");
-    fs::create_dir(&project_dir).expect("project directory creates");
-    symlink(&project_dir, &link).expect("project symlink creates");
+    fs::create_dir_all(&nested).expect("project directory creates");
+    fs::write(project_dir.join(PROJECT_MARKER), "").expect("project marker creates");
+    symlink(&nested, &link).expect("project symlink creates");
 
-    let direct = Project::from_path(&project_dir).expect("direct project resolves");
+    let direct = Project::from_path(&nested).expect("direct project resolves");
     let linked = Project::from_path(&link).expect("linked project resolves");
     assert_eq!(direct, linked);
     assert_eq!(direct.root, canonical(&project_dir));
