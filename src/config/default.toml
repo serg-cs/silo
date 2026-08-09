@@ -2,12 +2,12 @@
 #
 # All keys are optional; when a key is absent, the built-in default applies.
 #
-# Files and environment variables injected into every container live in the
-# run directory beside this file (~/.config/silo/run). Its `env` file holds
-# KEY=VALUE entries passed to the container at start, and every other entry
-# is mounted read-only into the container home at the matching path. The
-# directory is created with a commented `env` template on the first `silo
-# run`. Additional bind mounts are configured under [[shared]] below.
+# Every container shares the current project directory (mounted read-write
+# at /home/silo/<project-name>), plus whatever you configure below: the
+# optional read-only `.git` and the `[[shared]]` mounts. A project container
+# stays running after its last session. Run `silo stop` to stop and delete
+# it. Image rebuilds and changes to mount entries or read_only_git take
+# effect after `silo stop` and the next run.
 
 [image]
 # Dockerfile that defines the image `silo image build` builds and `silo run`
@@ -21,8 +21,8 @@
 read_only_git = true
 
 # [[shared]]
-# Shared mounts applied to every container, on top of the project directory
-# and the run directory. Each entry mounts a path on this machine (`source`)
+# Shared mounts applied when a project container is created, on top of the
+# project directory. Each entry mounts a path on this machine (`source`)
 # into the container at `target`, with a `permission` of `read-only` (the
 # default) or `read-write`:
 #
@@ -32,10 +32,10 @@ read_only_git = true
 #
 # The source must be an absolute path or a `~`-prefixed path like `~/notes`
 # (a bare `~` is your home directory; `~user` paths are not supported), and
-# must exist when `silo run` starts, or the run fails. Mounts are passed to
+# must exist when a container is created (for shared runs: at `silo stop` +
+# the next `silo run`), or the run fails. Mounts are passed to
 # the container CLI in this order: project directory, `.git` (read-only),
-# shared mounts, run directory — when two mounts share a target, the last
-# one passed wins.
+# shared mounts — when two mounts share a target, the last one passed wins.
 
 [quick]
 # Quick commands: `silo <name>` runs the command inside the container, like
@@ -46,7 +46,7 @@ read_only_git = true
 #   codex = ["codex"]
 #   cx    = ["codex", "--model", "compact"]
 #
-# A name must not collide with a built-in command (`run`, `image`, `help`)
+# A name must not collide with a built-in command (`run`, `stop`, `image`, `help`)
 # and must not start with `-`: the built-in command always wins, and flag-
 # shaped tokens are reserved for silo's own options, so such a quick command
 # could never run. Unusable names are reported as a warning when silo runs.

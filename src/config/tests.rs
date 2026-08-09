@@ -162,34 +162,6 @@ fn config_path_returns_none_without_home() {
 }
 
 #[test]
-fn run_dir_prefers_xdg_config_home() {
-    let path = run_dir_from(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/user")))
-        .expect("path resolves");
-    assert_eq!(path, Path::new("/xdg/silo/run"));
-}
-
-#[test]
-fn run_dir_falls_back_to_home_config() {
-    let path = run_dir_from(None, Some(OsStr::new("/home/user"))).expect("path resolves");
-    assert_eq!(path, Path::new("/home/user/.config/silo/run"));
-}
-
-#[test]
-fn run_dir_ignores_relative_xdg_config_home() {
-    let path = run_dir_from(
-        Some(OsStr::new("relative/xdg")),
-        Some(OsStr::new("/home/user")),
-    )
-    .expect("path resolves");
-    assert_eq!(path, Path::new("/home/user/.config/silo/run"));
-}
-
-#[test]
-fn run_dir_returns_none_without_home() {
-    assert!(run_dir_from(None, None).is_none());
-}
-
-#[test]
 fn old_config_without_the_key_still_protects() {
     // A config written before `read_only_git` existed: only `[image]`.
     let config =
@@ -229,6 +201,16 @@ fn quick_rejects_names_shadowed_by_builtins() {
         .to_string();
     assert!(msg.contains("`run`"), "names the offender: {msg}");
     assert!(msg.contains("shadowed"), "explains why: {msg}");
+}
+
+#[test]
+fn quick_rejects_stop_after_it_becomes_a_builtin() {
+    let config = Config::parse("[quick]\nstop = [\"bash\"]\n").expect("config parses");
+    let msg = config
+        .check_quick_names(&["run", "stop", "image", "help"])
+        .expect_err("`stop` collides with the built-in command")
+        .to_string();
+    assert!(msg.contains("`stop`"), "names the offender: {msg}");
 }
 
 #[test]

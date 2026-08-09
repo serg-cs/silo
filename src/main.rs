@@ -22,16 +22,21 @@ enum Command {
         #[command(subcommand)]
         command: ImageCommand,
     },
-    /// Run the container from the built image.
+    /// Run a session in the shared container for the current project.
     ///
     /// Executes COMMAND inside it instead of the default shell, passed
     /// after `--`: `silo run -- <command>`. A `[quick]` config entry runs
     /// as `silo <name>`.
     Run {
+        /// Use a separate one-shot container removed when the session ends.
+        #[arg(long)]
+        isolated: bool,
         /// Command to run inside the container; empty runs the default shell.
         #[arg(value_name = "COMMAND", last = true)]
         command: Vec<OsString>,
     },
+    /// Stop and delete the shared container for the current project.
+    Stop,
     /// Run a configured quick command: `silo <name> [args...]`, where `name`
     /// is a key in the `[quick]` section of the config file; extra arguments
     /// are appended.
@@ -64,9 +69,10 @@ fn main() -> ExitCode {
         Command::Image {
             command: ImageCommand::Build,
         } => container::build_image(&config),
-        Command::Run { command } => container::run_image(&config, &command),
+        Command::Run { isolated, command } => container::run_image(&config, &command, isolated),
+        Command::Stop => container::stop_image(),
         Command::Quick(args) => quick_command(&config, &args)
-            .and_then(|command| container::run_image(&config, &command)),
+            .and_then(|command| container::run_image(&config, &command, false)),
     };
     result.unwrap_or_else(|err| fail(&err))
 }
@@ -131,7 +137,10 @@ mod tests {
 
     #[test]
     fn run_passes_through_arbitrary_command() {
-        let Command::Run { command } = parse(&["silo", "run", "--", "codex", "--model", "compact"])
+        let Command::Run {
+            isolated: false,
+            command,
+        } = parse(&["silo", "run", "--", "codex", "--model", "compact"])
         else {
             panic!("expected Run");
         };
@@ -166,7 +175,10 @@ mod tests {
 
     #[test]
     fn run_accepts_flag_shaped_tokens_after_double_dash() {
-        let Command::Run { command } = parse(&["silo", "run", "--", "-t", "--model", "compact"])
+        let Command::Run {
+            isolated: false,
+            command,
+        } = parse(&["silo", "run", "--", "-t", "--model", "compact"])
         else {
             panic!("expected Run");
         };
@@ -182,7 +194,11 @@ mod tests {
 
     #[test]
     fn run_without_command_keeps_the_default_shell() {
-        let Command::Run { command } = parse(&["silo", "run"]) else {
+        let Command::Run {
+            isolated: false,
+            command,
+        } = parse(&["silo", "run"])
+        else {
             panic!("expected Run");
         };
         assert!(command.is_empty());
@@ -190,7 +206,11 @@ mod tests {
 
     #[test]
     fn run_with_double_dash_and_no_command_keeps_the_default_shell() {
-        let Command::Run { command } = parse(&["silo", "run", "--"]) else {
+        let Command::Run {
+            isolated: false,
+            command,
+        } = parse(&["silo", "run", "--"])
+        else {
             panic!("expected Run");
         };
         assert!(command.is_empty());
@@ -198,7 +218,10 @@ mod tests {
 
     #[test]
     fn run_preserves_double_dash_inside_the_command() {
-        let Command::Run { command } = parse(&["silo", "run", "--", "codex", "--", "--flag"])
+        let Command::Run {
+            isolated: false,
+            command,
+        } = parse(&["silo", "run", "--", "codex", "--", "--flag"])
         else {
             panic!("expected Run");
         };
@@ -238,12 +261,13 @@ mod tests {
             parse(&["silo", "image", "build"]),
             Command::Image { .. }
         ));
+        assert!(matches!(parse(&["silo", "stop"]), Command::Stop));
     }
 
     #[test]
     fn builtin_commands_covers_the_project_command_set() {
         let names = builtin_commands();
-        for expected in ["run", "image", "help"] {
+        for expected in ["run", "stop", "image", "help"] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "missing {expected}"
@@ -293,5 +317,32 @@ mod tests {
             msg.contains("silo run --"),
             "hints at the escape hatch: {msg}"
         );
+    }
+
+    #[test]
+    fn run_isolated_selects_the_ephemeral_lifecycle() {
+        let Command::Run {
+            isolated: true,
+            command,
+        } = parse(&["silo", "run", "--isolated", "--", "nu", "-c", "version"])
+        else {
+            panic!("expected isolated Run");
+        };
+        assert_eq!(
+            command,
+            [
+                OsString::from("nu"),
+                OsString::from("-c"),
+                OsString::from("version"),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_does_not_accept_rm_as_an_isolated_alias() {
+        let err = Cli::try_parse_from(["silo", "run", "--rm"])
+            .err()
+            .expect("only --isolated is supported");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }

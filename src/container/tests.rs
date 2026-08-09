@@ -3,7 +3,7 @@ use crate::config::{Permission, Shared};
 use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn dockerfile_embeds_ubuntu_latest() {
@@ -17,6 +17,20 @@ fn dockerfile_embeds_ubuntu_latest() {
 #[test]
 fn image_tag_is_silo_latest() {
     assert_eq!(IMAGE_TAG, "silo:latest");
+}
+
+#[test]
+fn custom_images_use_the_image_agnostic_lifecycle() {
+    let mut config = Config::default();
+    config.image.dockerfile = Some(PathBuf::from("/tmp/Dockerfile"));
+
+    assert!(uses_isolated_lifecycle(&config, false));
+}
+
+#[test]
+fn built_in_images_remain_shared_by_default() {
+    assert!(!uses_isolated_lifecycle(&Config::default(), false));
+    assert!(uses_isolated_lifecycle(&Config::default(), true));
 }
 
 #[test]
@@ -48,11 +62,10 @@ fn run_command_starts_interactive_shell() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(
+    let command = isolated_run_command(
         true,
         Path::new("/tmp/project"),
         &ids,
-        &RunFiles::default(),
         &ConfigMounts::default(),
         "silo-123",
         &[],
@@ -90,11 +103,10 @@ fn run_command_omits_pty_when_not_interactive() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(
+    let command = isolated_run_command(
         false,
         Path::new("/tmp/project"),
         &ids,
-        &RunFiles::default(),
         &ConfigMounts::default(),
         "silo-123",
         &[],
@@ -131,11 +143,10 @@ fn run_command_places_shared_dir_in_container_home() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(
+    let command = isolated_run_command(
         true,
         Path::new("/home/user/src/silo"),
         &ids,
-        &RunFiles::default(),
         &ConfigMounts::default(),
         "silo-123",
         &[],
@@ -169,11 +180,10 @@ fn run_command_rejects_sharing_root() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let err = run_command(
+    let err = isolated_run_command(
         true,
         Path::new("/"),
         &ids,
-        &RunFiles::default(),
         &ConfigMounts::default(),
         "silo-123",
         &[],
@@ -188,11 +198,10 @@ fn run_command_rejects_paths_with_colons() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let err = run_command(
+    let err = isolated_run_command(
         true,
         Path::new("/tmp/foo:bar"),
         &ids,
-        &RunFiles::default(),
         &ConfigMounts::default(),
         "silo-123",
         &[],
@@ -213,16 +222,8 @@ fn run_command_rejects_non_utf8_paths() {
         gid: "20".into(),
     };
     let path = Path::new(OsStr::from_bytes(b"/tmp/bad\xFFdir"));
-    let err = run_command(
-        true,
-        path,
-        &ids,
-        &RunFiles::default(),
-        &ConfigMounts::default(),
-        "silo-123",
-        &[],
-    )
-    .expect_err("name is not valid UTF-8");
+    let err = isolated_run_command(true, path, &ids, &ConfigMounts::default(), "silo-123", &[])
+        .expect_err("name is not valid UTF-8");
     assert!(err.to_string().contains("cannot share"));
     assert!(err.to_string().contains("valid UTF-8"));
 }
@@ -595,77 +596,15 @@ impl Drop for TestDir {
 }
 
 #[test]
-fn run_command_injects_run_files() {
-    let ids = HostIds {
-        uid: "501".into(),
-        gid: "20".into(),
-    };
-    let run_files = RunFiles {
-        env_file: Some(PathBuf::from("/home/user/.config/silo/run/env")),
-        mounts: vec![
-            RunMount {
-                host: PathBuf::from("/home/user/.agents"),
-                dest: PathBuf::from("/home/silo/.agents"),
-            },
-            RunMount {
-                host: PathBuf::from("/home/user/.config/opencode"),
-                dest: PathBuf::from("/home/silo/.config/opencode"),
-            },
-        ],
-    };
-    let command = run_command(
-        true,
-        Path::new("/tmp/project"),
-        &ids,
-        &run_files,
-        &ConfigMounts::default(),
-        "silo-123",
-        &[],
-    )
-    .expect("command builds");
-    let args: Vec<&str> = command
-        .get_args()
-        .map(|arg| arg.to_str().expect("arg is UTF-8"))
-        .collect();
-    assert_eq!(
-        args,
-        [
-            "run",
-            "--name",
-            "silo-123",
-            "--rm",
-            "-i",
-            "-t",
-            "-v",
-            "/tmp/project:/home/silo/project",
-            "-w",
-            "/home/silo/project",
-            "-v",
-            "/home/user/.agents:/home/silo/.agents:ro",
-            "-v",
-            "/home/user/.config/opencode:/home/silo/.config/opencode:ro",
-            "--env-file",
-            "/home/user/.config/silo/run/env",
-            "--env",
-            "SILO_UID=501",
-            "--env",
-            "SILO_GID=20",
-            "silo:latest",
-        ]
-    );
-}
-
-#[test]
 fn run_command_appends_the_passed_command() {
     let ids = HostIds {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(
+    let command = isolated_run_command(
         false,
         Path::new("/tmp/project"),
         &ids,
-        &RunFiles::default(),
         &ConfigMounts::default(),
         "silo-123",
         &[
@@ -728,11 +667,10 @@ fn run_command_mounts_git_read_only() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(
+    let command = isolated_run_command(
         true,
         Path::new("/tmp/project"),
         &ids,
-        &RunFiles::default(),
         &ConfigMounts {
             git: Some(PathBuf::from("/tmp/project/.git")),
             shared: vec![],
@@ -756,11 +694,10 @@ fn run_command_omits_git_mount_when_absent() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = run_command(
+    let command = isolated_run_command(
         true,
         Path::new("/tmp/project"),
         &ids,
-        &RunFiles::default(),
         &ConfigMounts::default(),
         "silo-123",
         &[],
@@ -787,11 +724,10 @@ fn run_command_mounts_configured_shared() {
             permission: Permission::ReadWrite,
         },
     ];
-    let command = run_command(
+    let command = isolated_run_command(
         true,
         Path::new("/tmp/project"),
         &ids,
-        &RunFiles::default(),
         &ConfigMounts { git: None, shared },
         "silo-123",
         &[],
@@ -808,28 +744,20 @@ fn run_command_mounts_configured_shared() {
 }
 
 #[test]
-fn run_command_orders_git_then_shared_then_run_files() {
+fn run_command_orders_git_then_shared_mounts() {
     let ids = HostIds {
         uid: "501".into(),
         gid: "20".into(),
-    };
-    let run_files = RunFiles {
-        env_file: None,
-        mounts: vec![RunMount {
-            host: PathBuf::from("/home/user/.agents"),
-            dest: PathBuf::from("/home/silo/.agents"),
-        }],
     };
     let shared = vec![ResolvedShared {
         host: PathBuf::from("/home/user/data"),
         dest: PathBuf::from("/data"),
         permission: Permission::ReadWrite,
     }];
-    let command = run_command(
+    let command = isolated_run_command(
         true,
         Path::new("/tmp/project"),
         &ids,
-        &run_files,
         &ConfigMounts {
             git: Some(PathBuf::from("/tmp/project/.git")),
             shared,
@@ -844,34 +772,8 @@ fn run_command_orders_git_then_shared_then_run_files() {
             "/tmp/project:/home/silo/project",
             "/tmp/project/.git:/home/silo/project/.git:ro",
             "/home/user/data:/data",
-            "/home/user/.agents:/home/silo/.agents:ro",
         ]
     );
-}
-
-#[test]
-fn mount_conflicts_reports_run_file_overriding_shared() {
-    let conflicts = mount_conflicts(
-        Path::new("/home/silo/project"),
-        false,
-        &[ResolvedShared {
-            host: PathBuf::from("/home/user/.ssh"),
-            dest: PathBuf::from("/home/silo/.ssh"),
-            permission: Permission::ReadWrite,
-        }],
-        &RunFiles {
-            env_file: None,
-            mounts: vec![RunMount {
-                host: PathBuf::from("/home/user/run/.ssh"),
-                dest: PathBuf::from("/home/silo/.ssh"),
-            }],
-        },
-    );
-    assert_eq!(conflicts.len(), 1);
-    let msg = &conflicts[0];
-    assert!(msg.contains("/home/user/.ssh"), "{msg}");
-    assert!(msg.contains("/home/silo/.ssh"), "{msg}");
-    assert!(msg.contains("always read-only"), "{msg}");
 }
 
 #[test]
@@ -884,7 +786,6 @@ fn mount_conflicts_reports_read_write_shared_over_git() {
             dest: PathBuf::from("/home/silo/project/.git"),
             permission: Permission::ReadWrite,
         }],
-        &RunFiles::default(),
     );
     assert_eq!(conflicts.len(), 1);
     let msg = &conflicts[0];
@@ -904,7 +805,6 @@ fn mount_conflicts_reports_read_write_shared_under_git() {
             dest: PathBuf::from("/home/silo/project/.git/objects"),
             permission: Permission::ReadWrite,
         }],
-        &RunFiles::default(),
     );
     assert_eq!(conflicts.len(), 1);
     assert!(
@@ -927,7 +827,6 @@ fn mount_conflicts_keeps_gitignore_silent() {
             dest: PathBuf::from("/home/silo/project/.gitignore"),
             permission: Permission::ReadWrite,
         }],
-        &RunFiles::default(),
     );
     assert!(conflicts.is_empty());
 }
@@ -944,37 +843,8 @@ fn mount_conflicts_keeps_ancestor_shared_silent() {
             dest: PathBuf::from("/home/silo/project"),
             permission: Permission::ReadWrite,
         }],
-        &RunFiles::default(),
     );
     assert!(conflicts.is_empty());
-}
-
-#[test]
-fn mount_conflicts_reports_run_file_nested_under_shared() {
-    // A run directory entry at a deeper target replaces part of the shared
-    // mount's content.
-    let conflicts = mount_conflicts(
-        Path::new("/home/silo/project"),
-        false,
-        &[ResolvedShared {
-            host: PathBuf::from("/home/user/config"),
-            dest: PathBuf::from("/home/silo/.config"),
-            permission: Permission::ReadWrite,
-        }],
-        &RunFiles {
-            env_file: None,
-            mounts: vec![RunMount {
-                host: PathBuf::from("/home/user/run/opencode"),
-                dest: PathBuf::from("/home/silo/.config/opencode"),
-            }],
-        },
-    );
-    assert_eq!(conflicts.len(), 1);
-    assert!(
-        conflicts[0].contains("/home/silo/.config/opencode"),
-        "{}",
-        conflicts[0]
-    );
 }
 
 #[test]
@@ -989,7 +859,6 @@ fn mount_conflicts_keeps_read_only_shared_over_git_silent() {
             dest: PathBuf::from("/home/silo/project/.git"),
             permission: Permission::ReadOnly,
         }],
-        &RunFiles::default(),
     );
     assert!(conflicts.is_empty());
 }
@@ -1004,7 +873,6 @@ fn mount_conflicts_is_silent_without_overlaps() {
             dest: PathBuf::from("/data"),
             permission: Permission::ReadWrite,
         }],
-        &RunFiles::default(),
     );
     assert!(conflicts.is_empty());
 }
@@ -1191,138 +1059,272 @@ fn expand_tilde_with_empty_home_keeps_tilde_paths() {
 }
 
 #[test]
-fn discover_returns_empty_for_missing_run_dir() {
-    let dir = TestDir::new("missing");
-    let run_files = RunFiles::discover(&dir.path().join("run")).expect("missing dir is empty");
-    assert_eq!(run_files, RunFiles::default());
+fn isolated_container_id_embeds_the_pid() {
+    assert_eq!(
+        isolated_container_id(),
+        format!("silo-{}", std::process::id())
+    );
 }
 
 #[test]
-fn discover_skips_env_and_collects_mounts() {
-    let dir = TestDir::new("discover");
-    let run_dir = dir.path().join("run");
-    fs::create_dir_all(run_dir.join(".config/opencode")).expect("dir creation succeeds");
-    fs::create_dir_all(run_dir.join(".agents")).expect("dir creation succeeds");
-    fs::write(run_dir.join(".gitconfig"), "[user]\n").expect("write succeeds");
-    fs::write(run_dir.join("README"), "hello\n").expect("write succeeds");
-    fs::write(run_dir.join("env"), "OPENAI_API_KEY=x\n").expect("write succeeds");
+fn isolated_container_id_starts_with_the_prefix() {
+    assert!(isolated_container_id().starts_with(CONTAINER_NAME_PREFIX));
+}
 
-    let run_files = RunFiles::discover(&run_dir).expect("discover succeeds");
-    assert_eq!(run_files.env_file, Some(run_dir.join("env")));
+#[test]
+fn project_container_id_is_stable_and_path_specific() {
+    let first = project_container_id(Path::new("/work/one/project"));
+    let same = project_container_id(Path::new("/work/one/project"));
+    let other = project_container_id(Path::new("/work/two/project"));
+    assert_eq!(first, same);
+    assert_ne!(first, other, "equal basenames must not collide");
     assert_eq!(
-        run_files.mounts,
-        vec![
-            RunMount {
-                host: fs::canonicalize(run_dir.join(".agents")).expect("host resolves"),
-                dest: PathBuf::from("/home/silo/.agents"),
-            },
-            RunMount {
-                host: fs::canonicalize(run_dir.join(".config")).expect("host resolves"),
-                dest: PathBuf::from("/home/silo/.config"),
-            },
-            RunMount {
-                host: fs::canonicalize(run_dir.join(".gitconfig")).expect("host resolves"),
-                dest: PathBuf::from("/home/silo/.gitconfig"),
-            },
-            RunMount {
-                host: fs::canonicalize(run_dir.join("README")).expect("host resolves"),
-                dest: PathBuf::from("/home/silo/README"),
-            },
+        first.len(),
+        CONTAINER_NAME_PREFIX.len() + PROJECT_DIGEST_HEX_LEN
+    );
+    assert!(
+        first
+            .strip_prefix(CONTAINER_NAME_PREFIX)
+            .expect("prefix exists")
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_identity_canonicalizes_symlinked_working_directories() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TestDir::new("project-symlink");
+    let project_dir = dir.path().join("real-project");
+    let link = dir.path().join("project-link");
+    fs::create_dir(&project_dir).expect("project directory creates");
+    symlink(&project_dir, &link).expect("project symlink creates");
+
+    let direct = Project::from_path(&project_dir).expect("direct project resolves");
+    let linked = Project::from_path(&link).expect("linked project resolves");
+    assert_eq!(direct, linked);
+    assert_eq!(direct.root, canonical(&project_dir));
+    assert_eq!(direct.workdir, PathBuf::from("/home/silo/real-project"));
+}
+
+fn test_project(root: &str) -> Project {
+    let root = PathBuf::from(root);
+    Project {
+        workdir: Path::new(CONTAINER_HOME).join(root.file_name().expect("project has a name")),
+        id: project_container_id(&root),
+        root,
+    }
+}
+
+#[test]
+fn create_command_starts_a_detached_keeper() {
+    let project = test_project("/tmp/project");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let command = create_command(
+        &project,
+        &ids,
+        &ConfigMounts::default(),
+        Path::new("/tmp/project.cid"),
+    )
+    .expect("command builds");
+    let args: Vec<&str> = command
+        .get_args()
+        .map(|arg| arg.to_str().expect("arg is UTF-8"))
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "run",
+            "--name",
+            project.id.as_str(),
+            "--cidfile",
+            "/tmp/project.cid",
+            "-d",
+            "-v",
+            "/tmp/project:/home/silo/project",
+            "-w",
+            "/home/silo/project",
+            "--env",
+            "SILO_UID=501",
+            "--env",
+            "SILO_GID=20",
+            "silo:latest",
+            "sleep",
+            "infinity",
         ]
     );
 }
 
 #[test]
-fn discover_rejects_directory_named_env() {
-    let dir = TestDir::new("env-dir");
-    let run_dir = dir.path().join("run");
-    fs::create_dir_all(run_dir.join("env")).expect("dir creation succeeds");
-
-    let err = RunFiles::discover(&run_dir).expect_err("env must be a file");
-    assert!(err.to_string().contains("`env`"));
-    assert!(err.to_string().contains("is not a file"));
-}
-
-#[test]
-fn discover_rejects_names_with_colons() {
-    let dir = TestDir::new("colon");
-    let run_dir = dir.path().join("run");
-    fs::create_dir_all(&run_dir).expect("dir creation succeeds");
-    fs::write(run_dir.join("foo:bar"), "x").expect("write succeeds");
-
-    let err = RunFiles::discover(&run_dir).expect_err("colon breaks the volume spec");
-    assert!(err.to_string().contains("cannot mount"));
-    assert!(err.to_string().contains("without `:`"));
-}
-
-#[cfg(unix)]
-#[test]
-fn discover_rejects_non_utf8_names() {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-
-    let name = OsStr::from_bytes(b".agents\xFF");
-    let err = mount_for(Path::new("/tmp"), name).expect_err("name is not valid UTF-8");
-    assert!(err.to_string().contains("cannot mount"));
-    assert!(err.to_string().contains("valid UTF-8"));
-}
-
-#[cfg(unix)]
-#[test]
-fn discover_resolves_symlinked_entries() {
-    use std::os::unix::fs::symlink;
-
-    let dir = TestDir::new("symlink");
-    let run_dir = dir.path().join("run");
-    let target = dir.path().join("real-agents");
-    fs::create_dir_all(&run_dir).expect("dir creation succeeds");
-    fs::create_dir_all(&target).expect("dir creation succeeds");
-    fs::write(target.join("agent.toml"), "x").expect("write succeeds");
-    symlink(&target, run_dir.join(".agents")).expect("symlink creation succeeds");
-
-    let run_files = RunFiles::discover(&run_dir).expect("discover succeeds");
+fn exec_command_attaches_as_silo_with_home() {
+    let project = test_project("/tmp/project");
+    let command = exec_command(
+        true,
+        &project,
+        &[OsString::from("codex"), OsString::from("--compact")],
+    );
+    let args: Vec<&str> = command
+        .get_args()
+        .map(|arg| arg.to_str().expect("arg is UTF-8"))
+        .collect();
     assert_eq!(
-        run_files.mounts,
-        vec![RunMount {
-            host: fs::canonicalize(&target).expect("target canonicalizes"),
-            dest: PathBuf::from("/home/silo/.agents"),
-        }]
+        args,
+        [
+            "exec",
+            "-i",
+            "-t",
+            "--user",
+            "silo",
+            "--workdir",
+            "/home/silo/project",
+            "--env",
+            "HOME=/home/silo",
+            project.id.as_str(),
+            "codex",
+            "--compact",
+        ]
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn discover_rejects_broken_symlinks() {
-    use std::os::unix::fs::symlink;
-
-    let dir = TestDir::new("broken-link");
-    let run_dir = dir.path().join("run");
-    fs::create_dir_all(&run_dir).expect("dir creation succeeds");
-    symlink(dir.path().join("missing"), run_dir.join(".agents"))
-        .expect("symlink creation succeeds");
-
-    let err = RunFiles::discover(&run_dir).expect_err("broken symlink errors");
-    assert!(err.to_string().contains(".agents"));
-    assert!(err.to_string().contains("cannot resolve"));
+fn exec_command_uses_nu_and_omits_tty_without_a_terminal() {
+    let project = test_project("/tmp/project");
+    let command = exec_command(false, &project, &[]);
+    let args: Vec<&str> = command
+        .get_args()
+        .map(|arg| arg.to_str().expect("arg is UTF-8"))
+        .collect();
+    assert_eq!(args[0..2], ["exec", "-i"]);
+    assert!(!args.contains(&"-t"));
+    assert_eq!(args.last(), Some(&DEFAULT_SESSION_COMMAND));
 }
 
 #[test]
-fn discover_rejects_existing_non_directory() {
-    let dir = TestDir::new("not-a-dir");
-    fs::write(dir.path().join("run"), "x").expect("write succeeds");
-
-    let err = RunFiles::discover(&dir.path().join("run")).expect_err("file is not a directory");
-    assert!(err.to_string().contains("is not a directory"));
+fn inspect_parser_accepts_current_nested_state() {
+    let json = br#"[{"id":"silo-test","status":{"state":"running","networks":[]}}]"#;
+    assert_eq!(
+        parse_container_state(json, "silo-test").expect("state parses"),
+        ContainerState::Running
+    );
 }
 
 #[test]
-fn container_id_embeds_the_pid() {
-    assert_eq!(container_id(), format!("silo-{}", std::process::id()));
+fn inspect_parser_accepts_legacy_flat_state() {
+    let json = br#"[{"configuration":{"id":"silo-test"},"status":"stopped"}]"#;
+    assert_eq!(
+        parse_container_state(json, "silo-test").expect("state parses"),
+        ContainerState::Stopped
+    );
 }
 
 #[test]
-fn container_id_starts_with_the_prefix() {
-    assert!(container_id().starts_with(CONTAINER_NAME_PREFIX));
+fn inspect_parser_maps_transient_and_unknown_states() {
+    let stopping = br#"[{"id":"silo-test","status":{"state":"stopping"}}]"#;
+    let future = br#"[{"id":"silo-test","status":{"state":"paused"}}]"#;
+    assert_eq!(
+        parse_container_state(stopping, "silo-test").expect("state parses"),
+        ContainerState::Stopping
+    );
+    assert_eq!(
+        parse_container_state(future, "silo-test").expect("state parses"),
+        ContainerState::Unknown
+    );
+}
+
+#[test]
+fn inspect_parser_rejects_missing_container_and_state() {
+    let wrong = br#"[{"id":"other","status":{"state":"running"}}]"#;
+    let missing = br#"[{"id":"silo-test","status":{}}]"#;
+    assert!(parse_container_state(wrong, "silo-test").is_err());
+    assert!(parse_container_state(missing, "silo-test").is_err());
+}
+
+#[test]
+fn shared_marker_round_trips_project_and_creator() {
+    let dir = TestDir::new("shared-marker");
+    let project = test_project("/tmp/project");
+    let marker = ContainerMarker::new(&project);
+    write_marker(dir.path(), &marker).expect("marker writes");
+    assert_eq!(
+        read_marker(dir.path(), &project.id).expect("marker reads"),
+        Some(marker)
+    );
+    remove_shared_state(dir.path(), &project.id);
+    assert!(!marker_path(dir.path(), &project.id).exists());
+}
+
+#[test]
+fn shared_marker_atomically_replaces_invalid_contents() {
+    let dir = TestDir::new("shared-marker-replace");
+    let project = test_project("/tmp/project");
+    let marker = ContainerMarker::new(&project);
+    fs::write(marker_path(dir.path(), &project.id), b"{partial")
+        .expect("partial old marker writes");
+
+    write_marker(dir.path(), &marker).expect("marker replacement succeeds");
+
+    assert_eq!(
+        read_marker(dir.path(), &project.id).expect("replacement reads"),
+        Some(marker)
+    );
+    assert!(!marker_temp_path(dir.path(), &project.id).exists());
+}
+
+#[test]
+fn failed_shared_marker_replacement_preserves_live_marker() {
+    let dir = TestDir::new("shared-marker-preserve");
+    let project = test_project("/tmp/project");
+    let original = ContainerMarker::new(&project);
+    write_marker(dir.path(), &original).expect("original marker writes");
+    fs::create_dir(marker_temp_path(dir.path(), &project.id))
+        .expect("directory blocks temporary marker creation");
+    let mut replacement = original.clone();
+    replacement.creator_pid += 1;
+
+    write_marker(dir.path(), &replacement).expect_err("replacement cannot be staged");
+
+    assert_eq!(
+        read_marker(dir.path(), &project.id).expect("live marker remains readable"),
+        Some(original)
+    );
+}
+
+#[test]
+fn shared_state_cleanup_removes_interrupted_marker_temporary() {
+    let dir = TestDir::new("shared-marker-temp-cleanup");
+    let project = test_project("/tmp/project");
+    fs::write(marker_temp_path(dir.path(), &project.id), b"{partial")
+        .expect("temporary marker writes");
+
+    remove_shared_state(dir.path(), &project.id);
+
+    assert!(!marker_temp_path(dir.path(), &project.id).exists());
+}
+
+#[test]
+fn project_lock_excludes_a_second_ensure() {
+    let dir = TestDir::new("project-lock");
+    let path = dir.path().join("project.lock");
+    let first = ProjectLock::acquire(&path, false)
+        .expect("first lock succeeds")
+        .expect("blocking lock is returned");
+    assert!(
+        ProjectLock::acquire(&path, true)
+            .expect("nonblocking attempt succeeds")
+            .is_none(),
+        "second ensure must observe the busy lock"
+    );
+    drop(first);
+    assert!(
+        ProjectLock::acquire(&path, true)
+            .expect("lock succeeds after release")
+            .is_some()
+    );
 }
 
 #[test]
@@ -1361,8 +1363,100 @@ fn owner_alive_detects_dead_processes() {
     assert!(!owner_alive(pid));
 }
 
+fn dead_owner_marker(dir: &Path, name: &str) -> ContainerMarker {
+    let mut child = Command::new("true").spawn().expect("spawn succeeds");
+    let creator_pid = child.id();
+    child.wait().expect("wait succeeds");
+    let project = test_project(&format!("/tmp/{name}"));
+    let mut marker = ContainerMarker::new(&project);
+    marker.creator_pid = creator_pid;
+    write_marker(dir, &marker).expect("marker writes");
+    marker
+}
+
 #[test]
-fn sweep_removes_markers_of_dead_owners_only() {
+fn shared_sweep_never_deletes_a_running_container() {
+    let dir = TestDir::new("shared-sweep-running");
+    let marker = dead_owner_marker(dir.path(), "running-project");
+    let deleted = Cell::new(false);
+    sweep_shared_in(
+        dir.path(),
+        None,
+        |_| Ok(ContainerState::Running),
+        |_| {
+            deleted.set(true);
+            Ok(())
+        },
+    );
+    assert!(!deleted.get());
+    assert!(marker_path(dir.path(), &marker.container_id).exists());
+}
+
+#[test]
+fn shared_sweep_deletes_only_stopped_dead_owner_containers() {
+    let dir = TestDir::new("shared-sweep-stopped");
+    let marker = dead_owner_marker(dir.path(), "stopped-project");
+    let mut deleted = Vec::new();
+    sweep_shared_in(
+        dir.path(),
+        None,
+        |_| Ok(ContainerState::Stopped),
+        |id| {
+            deleted.push(id.to_string());
+            Ok(())
+        },
+    );
+    assert_eq!(
+        deleted.as_slice(),
+        std::slice::from_ref(&marker.container_id)
+    );
+    assert!(!marker_path(dir.path(), &marker.container_id).exists());
+}
+
+#[test]
+fn shared_sweep_clears_absent_markers_without_deleting() {
+    let dir = TestDir::new("shared-sweep-absent");
+    let marker = dead_owner_marker(dir.path(), "absent-project");
+    sweep_shared_in(
+        dir.path(),
+        None,
+        |_| Ok(ContainerState::Absent),
+        |_| panic!("absent containers need no delete"),
+    );
+    assert!(!marker_path(dir.path(), &marker.container_id).exists());
+}
+
+#[test]
+fn shared_sweep_keeps_live_owner_and_current_project_markers() {
+    let dir = TestDir::new("shared-sweep-protected");
+    let live_project = test_project("/tmp/live-project");
+    write_marker(dir.path(), &ContainerMarker::new(&live_project)).expect("live marker writes");
+    let dead = dead_owner_marker(dir.path(), "current-project");
+    sweep_shared_in(
+        dir.path(),
+        Some(&dead.container_id),
+        |_| panic!("protected markers are not inspected"),
+        |_| panic!("protected markers are not deleted"),
+    );
+    assert!(marker_path(dir.path(), &live_project.id).exists());
+    assert!(marker_path(dir.path(), &dead.container_id).exists());
+}
+
+#[test]
+fn shared_sweep_retains_marker_when_delete_fails() {
+    let dir = TestDir::new("shared-sweep-delete-failure");
+    let marker = dead_owner_marker(dir.path(), "failed-project");
+    sweep_shared_in(
+        dir.path(),
+        None,
+        |_| Ok(ContainerState::Stopped),
+        |_| Err(anyhow!("delete failed")),
+    );
+    assert!(marker_path(dir.path(), &marker.container_id).exists());
+}
+
+#[test]
+fn legacy_sweep_removes_markers_of_dead_owners_only() {
     let dir = TestDir::new("sweep");
     // Live owner (this process): its container must be left alone.
     let live = format!("silo-{}", std::process::id());
@@ -1379,7 +1473,7 @@ fn sweep_removes_markers_of_dead_owners_only() {
     fs::write(dir.path().join("silo-not-a-pid"), "x").expect("write succeeds");
 
     let mut deleted = Vec::new();
-    sweep_stale_in(dir.path(), |id| {
+    sweep_legacy_in(dir.path(), |id| {
         deleted.push(id.to_string());
         Ok(())
     });
@@ -1392,7 +1486,7 @@ fn sweep_removes_markers_of_dead_owners_only() {
 }
 
 #[test]
-fn sweep_keeps_markers_when_delete_fails() {
+fn legacy_sweep_keeps_markers_when_delete_fails() {
     let dir = TestDir::new("sweep-fail");
     let mut child = Command::new("true").spawn().expect("spawn succeeds");
     let dead_pid = child.id();
@@ -1400,7 +1494,7 @@ fn sweep_keeps_markers_when_delete_fails() {
     let dead = format!("silo-{dead_pid}");
     register_container_in(dir.path(), &dead).expect("register succeeds");
 
-    sweep_stale_in(dir.path(), |_| Err(anyhow!("delete failed")));
+    sweep_legacy_in(dir.path(), |_| Err(anyhow!("delete failed")));
 
     assert!(dir.path().join(&dead).exists());
 }

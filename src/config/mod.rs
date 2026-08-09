@@ -8,10 +8,10 @@
 //! resulting [`Config`] is passed down, so flags can override later without a
 //! refactor.
 //!
-//! On top of the built-in mounts (the shared project directory, the run
-//! directory, and the optional read-only `.git`), the `[[shared]]` section
-//! mounts additional host paths into the container, each read-only or
-//! read-write (see [`Shared`]).
+//! On top of the built-in mounts (the shared project directory and the
+//! optional read-only `.git`), the `[[shared]]` section mounts additional
+//! host paths into the container, each read-only or read-write (see
+//! [`Shared`]).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -33,9 +33,9 @@ pub struct Config {
     /// Whether the project's `.git` directory is mounted read-only in the
     /// container, so tools inside it cannot modify version control state.
     pub read_only_git: bool,
-    /// Configurable shared mounts, applied at every `silo run`: each entry
-    /// mounts a path on the host (`source`) into the container at `target`,
-    /// read-only or read-write.
+    /// Configurable shared mounts, applied when a project's shared container
+    /// is created: each entry mounts a host `source` at container `target`,
+    /// read-only or read-write. `silo stop` and the next run recreate them.
     pub shared: Vec<Shared>,
     /// Quick commands: `silo <name>` runs this command inside the container
     /// without typing `silo run --` every time. The key is what you type;
@@ -70,9 +70,9 @@ pub struct Image {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Shared {
     /// Path on the host to mount: an absolute path, or a `~`-prefixed path
-    /// like `~/notes` (a bare `~` is the home directory itself; expanded at
-    /// `silo run`; `~user` paths are not supported). The path must exist at
-    /// `silo run` or the run fails.
+    /// like `~/notes` (a bare `~` is the home directory itself; expanded when
+    /// the shared container is created; `~user` paths are not supported).
+    /// The path must exist at creation or the run fails.
     pub source: PathBuf,
     /// Absolute path inside the container where the source is mounted.
     pub target: PathBuf,
@@ -252,17 +252,6 @@ fn spec_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Returns the run directory: `$XDG_CONFIG_HOME/silo/run` when the variable
-/// is set, otherwise `~/.config/silo/run`. Files and env vars placed there
-/// are injected into the container at start (see `silo run`). Returns `None`
-/// when no home directory can be determined.
-pub(crate) fn run_dir() -> Option<PathBuf> {
-    run_dir_from(
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    )
-}
-
 /// Returns the config file path: `$XDG_CONFIG_HOME/silo/config.toml` when the
 /// variable is set, otherwise `~/.config/silo/config.toml`. Returns `None`
 /// when no home directory can be determined.
@@ -278,13 +267,6 @@ fn config_path() -> Option<PathBuf> {
 /// process environment.
 fn config_path_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     config_dir_from(xdg, home).map(|dir| dir.join("config.toml"))
-}
-
-/// Pure version of [`run_dir`], taking the environment values as arguments
-/// so the resolution rules are testable without mutating the process
-/// environment.
-fn run_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    config_dir_from(xdg, home).map(|dir| dir.join("run"))
 }
 
 /// Pure version of the config directory resolution, taking the environment

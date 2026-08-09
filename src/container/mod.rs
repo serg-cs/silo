@@ -1,14 +1,19 @@
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::{Config, Permission, Shared};
 
@@ -20,65 +25,27 @@ pub const DOCKERFILE: &str = include_str!("silo.dockerfile");
 
 const CONTAINER_BIN: &str = "container";
 
-/// Prefix of the `--name` silo passes to `container run`; the container CLI
-/// uses the name as the container ID, so silo knows its container's ID
-/// before the run starts and leftovers are recognizable.
+/// Prefix of every `--name` silo passes to `container run`.
 const CONTAINER_NAME_PREFIX: &str = "silo-";
 
-/// Name of the directory under the config directory holding one marker file
-/// per container silo has started but not yet confirmed removed. The file
-/// name is the container ID, which embeds the pid of the silo that started
-/// it; a marker whose silo is dead means the run was killed and the
-/// container is swept by the next run.
+/// Config subdirectory holding markers, locks, and transient cidfiles.
 const CONTAINER_STATE_DIR: &str = "containers";
+
+/// Current on-disk marker schema version.
+const MARKER_VERSION: u8 = 1;
+
+/// Amount of the SHA-256 digest used in a shared container ID.
+const PROJECT_DIGEST_HEX_LEN: usize = 24;
+
+/// Default command for a shared session when the user supplies none.
+const DEFAULT_SESSION_COMMAND: &str = "nu";
+
+/// Init command that keeps a shared container available for exec sessions.
+const SHARED_INIT_COMMAND: [&str; 2] = ["sleep", "infinity"];
 
 /// Home directory of the container's `silo` user; the shared project
 /// directory is mounted into it as `<home>/<project-name>`.
 const CONTAINER_HOME: &str = "/home/silo";
-
-/// Name of the `env` file in the run directory whose `KEY=VALUE` lines are
-/// passed to the container via `--env-file`. It is never mounted.
-const RUN_ENV_FILE: &str = "env";
-
-/// Commented `env` template written into a fresh run directory; every line
-/// starts with `#`, so the container CLI's `--env-file` parser skips them.
-const RUN_ENV_TEMPLATE: &str = "\
-# Environment variables injected into every container at start.
-# Write one KEY=VALUE per line; blank lines and # comments are ignored.
-# A bare KEY without `=` inherits the host's value of that variable.
-#   OPENAI_API_KEY=sk-...
-#
-# Every other entry in this directory is bind-mounted read-only into the
-# container at the matching path under /home/silo/, so the layout mirrors the
-# container's home directory:
-#   .agents/foo.json     -> /home/silo/.agents/foo.json
-#   .config/opencode/    -> /home/silo/.config/opencode/
-#   .gitconfig           -> /home/silo/.gitconfig
-# Create a new file, directory, or symlink and it appears in every container
-# at the next `silo run`. Symlinks are resolved to their target, so a link to
-# a directory like ~/.agents shares its live contents. Links nested inside a
-# mounted directory are served as links and will not resolve; keep them at
-# the top level of this directory instead.
-";
-
-/// Files and environment variables injected into the container at start,
-/// discovered in the run directory (`~/.config/silo/run`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct RunFiles {
-    /// The `env` file, passed to the container via `--env-file`.
-    env_file: Option<PathBuf>,
-    /// Top-level entries of the run directory, mounted read-only into the
-    /// container home.
-    mounts: Vec<RunMount>,
-}
-
-/// One run directory entry: the host path to mount and where it lands in the
-/// container.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RunMount {
-    host: PathBuf,
-    dest: PathBuf,
-}
 
 /// One configured shared mount resolved for this run: `host` is the
 /// canonical source path on this machine, `dest` where it is mounted inside
@@ -90,13 +57,102 @@ struct ResolvedShared {
     permission: Permission,
 }
 
-/// Config-driven mounts applied on top of the shared project directory and
-/// the run directory files: the optional read-only `.git` and the
-/// configured shared mounts.
+/// Config-driven mounts applied on top of the shared project directory: the
+/// optional read-only `.git` and the configured shared mounts.
 #[derive(Default)]
 struct ConfigMounts {
     git: Option<PathBuf>,
     shared: Vec<ResolvedShared>,
+}
+
+/// Stable identity and container path for the current project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Project {
+    root: PathBuf,
+    workdir: PathBuf,
+    id: String,
+}
+
+impl Project {
+    /// Resolves the current project through symlinks before deriving its ID.
+    fn current() -> Result<Self> {
+        let cwd = std::env::current_dir().context("failed to determine current directory")?;
+        Self::from_path(&cwd)
+    }
+
+    /// Pure-path entry point used to validate canonical identity behavior.
+    fn from_path(cwd: &Path) -> Result<Self> {
+        let root = fs::canonicalize(cwd)
+            .with_context(|| format!("failed to resolve project directory `{}`", cwd.display()))?;
+        // Validate before persisting the path in JSON or a volume spec.
+        volume_host_path(&root)?;
+        let workdir = shared_dir_name(&root)?;
+        let id = project_container_id(&root);
+        Ok(Self { root, workdir, id })
+    }
+}
+
+/// State reported by `container inspect` for one deterministic container ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerState {
+    Absent,
+    Running,
+    Stopped,
+    Stopping,
+    Unknown,
+}
+
+/// Durable ownership metadata for a shared container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ContainerMarker {
+    version: u8,
+    container_id: String,
+    project: PathBuf,
+    creator_pid: u32,
+}
+
+impl ContainerMarker {
+    fn new(project: &Project) -> Self {
+        Self {
+            version: MARKER_VERSION,
+            container_id: project.id.clone(),
+            project: project.root.clone(),
+            creator_pid: std::process::id(),
+        }
+    }
+}
+
+/// Exclusive per-project file lock held only while container state changes.
+struct ProjectLock(File);
+
+impl ProjectLock {
+    /// Acquires the project lock, optionally returning immediately when busy.
+    fn acquire(path: &Path, nonblocking: bool) -> Result<Option<Self>> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("failed to open project lock `{}`", path.display()))?;
+        let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(Some(Self(file)));
+        }
+        let err = io::Error::last_os_error();
+        let code = err.raw_os_error();
+        if nonblocking && (code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN)) {
+            return Ok(None);
+        }
+        Err(err).with_context(|| format!("failed to lock `{}`", path.display()))
+    }
+}
+
+impl Drop for ProjectLock {
+    fn drop(&mut self) {
+        // Closing the file also releases the lock; unlock explicitly for clarity.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Returns the host side of the read-only `.git` mount: the canonical path
@@ -120,113 +176,9 @@ fn mount_host(path: &Path, root_canonical: &Path) -> Option<PathBuf> {
     host.starts_with(root_canonical).then_some(host)
 }
 
-impl RunFiles {
-    /// Scans the run directory for what to inject at container start: the
-    /// `env` file becomes the `--env-file`, and every other top-level entry
-    /// (files, directories, dotfiles, symlinks) is mounted read-only at the
-    /// matching path under the container home. Symlinks are resolved to
-    /// their target, so the mounted content is the target's live content.
-    ///
-    /// A missing directory yields an empty [`RunFiles`]; the caller creates
-    /// it on first use.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the run directory exists but cannot be read, or
-    /// an entry cannot be mounted (name not usable in a volume spec, `env`
-    /// not a file, broken symlink).
-    fn discover(run_dir: &Path) -> Result<Self> {
-        let mut env_file = None;
-        let mut mounts = Vec::new();
-        if run_dir.is_dir() {
-            for entry in read_dir_entries(run_dir)? {
-                let name = entry.file_name();
-                if name.to_str() == Some(RUN_ENV_FILE) {
-                    env_file = Some(env_file_path(run_dir)?);
-                } else {
-                    mounts.push(mount_for(run_dir, &name)?);
-                }
-            }
-        } else if run_dir.exists() {
-            return Err(anyhow!(
-                "run directory `{}` is not a directory",
-                run_dir.display()
-            ));
-        }
-        // Symlink resolution can reorder entries; sort for deterministic
-        // command lines.
-        mounts.sort_by(|a, b| a.host.cmp(&b.host));
-        Ok(Self { env_file, mounts })
-    }
-}
-
-/// Returns the entries of the run directory sorted by name, so the mount
-/// order is deterministic.
-///
-/// # Errors
-///
-/// Returns an error when the directory cannot be read.
-fn read_dir_entries(run_dir: &Path) -> Result<Vec<fs::DirEntry>> {
-    let mut entries: Vec<fs::DirEntry> = fs::read_dir(run_dir)
-        .with_context(|| format!("failed to read run directory `{}`", run_dir.display()))?
-        .collect::<std::io::Result<_>>()
-        .with_context(|| format!("failed to read run directory `{}`", run_dir.display()))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    Ok(entries)
-}
-
-/// Validates the `env` entry is a file (following symlinks) and returns its
-/// path.
-///
-/// # Errors
-///
-/// Returns an error when the entry is not a file, e.g. a directory.
-fn env_file_path(run_dir: &Path) -> Result<PathBuf> {
-    let path = run_dir.join(RUN_ENV_FILE);
-    if !path.is_file() {
-        return Err(anyhow!(
-            "`{RUN_ENV_FILE}` in run directory `{}` is not a file",
-            run_dir.display()
-        ));
-    }
-    Ok(path)
-}
-
-/// Builds the mount for one run directory entry: the host side is the entry
-/// itself with symlinks resolved, the container side is the entry's name
-/// placed in the container home.
-///
-/// # Errors
-///
-/// Returns an error when the name is not usable in a volume spec or the
-/// entry's symlink target cannot be resolved.
-fn mount_for(run_dir: &Path, name: &OsStr) -> Result<RunMount> {
-    let name = name
-        .to_str()
-        .filter(|name| !name.contains(':'))
-        .ok_or_else(|| {
-            anyhow!(
-                "cannot mount `{}` in run directory `{}`: the name must be valid UTF-8 without `:`",
-                Path::new(name).display(),
-                run_dir.display()
-            )
-        })?;
-    let host = fs::canonicalize(run_dir.join(name)).with_context(|| {
-        format!(
-            "cannot resolve `{}` in run directory `{}` (broken symlink?)",
-            name,
-            run_dir.display()
-        )
-    })?;
-    Ok(RunMount {
-        host,
-        dest: Path::new(CONTAINER_HOME).join(name),
-    })
-}
-
 /// Resolves the configured shared mounts into mounts for this run: expands
 /// a leading `~` in each source to the home directory and canonicalizes it
-/// (symlinks mount their target, like the run directory), keeping the
+/// (symlinks mount their target), keeping the
 /// configured container target and permission. Entries keep their config
 /// order, so a later shared mount can override an earlier one at the same
 /// target.
@@ -271,31 +223,17 @@ fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
 }
 
 /// Returns warnings for shared mounts whose intent a later mount silently
-/// defeats: a run directory entry at the same or a deeper target replaces
-/// part or all of the shared mount's content (the run directory is mounted
-/// after the shared mounts and is always read-only), or a read-write shared
-/// mount at or under the `.git` target lets tools in the container modify
-/// version control state despite the read-only `.git` mount. An ancestor
-/// mount does not hide a child mount, so only these directions conflict.
+/// defeats: a read-write shared mount at or under the `.git` target lets
+/// tools in the container modify version control state despite the
+/// read-only `.git` mount.
 fn mount_conflicts(
     project_dest: &Path,
     git_mounted: bool,
     shared: &[ResolvedShared],
-    run_files: &RunFiles,
 ) -> Vec<String> {
     let git_dest = git_mounted.then(|| project_dest.join(".git"));
     let mut warnings = Vec::new();
     for entry in shared {
-        for mount in &run_files.mounts {
-            if mount.dest.starts_with(&entry.dest) {
-                warnings.push(format!(
-                    "the run directory entry at `{}` replaces the shared mount of `{}` at `{}` or part of it: the run directory is mounted after the shared mounts and is always read-only",
-                    mount.dest.display(),
-                    entry.host.display(),
-                    entry.dest.display()
-                ));
-            }
-        }
         if entry.permission == Permission::ReadWrite
             && git_dest
                 .as_deref()
@@ -408,42 +346,40 @@ struct HostIds {
     gid: String,
 }
 
-/// Runs the container from the built image, executing `command` inside it
-/// (empty runs the default shell). When the container system has not been
-/// started yet, boots it first with `container system start`. `container
-/// run --rm` is spawned
-/// as a child instead of replacing this process, so silo outlives it and
-/// always cleans up afterwards: signals (SIGINT, SIGTERM, SIGHUP, SIGQUIT)
-/// are forwarded to the child so the container shuts down, and once the
-/// child exits for any reason the container is force-deleted (killed if
-/// still running), the terminal is restored, and the run's exit status is
-/// passed through. If silo itself is killed hard (e.g. `kill -9`), the
-/// container ID stays marked in the state directory and the next `silo run`
-/// sweeps it. Files and env vars from the run directory
-/// (`~/.config/silo/run`) are injected at start, the configured `[[shared]]`
-/// mounts are resolved and applied, and the project's `.git` directory is
-/// mounted read-only on top of the read-write project mount when the config
-/// enables it.
+/// Runs a command in this project's shared container, or in a one-shot
+/// foreground container when `isolated` is set or the configured image is
+/// custom. Custom images retain the image-defined user, command, and runtime
+/// filesystem contract through the established one-shot lifecycle. Shared
+/// runs serialize only ensure operations, then release the project lock before
+/// attaching an exec session so any number of sessions can run concurrently.
 ///
 /// # Errors
 ///
-/// Returns an error when the image is not built yet, the host ids cannot be
-/// determined, the run directory cannot be scanned, a signal handler cannot
-/// be installed, or the container CLI is missing.
-pub fn run_image(config: &Config, command: &[OsString]) -> Result<ExitCode> {
-    let (exists, stderr) = inspect_image()?;
-    if !exists {
-        return Err(inspect_error(&stderr));
+/// Returns an error when setup, state inspection, container creation, or the
+/// attached process fails.
+pub fn run_image(config: &Config, command: &[OsString], isolated: bool) -> Result<ExitCode> {
+    if uses_isolated_lifecycle(config, isolated) {
+        require_image()?;
+        return run_isolated(config, command);
     }
-    install_signal_handlers()?;
+    run_shared(config, command)
+}
+
+/// Custom images cannot rely on the built-in image's shared-container user,
+/// home, shell, or keeper process, so preserve their image-agnostic lifecycle.
+fn uses_isolated_lifecycle(config: &Config, isolated: bool) -> bool {
+    isolated || config.image.dockerfile.is_some()
+}
+
+/// Runs the existing ephemeral `container run --rm` lifecycle.
+fn run_isolated(config: &Config, command: &[OsString]) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
     let ids = host_ids()?;
-    let run_files = run_files()?;
     let shared = resolve_shared(
         &config.shared,
         std::env::var_os("HOME").as_deref().map(Path::new),
     )?;
-    let id = container_id();
+    let id = isolated_container_id();
     // Build the command first: it only fails on path validation, before any
     // container exists or a marker is written.
     let git_mount = git_mount_host(&cwd, config.read_only_git);
@@ -451,27 +387,26 @@ pub fn run_image(config: &Config, command: &[OsString]) -> Result<ExitCode> {
         git: git_mount,
         shared,
     };
-    let mut run = run_command(
+    let mut run = isolated_run_command(
         std::io::stdin().is_terminal(),
         &cwd,
         &ids,
-        &run_files,
         &config_mounts,
         &id,
         command,
     )?;
     // Warn about shared mounts whose intent a later mount defeats, e.g. a
-    // run directory entry shadowing a read-write shared mount.
+    // read-write shared mount overlapping the read-only `.git`.
     let shared_dir = shared_dir_name(&cwd)?;
     for warning in mount_conflicts(
         &shared_dir,
         config_mounts.git.is_some(),
         &config_mounts.shared,
-        &run_files,
     ) {
         eprintln!("warning: {warning}");
     }
-    sweep_stale_containers();
+    sweep_stale_containers(None);
+    install_signal_handlers()?;
     register_container(&id);
     // Captured before the child starts, so it holds the pre-raw-mode state.
     let terminal = SavedTerminal::capture();
@@ -485,12 +420,107 @@ pub fn run_image(config: &Config, command: &[OsString]) -> Result<ExitCode> {
     status.map(exit_code)
 }
 
-/// Returns the ID of this run's container, `<prefix><pid>`. The container
-/// CLI uses the `--name` value as the container ID, so silo knows it before
-/// the run starts and can remove the container afterwards without parsing
-/// any output.
-fn container_id() -> String {
+/// Ensures the shared project container and attaches one exec session.
+fn run_shared(config: &Config, command: &[OsString]) -> Result<ExitCode> {
+    let project = Project::current()?;
+
+    // Sweep unrelated leftovers before locking this project's ensure path.
+    sweep_stale_containers(Some(&project.id));
+    let state_dir = runtime_state_dir()?;
+    let lock_path = lock_path(&state_dir, &project.id);
+    let lock = ProjectLock::acquire(&lock_path, false)?
+        .ok_or_else(|| anyhow!("project lock unexpectedly unavailable"))?;
+    ensure_shared_container(&project, config, &state_dir)?;
+    drop(lock);
+
+    // The attached process owns the terminal, but not the shared container.
+    let mut exec = exec_command(std::io::stdin().is_terminal(), &project, command);
+    install_signal_handlers()?;
+    let terminal = SavedTerminal::capture();
+    let mut child = exec.spawn().map_err(spawn_error)?;
+    let pid = libc::pid_t::try_from(child.id()).expect("child pid fits in pid_t");
+    let status = wait_for_child(&mut child, pid);
+    if let Some(terminal) = &terminal {
+        terminal.restore();
+    }
+    status.map(exit_code)
+}
+
+/// Resolves all creation-time config mounts for a project.
+fn resolve_config_mounts(config: &Config, cwd: &Path) -> Result<ConfigMounts> {
+    Ok(ConfigMounts {
+        git: git_mount_host(cwd, config.read_only_git),
+        shared: resolve_shared(
+            &config.shared,
+            std::env::var_os("HOME").as_deref().map(Path::new),
+        )?,
+    })
+}
+
+/// Reports mount-order conflicts before creating a container.
+fn warn_mount_conflicts(project: &Project, config_mounts: &ConfigMounts) {
+    for warning in mount_conflicts(
+        &project.workdir,
+        config_mounts.git.is_some(),
+        &config_mounts.shared,
+    ) {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// Stops and deletes the shared container for the current project.
+///
+/// An absent container is an idempotent success.
+pub fn stop_image() -> Result<ExitCode> {
+    let project = Project::current()?;
+    let state_dir = runtime_state_dir()?;
+    let lock = ProjectLock::acquire(&lock_path(&state_dir, &project.id), false)?
+        .ok_or_else(|| anyhow!("project lock unexpectedly unavailable"))?;
+    if let Some(marker) = read_marker(&state_dir, &project.id)?
+        && marker.project != project.root
+    {
+        return Err(anyhow!(
+            "refusing to stop `{}` because its marker belongs to `{}`",
+            project.id,
+            marker.project.display()
+        ));
+    }
+    let state = settled_container_state(&project.id)?;
+
+    // Stop gracefully when needed, then delete the inert container record.
+    if state == ContainerState::Running {
+        run_checked(
+            Command::new(CONTAINER_BIN).args(["stop", &project.id]),
+            "stop shared container",
+        )?;
+    }
+    if matches!(state, ContainerState::Stopping | ContainerState::Unknown) {
+        return Err(anyhow!(
+            "container `{}` is in an unusable state and was not deleted",
+            project.id
+        ));
+    }
+    if state != ContainerState::Absent {
+        run_checked(
+            Command::new(CONTAINER_BIN).args(["delete", &project.id]),
+            "delete shared container",
+        )?;
+    }
+    remove_shared_state(&state_dir, &project.id);
+    drop(lock);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Returns the legacy one-shot ID, `<prefix><pid>`.
+fn isolated_container_id() -> String {
     format!("{CONTAINER_NAME_PREFIX}{}", std::process::id())
+}
+
+/// Returns the deterministic shared ID derived from a canonical project path.
+fn project_container_id(project: &Path) -> String {
+    let digest = Sha256::digest(project.as_os_str().as_bytes());
+    let hex = format!("{digest:x}");
+    format!("{CONTAINER_NAME_PREFIX}{}", &hex[..PROJECT_DIGEST_HEX_LEN])
 }
 
 /// Signal received by silo while the container runs, recorded by the
@@ -592,6 +622,316 @@ fn container_state_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option
     crate::config::config_dir_from(xdg, home).map(|dir| dir.join(CONTAINER_STATE_DIR))
 }
 
+/// Returns a writable state directory even when no home directory is known.
+fn runtime_state_dir() -> Result<PathBuf> {
+    let dir = container_state_dir().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("silo-{}", unsafe { libc::geteuid() }))
+    });
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create state dir `{}`", dir.display()))?;
+    Ok(dir)
+}
+
+fn marker_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.json"))
+}
+
+fn lock_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.lock"))
+}
+
+fn cidfile_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.cid"))
+}
+
+fn marker_temp_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.json.tmp"))
+}
+
+/// Persists a shared marker while its project lock is held.
+fn write_marker(dir: &Path, marker: &ContainerMarker) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(marker).context("failed to encode container marker")?;
+    let path = marker_path(dir, &marker.container_id);
+    let temp = marker_temp_path(dir, &marker.container_id);
+
+    // Fully persist the replacement before the atomic rename, so interruption
+    // cannot leave the live marker truncated or partially encoded.
+    let write_result = (|| -> Result<()> {
+        let mut file = File::create(&temp)
+            .with_context(|| format!("failed to create marker `{}`", temp.display()))?;
+        file.write_all(&bytes)
+            .with_context(|| format!("failed to write marker `{}`", temp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync marker `{}`", temp.display()))?;
+        fs::rename(&temp, &path).with_context(|| {
+            format!(
+                "failed to replace marker `{}` from temporary `{}`",
+                path.display(),
+                temp.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    write_result
+}
+
+/// Loads and validates a shared marker when one exists.
+fn read_marker(dir: &Path, id: &str) -> Result<Option<ContainerMarker>> {
+    let path = marker_path(dir, id);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read marker `{}`", path.display()));
+        }
+    };
+    let marker: ContainerMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid container marker `{}`", path.display()))?;
+    if marker.version != MARKER_VERSION || marker.container_id != id {
+        return Err(anyhow!(
+            "container marker `{}` is inconsistent",
+            path.display()
+        ));
+    }
+    Ok(Some(marker))
+}
+
+/// Removes the marker and temporary cidfile after confirmed deletion.
+fn remove_shared_state(dir: &Path, id: &str) {
+    let _ = fs::remove_file(marker_path(dir, id));
+    let _ = fs::remove_file(marker_temp_path(dir, id));
+    let _ = fs::remove_file(cidfile_path(dir, id));
+}
+
+/// Ensures the deterministic container exists and is running.
+fn ensure_shared_container(project: &Project, config: &Config, state_dir: &Path) -> Result<()> {
+    let marker = read_marker(state_dir, &project.id)?;
+    if let Some(marker) = &marker
+        && marker.project != project.root
+    {
+        return Err(anyhow!(
+            "container ID `{}` belongs to project `{}`, not `{}`",
+            project.id,
+            marker.project.display(),
+            project.root.display()
+        ));
+    }
+
+    match settled_container_state(&project.id)? {
+        ContainerState::Absent => create_missing_shared_container(project, config, state_dir),
+        ContainerState::Stopped => {
+            require_marker(marker.as_ref(), project)?;
+            run_checked(
+                Command::new(CONTAINER_BIN).args(["start", &project.id]),
+                "start shared container",
+            )?;
+            if inspect_container(&project.id)? == ContainerState::Running {
+                Ok(())
+            } else {
+                Err(anyhow!("shared container `{}` did not start", project.id))
+            }
+        }
+        ContainerState::Running => {
+            require_marker(marker.as_ref(), project)?;
+            Ok(())
+        }
+        ContainerState::Stopping | ContainerState::Unknown => Err(anyhow!(
+            "container `{}` did not reach a usable state",
+            project.id
+        )),
+    }
+}
+
+/// Resolves creation-only inputs and creates an absent shared container.
+fn create_missing_shared_container(
+    project: &Project,
+    config: &Config,
+    state_dir: &Path,
+) -> Result<()> {
+    // Existing containers do not need their original image tag or mounts;
+    // only the absent branch performs these creation checks.
+    require_image()?;
+    let ids = host_ids()?;
+    let config_mounts = resolve_config_mounts(config, &project.root)?;
+    warn_mount_conflicts(project, &config_mounts);
+    create_shared_container(project, &ids, &config_mounts, state_dir)
+}
+
+/// Rejects markerless deterministic containers instead of adopting them.
+fn require_marker(marker: Option<&ContainerMarker>, project: &Project) -> Result<()> {
+    if marker.is_some() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "container `{}` exists without silo state; run `silo stop` to remove it safely",
+        project.id
+    ))
+}
+
+/// Waits briefly for a stopping container before ensure decides what to do.
+fn settled_container_state(id: &str) -> Result<ContainerState> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = inspect_container(id)?;
+        if state != ContainerState::Stopping || Instant::now() >= deadline {
+            return Ok(state);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Creates and verifies a detached shared container.
+fn create_shared_container(
+    project: &Project,
+    ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    state_dir: &Path,
+) -> Result<()> {
+    let cidfile = cidfile_path(state_dir, &project.id);
+    let _ = fs::remove_file(&cidfile);
+    let mut create = create_command(project, ids, config_mounts, &cidfile)?;
+    write_marker(state_dir, &ContainerMarker::new(project))?;
+
+    // The provisional marker makes an interrupted creation discoverable.
+    let output = match create.output() {
+        Ok(output) => output,
+        Err(err) => {
+            remove_shared_state(state_dir, &project.id);
+            return Err(spawn_error(err));
+        }
+    };
+    if !output.status.success() {
+        cleanup_failed_run(state_dir, &project.id, &cidfile);
+        return Err(anyhow!(
+            "failed to create shared container `{}`: {}",
+            project.id,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let recorded = match fs::read_to_string(&cidfile) {
+        Ok(recorded) => recorded,
+        Err(err) => {
+            cleanup_failed_creation(state_dir, &project.id);
+            return Err(err)
+                .with_context(|| format!("failed to read cidfile `{}`", cidfile.display()));
+        }
+    };
+    if recorded.trim() != project.id {
+        cleanup_failed_creation(state_dir, &project.id);
+        return Err(anyhow!(
+            "container runtime wrote unexpected ID `{}` to `{}`",
+            recorded.trim(),
+            cidfile.display()
+        ));
+    }
+    let _ = fs::remove_file(&cidfile);
+    let state = match inspect_container(&project.id) {
+        Ok(state) => state,
+        Err(err) => {
+            cleanup_failed_creation(state_dir, &project.id);
+            return Err(err);
+        }
+    };
+    if state != ContainerState::Running {
+        cleanup_failed_creation(state_dir, &project.id);
+        return Err(anyhow!(
+            "shared container `{}` stopped during startup",
+            project.id
+        ));
+    }
+    Ok(())
+}
+
+/// Cleans a failed `run` only when its cidfile proves this invocation created it.
+fn cleanup_failed_run(state_dir: &Path, id: &str, cidfile: &Path) {
+    let created_here = fs::read_to_string(cidfile).is_ok_and(|value| value.trim() == id);
+    if created_here {
+        cleanup_failed_creation(state_dir, id);
+    } else {
+        remove_shared_state(state_dir, id);
+    }
+}
+
+/// Removes a partially created container and clears state only once gone.
+fn cleanup_failed_creation(state_dir: &Path, id: &str) {
+    match delete_container(id) {
+        Ok(()) => remove_shared_state(state_dir, id),
+        Err(err) => {
+            eprintln!("warning: could not remove partially created container `{id}`: {err:#}");
+        }
+    }
+}
+
+/// Inspects a container, booting the container system and retrying once when needed.
+fn inspect_container(id: &str) -> Result<ContainerState> {
+    let (state, stderr) = probe_container(id)?;
+    if state.is_none() && system_not_started(&stderr) && start_container_system() {
+        let (state, stderr) = probe_container(id)?;
+        return state.ok_or_else(|| container_inspect_error(id, &stderr));
+    }
+    state.ok_or_else(|| container_inspect_error(id, &stderr))
+}
+
+/// Runs one raw container inspection; not-found is represented as absence.
+fn probe_container(id: &str) -> Result<(Option<ContainerState>, String)> {
+    let output = Command::new(CONTAINER_BIN)
+        .args(["inspect", id])
+        .output()
+        .map_err(spawn_error)?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        return Ok((Some(parse_container_state(&output.stdout, id)?), stderr));
+    }
+    if stderr.to_lowercase().contains("not found") {
+        return Ok((Some(ContainerState::Absent), stderr));
+    }
+    Ok((None, stderr))
+}
+
+fn container_inspect_error(id: &str, stderr: &str) -> anyhow::Error {
+    anyhow!("could not inspect container `{id}`: {stderr}")
+}
+
+/// Parses current `status.state` and legacy flat `status` inspect shapes.
+fn parse_container_state(stdout: &[u8], id: &str) -> Result<ContainerState> {
+    let items: Vec<Value> =
+        serde_json::from_slice(stdout).context("invalid container inspect JSON")?;
+    let item = items
+        .iter()
+        .find(|item| {
+            item.get("id").and_then(Value::as_str) == Some(id)
+                || item.pointer("/configuration/id").and_then(Value::as_str) == Some(id)
+        })
+        .ok_or_else(|| anyhow!("container inspect did not return `{id}`"))?;
+    let status = item
+        .pointer("/status/state")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("status").and_then(Value::as_str))
+        .ok_or_else(|| anyhow!("container inspect omitted the state for `{id}`"))?;
+    Ok(match status {
+        "running" => ContainerState::Running,
+        "stopped" => ContainerState::Stopped,
+        "stopping" => ContainerState::Stopping,
+        _ => ContainerState::Unknown,
+    })
+}
+
+/// Executes a non-interactive lifecycle command and includes stderr on failure.
+fn run_checked(command: &mut Command, action: &str) -> Result<()> {
+    let output = command.output().map_err(spawn_error)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "failed to {action}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
 /// Records this run's container ID in the state directory before the child
 /// starts, so a silo killed hard (e.g. `kill -9`) leaves a marker the next
 /// run sweeps. Best effort: a warning is printed instead of failing the
@@ -633,22 +973,79 @@ fn unregister_container_in(dir: &Path, id: &str) {
     let _ = fs::remove_file(dir.join(id));
 }
 
-/// Force-deletes containers left behind by silo runs that died before
-/// cleaning up (killed, crashed): every marked container whose silo process
-/// is no longer alive. Containers of concurrent, still-running silo
-/// sessions are left alone (their marker's pid is alive). Markers are
-/// removed once their container is gone.
-fn sweep_stale_containers() {
-    let Some(dir) = container_state_dir() else {
+/// Sweeps dead-owner shared markers without touching running containers.
+fn sweep_stale_containers(skip_id: Option<&str>) {
+    let Ok(dir) = runtime_state_dir() else {
         return;
     };
-    sweep_stale_in(&dir, delete_container);
+    sweep_shared_in(&dir, skip_id, inspect_container, delete_container);
+    sweep_legacy_in(&dir, delete_container);
 }
 
-/// Pure version of [`sweep_stale_containers`], taking the state directory
-/// and the delete operation so the sweep logic is testable without a
-/// container CLI.
-fn sweep_stale_in(dir: &Path, mut delete: impl FnMut(&str) -> Result<()>) {
+/// Testable shared-marker sweep implementation.
+fn sweep_shared_in(
+    dir: &Path,
+    skip_id: Option<&str>,
+    mut inspect: impl FnMut(&str) -> Result<ContainerState>,
+    mut delete: impl FnMut(&str) -> Result<()>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(marker) = serde_json::from_slice::<ContainerMarker>(&bytes) else {
+            eprintln!(
+                "warning: ignoring invalid container marker `{}`",
+                path.display()
+            );
+            continue;
+        };
+        let id = marker.container_id.as_str();
+        if marker.version != MARKER_VERSION
+            || path.file_stem().and_then(OsStr::to_str) != Some(id)
+            || !id.starts_with(CONTAINER_NAME_PREFIX)
+        {
+            eprintln!(
+                "warning: ignoring inconsistent container marker `{}`",
+                path.display()
+            );
+            continue;
+        }
+        if skip_id == Some(id) {
+            continue;
+        }
+        let Ok(pid) = libc::pid_t::try_from(marker.creator_pid) else {
+            continue;
+        };
+        if owner_alive(pid) {
+            continue;
+        }
+        let Ok(Some(_lock)) = ProjectLock::acquire(&lock_path(dir, id), true) else {
+            continue;
+        };
+        match inspect(id) {
+            Ok(ContainerState::Absent) => remove_shared_state(dir, id),
+            Ok(ContainerState::Stopped) => match delete(id) {
+                Ok(()) => remove_shared_state(dir, id),
+                Err(err) => {
+                    eprintln!("warning: could not remove stale container `{id}`: {err:#}");
+                }
+            },
+            Ok(ContainerState::Running | ContainerState::Stopping | ContainerState::Unknown) => {}
+            Err(err) => eprintln!("warning: could not inspect stale container `{id}`: {err:#}"),
+        }
+    }
+}
+
+/// Preserves cleanup for PID-named markers written by older isolated runs.
+fn sweep_legacy_in(dir: &Path, mut delete: impl FnMut(&str) -> Result<()>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -726,38 +1123,6 @@ fn cleanup_container(id: &str) {
     }
 }
 
-/// Discovers the run directory contents to inject into the container,
-/// creating the directory with a commented `env` template on first use. With
-/// no home directory the feature is skipped silently.
-///
-/// # Errors
-///
-/// Returns an error when the run directory cannot be scanned.
-fn run_files() -> Result<RunFiles> {
-    let Some(run_dir) = crate::config::run_dir() else {
-        return Ok(RunFiles::default());
-    };
-    ensure_run_dir(&run_dir);
-    RunFiles::discover(&run_dir)
-}
-
-/// Creates the run directory and its commented `env` template on first use,
-/// warning instead of failing so an unwritable home directory never breaks a
-/// command.
-fn ensure_run_dir(run_dir: &Path) {
-    if run_dir.exists() {
-        return;
-    }
-    if let Err(err) = fs::create_dir_all(run_dir)
-        .and_then(|()| fs::write(run_dir.join(RUN_ENV_FILE), RUN_ENV_TEMPLATE))
-    {
-        eprintln!(
-            "warning: could not create run directory at `{}`: {err:#}",
-            run_dir.display()
-        );
-    }
-}
-
 /// Builds the error reported when the image check failed, treating a missing
 /// image ("not found" in the probe's stderr) separately from other probe
 /// failures (e.g. the container system service is not running).
@@ -800,6 +1165,16 @@ fn start_container_system() -> bool {
 /// reported unchanged so the user still sees the original failure.
 fn inspect_image() -> Result<(bool, String)> {
     inspect_image_with(probe_image, start_container_system)
+}
+
+/// Requires the built image only for operations that create a container.
+fn require_image() -> Result<()> {
+    let (exists, stderr) = inspect_image()?;
+    if exists {
+        Ok(())
+    } else {
+        Err(inspect_error(&stderr))
+    }
 }
 
 /// The probe/boot/reprobe logic behind [`inspect_image`], separated so tests
@@ -988,41 +1363,65 @@ fn id_of(flag: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Builds the `container run` command that shares the current directory with
-/// the container, mounting it inside the `silo` user's home so the shell
-/// starts there with all files reachable, forwards the host user's ids for
-/// uid remapping, injects the run directory's files and env vars
-/// ([`RunFiles`]), applies the config-driven mounts ([`ConfigMounts`]: the
-/// project's `.git` read-only and the configured shared mounts, read-only
-/// or read-write), names the container [`container_id`] so its ID is known up
-/// front for cleanup, and runs `command` inside it (empty runs the image's
-/// default command, the shell).
+/// Builds the legacy one-shot `container run --rm` command.
 ///
 /// # Errors
 ///
 /// Returns an error when the current directory has no name (e.g. `/`), or
 /// its path or a mount's path cannot be expressed in a volume spec.
-fn run_command(
+fn isolated_run_command(
     interactive: bool,
     cwd: &Path,
     host_ids: &HostIds,
-    run_files: &RunFiles,
     config_mounts: &ConfigMounts,
     id: &str,
     command: &[OsString],
 ) -> Result<Command> {
     let shared_dir = shared_dir_name(cwd)?;
-    let host_dir = volume_host_path(cwd)?;
     let mut run = Command::new(CONTAINER_BIN);
     run.arg("run").arg("--name").arg(id).arg("--rm").arg("-i");
     if interactive {
         // Allocating a pty without a terminal fails with ENOTTY.
         run.arg("-t");
     }
+    append_creation_mounts(&mut run, cwd, &shared_dir, config_mounts)?;
+    append_host_ids(&mut run, host_ids);
+    run.arg(IMAGE_TAG).args(command);
+    Ok(run)
+}
+
+/// Builds the detached creation command for a shared project container.
+fn create_command(
+    project: &Project,
+    host_ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    cidfile: &Path,
+) -> Result<Command> {
+    let mut run = Command::new(CONTAINER_BIN);
+    run.arg("run")
+        .arg("--name")
+        .arg(&project.id)
+        .arg("--cidfile")
+        .arg(cidfile)
+        .arg("-d");
+    append_creation_mounts(&mut run, &project.root, &project.workdir, config_mounts)?;
+    append_host_ids(&mut run, host_ids);
+    run.arg(IMAGE_TAG).args(SHARED_INIT_COMMAND);
+    Ok(run)
+}
+
+/// Adds mounts in their established override order and selects the workdir.
+fn append_creation_mounts(
+    run: &mut Command,
+    cwd: &Path,
+    shared_dir: &Path,
+    config_mounts: &ConfigMounts,
+) -> Result<()> {
+    let host_dir = volume_host_path(cwd)?;
     run.arg("-v")
         .arg(format!("{host_dir}:{}", shared_dir.display()))
         .arg("-w")
-        .arg(&shared_dir);
+        .arg(shared_dir);
     if let Some(host) = &config_mounts.git {
         // The project's `.git` is mounted read-only on top of the
         // read-write project mount, so tools in the container cannot modify
@@ -1041,21 +1440,37 @@ fn run_command(
         };
         run.arg("-v").arg(spec);
     }
-    for mount in &run_files.mounts {
-        let host = mount_host_path(&mount.host)?;
-        run.arg("-v")
-            .arg(format!("{host}:{}:ro", mount.dest.display()));
-    }
-    if let Some(env_file) = &run_files.env_file {
-        run.arg("--env-file").arg(env_file);
-    }
+    Ok(())
+}
+
+/// Adds only the stable IDs required by the shared container's entrypoint.
+fn append_host_ids(run: &mut Command, host_ids: &HostIds) {
     run.arg("--env")
         .arg(format!("SILO_UID={}", host_ids.uid))
         .arg("--env")
-        .arg(format!("SILO_GID={}", host_ids.gid))
-        .arg(IMAGE_TAG)
-        .args(command);
-    Ok(run)
+        .arg(format!("SILO_GID={}", host_ids.gid));
+}
+
+/// Builds one session attachment command for the running shared container.
+fn exec_command(interactive: bool, project: &Project, command: &[OsString]) -> Command {
+    let mut exec = Command::new(CONTAINER_BIN);
+    exec.arg("exec").arg("-i");
+    if interactive {
+        exec.arg("-t");
+    }
+    exec.arg("--user")
+        .arg("silo")
+        .arg("--workdir")
+        .arg(&project.workdir);
+    exec.arg("--env")
+        .arg(format!("HOME={CONTAINER_HOME}"))
+        .arg(&project.id);
+    if command.is_empty() {
+        exec.arg(DEFAULT_SESSION_COMMAND);
+    } else {
+        exec.args(command);
+    }
+    exec
 }
 
 /// Returns the host side of the shared-directory volume spec, rejecting
@@ -1070,7 +1485,7 @@ fn volume_host_path(cwd: &Path) -> Result<&str> {
     spec_host_path(cwd, "share")
 }
 
-/// Like [`volume_host_path`], for the run directory mounts.
+/// Like [`volume_host_path`], for the shared and `.git` mount paths.
 fn mount_host_path(path: &Path) -> Result<&str> {
     spec_host_path(path, "mount")
 }
