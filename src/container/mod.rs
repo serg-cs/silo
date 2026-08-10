@@ -1,17 +1,16 @@
-use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -22,6 +21,15 @@ pub const IMAGE_TAG: &str = "silo:latest";
 
 /// Dockerfile embedded into the executable at compile time.
 pub const DOCKERFILE: &str = include_str!("silo.dockerfile");
+
+/// Supervisor embedded alongside the built-in Dockerfile.
+const SUPERVISOR: &str = include_str!("silo-supervisor.sh");
+
+/// Session lease wrapper embedded alongside the built-in Dockerfile.
+const SESSION_WRAPPER: &str = include_str!("silo-session.sh");
+
+/// Session reservation helper embedded alongside the built-in Dockerfile.
+const SESSION_RESERVER: &str = include_str!("silo-reserve.sh");
 
 const CONTAINER_BIN: &str = "container";
 
@@ -34,20 +42,36 @@ const GIT_DIR: &str = ".git";
 /// Prefix of every `--name` silo passes to `container run`.
 const CONTAINER_NAME_PREFIX: &str = "silo-";
 
-/// Config subdirectory holding markers, locks, and transient cidfiles.
-const CONTAINER_STATE_DIR: &str = "containers";
-
-/// Current on-disk marker schema version.
-const MARKER_VERSION: u8 = 1;
-
 /// Amount of the SHA-256 digest used in a shared container ID.
 const PROJECT_DIGEST_HEX_LEN: usize = 24;
 
 /// Default command for a shared session when the user supplies none.
 const DEFAULT_SESSION_COMMAND: &str = "nu";
 
-/// Init command that keeps a shared container available for exec sessions.
-const SHARED_INIT_COMMAND: [&str; 2] = ["sleep", "infinity"];
+/// PID 1 for shared containers; it exits when the final guest-side session
+/// lease closes.
+const SHARED_INIT_COMMAND: &str = "/usr/local/bin/silo-supervisor";
+
+/// Guest wrapper that holds a shared lease for the command and all children.
+const SESSION_WRAPPER_COMMAND: &str = "/usr/local/bin/silo-session";
+const SESSION_RESERVE_COMMAND: &str = "/usr/local/bin/silo-reserve";
+const GUEST_READY_PATH: &str = "/run/silo/ready";
+
+const LABEL_OWNER: &str = "dev.silo.owner";
+const LABEL_SCHEMA: &str = "dev.silo.schema";
+const LABEL_PROJECT: &str = "dev.silo.project";
+const LABEL_LIFECYCLE: &str = "dev.silo.lifecycle";
+const LABEL_SPEC: &str = "dev.silo.spec";
+const LABEL_OWNER_VALUE: &str = "silo";
+const LABEL_SCHEMA_VALUE: &str = "1";
+const LABEL_SHARED_VALUE: &str = "shared";
+const LABEL_ISOLATED_VALUE: &str = "isolated";
+const LIFECYCLE_PROTOCOL_VERSION: &str = "2";
+
+/// Runtime races are retried only for this bounded interval.
+const CONFLICT_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+const CONFLICT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const GUEST_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Home directory of the container's `silo` user; the shared project
 /// directory is mounted into it as `<home>/<project-name>`.
@@ -122,57 +146,27 @@ enum ContainerState {
     Unknown,
 }
 
-/// Durable ownership metadata for a shared container.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ContainerMarker {
-    version: u8,
-    container_id: String,
-    project: PathBuf,
-    creator_pid: u32,
+/// The complete durable record returned by `container inspect`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerInspection {
+    state: ContainerState,
+    labels: HashMap<String, String>,
 }
 
-impl ContainerMarker {
-    fn new(project: &Project) -> Self {
+impl ContainerInspection {
+    fn absent() -> Self {
         Self {
-            version: MARKER_VERSION,
-            container_id: project.id.clone(),
-            project: project.root.clone(),
-            creator_pid: std::process::id(),
+            state: ContainerState::Absent,
+            labels: HashMap::new(),
         }
     }
 }
 
-/// Exclusive per-project file lock held only while container state changes.
-struct ProjectLock(File);
-
-impl ProjectLock {
-    /// Acquires the project lock, optionally returning immediately when busy.
-    fn acquire(path: &Path, nonblocking: bool) -> Result<Option<Self>> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("failed to open project lock `{}`", path.display()))?;
-        let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
-        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-            return Ok(Some(Self(file)));
-        }
-        let err = io::Error::last_os_error();
-        let code = err.raw_os_error();
-        if nonblocking && (code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN)) {
-            return Ok(None);
-        }
-        Err(err).with_context(|| format!("failed to lock `{}`", path.display()))
-    }
-}
-
-impl Drop for ProjectLock {
-    fn drop(&mut self) {
-        // Closing the file also releases the lock; unlock explicitly for clarity.
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
-    }
+/// Runtime labels expected on the deterministic shared container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerIdentity {
+    project: String,
+    spec: String,
 }
 
 /// Returns the host side of the read-only `.git` mount: the canonical path
@@ -290,6 +284,18 @@ impl BuildDir {
     fn dockerfile(&self) -> PathBuf {
         self.0.join("silo.dockerfile")
     }
+
+    fn supervisor(&self) -> PathBuf {
+        self.0.join("silo-supervisor.sh")
+    }
+
+    fn session_wrapper(&self) -> PathBuf {
+        self.0.join("silo-session.sh")
+    }
+
+    fn session_reserver(&self) -> PathBuf {
+        self.0.join("silo-reserve.sh")
+    }
 }
 
 impl Drop for BuildDir {
@@ -318,6 +324,11 @@ pub fn build_image(config: &Config) -> Result<ExitCode> {
     }
     let build_dir = BuildDir::create()?;
     fs::write(build_dir.dockerfile(), DOCKERFILE).context("failed to write Dockerfile")?;
+    fs::write(build_dir.supervisor(), SUPERVISOR).context("failed to write supervisor")?;
+    fs::write(build_dir.session_wrapper(), SESSION_WRAPPER)
+        .context("failed to write session wrapper")?;
+    fs::write(build_dir.session_reserver(), SESSION_RESERVER)
+        .context("failed to write session reserver")?;
     execute_build(&mut build_command(
         &build_dir.dockerfile(),
         build_dir.path(),
@@ -370,8 +381,8 @@ struct HostIds {
 /// foreground container when `isolated` is set or the configured image is
 /// custom. Custom images retain the image-defined user, command, and runtime
 /// filesystem contract through the established one-shot lifecycle. Shared
-/// runs serialize only ensure operations, then release the project lock before
-/// attaching an exec session so any number of sessions can run concurrently.
+/// runs use a guest reservation to hand off safely from runtime inspection to
+/// an attached exec session while still allowing concurrent sessions.
 ///
 /// # Errors
 ///
@@ -386,7 +397,7 @@ pub fn run_image(config: &Config, command: &[OsString], isolated: bool) -> Resul
 }
 
 /// Custom images cannot rely on the built-in image's shared-container user,
-/// home, shell, or keeper process, so preserve their image-agnostic lifecycle.
+/// home, shell, or supervisor, so preserve their image-agnostic lifecycle.
 fn uses_isolated_lifecycle(config: &Config, isolated: bool) -> bool {
     isolated || config.image.dockerfile.is_some()
 }
@@ -401,7 +412,7 @@ fn run_isolated(config: &Config, command: &[OsString]) -> Result<ExitCode> {
     )?;
     let id = isolated_container_id();
     // Build the command first: it only fails on path validation, before any
-    // container exists or a marker is written.
+    // container exists.
     let git_mount = git_mount_host(&project.root, config.read_only_git);
     let config_mounts = ConfigMounts {
         git: git_mount,
@@ -424,9 +435,8 @@ fn run_isolated(config: &Config, command: &[OsString]) -> Result<ExitCode> {
     ) {
         eprintln!("warning: {warning}");
     }
-    sweep_stale_containers(None);
+    sweep_orphaned_isolated_containers(Some(&id));
     install_signal_handlers()?;
-    register_container(&id);
     // Captured before the child starts, so it holds the pre-raw-mode state.
     let terminal = SavedTerminal::capture();
     let mut child = run.spawn().map_err(spawn_error)?;
@@ -435,25 +445,39 @@ fn run_isolated(config: &Config, command: &[OsString]) -> Result<ExitCode> {
     if let Some(terminal) = &terminal {
         terminal.restore();
     }
-    cleanup_container(&id);
+    cleanup_isolated_container(&id);
     status.map(exit_code)
 }
 
 /// Ensures the shared project container and attaches one exec session.
 fn run_shared(config: &Config, command: &[OsString]) -> Result<ExitCode> {
     let project = Project::current()?;
-
-    // Sweep unrelated leftovers before locking this project's ensure path.
-    sweep_stale_containers(Some(&project.id));
-    let state_dir = runtime_state_dir()?;
-    let lock_path = lock_path(&state_dir, &project.id);
-    let lock = ProjectLock::acquire(&lock_path, false)?
-        .ok_or_else(|| anyhow!("project lock unexpectedly unavailable"))?;
-    ensure_shared_container(&project, config, &state_dir)?;
-    drop(lock);
+    sweep_orphaned_isolated_containers(None);
+    let deadline = Instant::now() + GUEST_READY_TIMEOUT + CONFLICT_RETRY_TIMEOUT;
+    let reservation = loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "container `{}` repeatedly stopped during session handoff",
+                project.id
+            ));
+        }
+        ensure_shared_container(&project, config)?;
+        if !wait_for_guest_ready(&project)? {
+            continue;
+        }
+        let reservation = session_reservation_token(&project);
+        if reserve_shared_session(&project, &reservation)? {
+            break reservation;
+        }
+    };
 
     // The attached process owns the terminal, but not the shared container.
-    let mut exec = exec_command(std::io::stdin().is_terminal(), &project, command);
+    let mut exec = exec_command(
+        std::io::stdin().is_terminal(),
+        &project,
+        &reservation,
+        command,
+    );
     install_signal_handlers()?;
     let terminal = SavedTerminal::capture();
     let mut child = exec.spawn().map_err(spawn_error)?;
@@ -492,41 +516,7 @@ fn warn_mount_conflicts(project: &Project, config_mounts: &ConfigMounts) {
 /// An absent container is an idempotent success.
 pub fn stop_image() -> Result<ExitCode> {
     let project = Project::current()?;
-    let state_dir = runtime_state_dir()?;
-    let lock = ProjectLock::acquire(&lock_path(&state_dir, &project.id), false)?
-        .ok_or_else(|| anyhow!("project lock unexpectedly unavailable"))?;
-    if let Some(marker) = read_marker(&state_dir, &project.id)?
-        && marker.project != project.root
-    {
-        return Err(anyhow!(
-            "refusing to stop `{}` because its marker belongs to `{}`",
-            project.id,
-            marker.project.display()
-        ));
-    }
-    let state = settled_container_state(&project.id)?;
-
-    // Stop gracefully when needed, then delete the inert container record.
-    if state == ContainerState::Running {
-        run_checked(
-            Command::new(CONTAINER_BIN).args(["stop", &project.id]),
-            "stop shared container",
-        )?;
-    }
-    if matches!(state, ContainerState::Stopping | ContainerState::Unknown) {
-        return Err(anyhow!(
-            "container `{}` is in an unusable state and was not deleted",
-            project.id
-        ));
-    }
-    if state != ContainerState::Absent {
-        run_checked(
-            Command::new(CONTAINER_BIN).args(["delete", &project.id]),
-            "delete shared container",
-        )?;
-    }
-    remove_shared_state(&state_dir, &project.id);
-    drop(lock);
+    stop_shared_container(&project)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -625,288 +615,453 @@ impl SavedTerminal {
     }
 }
 
-/// Returns the state directory holding the container markers, derived from
-/// the config directory. `None` when no home directory can be determined.
-fn container_state_dir() -> Option<PathBuf> {
-    container_state_dir_from(
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    )
+/// Computes the full project digest stored in the runtime label.
+fn project_digest(project: &Path) -> String {
+    format!("{:x}", Sha256::digest(project.as_os_str().as_bytes()))
 }
 
-/// Pure version of [`container_state_dir`], taking the environment values
-/// as arguments so the resolution rules are testable without mutating the
-/// process environment.
-fn container_state_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    crate::config::config_dir_from(xdg, home).map(|dir| dir.join(CONTAINER_STATE_DIR))
-}
-
-/// Returns a writable state directory even when no home directory is known.
-fn runtime_state_dir() -> Result<PathBuf> {
-    let dir = container_state_dir().unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("silo-{}", unsafe { libc::geteuid() }))
-    });
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create state dir `{}`", dir.display()))?;
-    Ok(dir)
-}
-
-fn marker_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.json"))
-}
-
-fn lock_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.lock"))
-}
-
-fn cidfile_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.cid"))
-}
-
-fn marker_temp_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.json.tmp"))
-}
-
-/// Persists a shared marker while its project lock is held.
-fn write_marker(dir: &Path, marker: &ContainerMarker) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(marker).context("failed to encode container marker")?;
-    let path = marker_path(dir, &marker.container_id);
-    let temp = marker_temp_path(dir, &marker.container_id);
-
-    // Fully persist the replacement before the atomic rename, so interruption
-    // cannot leave the live marker truncated or partially encoded.
-    let write_result = (|| -> Result<()> {
-        let mut file = File::create(&temp)
-            .with_context(|| format!("failed to create marker `{}`", temp.display()))?;
-        file.write_all(&bytes)
-            .with_context(|| format!("failed to write marker `{}`", temp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to sync marker `{}`", temp.display()))?;
-        fs::rename(&temp, &path).with_context(|| {
-            format!(
-                "failed to replace marker `{}` from temporary `{}`",
-                path.display(),
-                temp.display()
-            )
-        })?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp);
+/// Builds the desired runtime identity from every creation-time input.
+fn container_identity(
+    project: &Project,
+    host_ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    lifecycle: &str,
+    command: &[OsString],
+) -> ContainerIdentity {
+    let mut hasher = Sha256::new();
+    hash_spec_field(
+        &mut hasher,
+        b"protocol",
+        LIFECYCLE_PROTOCOL_VERSION.as_bytes(),
+    );
+    hash_spec_field(&mut hasher, b"image", IMAGE_TAG.as_bytes());
+    hash_spec_field(&mut hasher, b"lifecycle", lifecycle.as_bytes());
+    hash_spec_field(&mut hasher, b"uid", host_ids.uid.as_bytes());
+    hash_spec_field(&mut hasher, b"gid", host_ids.gid.as_bytes());
+    hash_spec_field(&mut hasher, b"project", project.root.as_os_str().as_bytes());
+    hash_spec_field(
+        &mut hasher,
+        b"workdir",
+        project.workdir.as_os_str().as_bytes(),
+    );
+    if let Some(git) = &config_mounts.git {
+        hash_spec_field(&mut hasher, b"git", git.as_os_str().as_bytes());
+    } else {
+        hash_spec_field(&mut hasher, b"git", b"");
     }
-    write_result
+    for mount in &config_mounts.shared {
+        hash_spec_field(
+            &mut hasher,
+            b"mount-host",
+            mount.host.as_os_str().as_bytes(),
+        );
+        hash_spec_field(
+            &mut hasher,
+            b"mount-dest",
+            mount.dest.as_os_str().as_bytes(),
+        );
+        hash_spec_field(
+            &mut hasher,
+            b"mount-permission",
+            match mount.permission {
+                Permission::ReadOnly => b"ro",
+                Permission::ReadWrite => b"rw",
+            },
+        );
+    }
+    for argument in command {
+        hash_spec_field(&mut hasher, b"command", argument.as_os_str().as_bytes());
+    }
+    ContainerIdentity {
+        project: project_digest(&project.root),
+        spec: format!("{:x}", hasher.finalize()),
+    }
 }
 
-/// Loads and validates a shared marker when one exists.
-fn read_marker(dir: &Path, id: &str) -> Result<Option<ContainerMarker>> {
-    let path = marker_path(dir, id);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to read marker `{}`", path.display()));
+/// Length-prefixes both names and values so the specification hash has a
+/// canonical, ambiguity-free serialization.
+fn hash_spec_field(hasher: &mut Sha256, name: &[u8], value: &[u8]) {
+    hasher.update(u64::try_from(name.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(name);
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(value);
+}
+
+fn append_identity_labels(run: &mut Command, identity: &ContainerIdentity, lifecycle: &str) {
+    for (key, value) in [
+        (LABEL_OWNER, LABEL_OWNER_VALUE),
+        (LABEL_SCHEMA, LABEL_SCHEMA_VALUE),
+        (LABEL_PROJECT, identity.project.as_str()),
+        (LABEL_LIFECYCLE, lifecycle),
+        (LABEL_SPEC, identity.spec.as_str()),
+    ] {
+        run.arg("--label").arg(format!("{key}={value}"));
+    }
+}
+
+/// Waits for the entrypoint to publish its explicit readiness marker. Runtime
+/// `running` alone is insufficient because UID/GID and filesystem setup may
+/// still be in progress.
+fn wait_for_guest_ready(project: &Project) -> Result<bool> {
+    let deadline = Instant::now() + GUEST_READY_TIMEOUT;
+    loop {
+        let output = guest_ready_command(project).output().map_err(spawn_error)?;
+        if output.status.success() {
+            return Ok(true);
         }
-    };
-    let marker: ContainerMarker = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid container marker `{}`", path.display()))?;
-    if marker.version != MARKER_VERSION || marker.container_id != id {
-        return Err(anyhow!(
-            "container marker `{}` is inconsistent",
-            path.display()
-        ));
-    }
-    Ok(Some(marker))
-}
-
-/// Removes the marker and temporary cidfile after confirmed deletion.
-fn remove_shared_state(dir: &Path, id: &str) {
-    let _ = fs::remove_file(marker_path(dir, id));
-    let _ = fs::remove_file(marker_temp_path(dir, id));
-    let _ = fs::remove_file(cidfile_path(dir, id));
-}
-
-/// Ensures the deterministic container exists and is running.
-fn ensure_shared_container(project: &Project, config: &Config, state_dir: &Path) -> Result<()> {
-    let marker = read_marker(state_dir, &project.id)?;
-    if let Some(marker) = &marker
-        && marker.project != project.root
-    {
-        return Err(anyhow!(
-            "container ID `{}` belongs to project `{}`, not `{}`",
-            project.id,
-            marker.project.display(),
-            project.root.display()
-        ));
-    }
-
-    match settled_container_state(&project.id)? {
-        ContainerState::Absent => create_missing_shared_container(project, config, state_dir),
-        ContainerState::Stopped => {
-            require_marker(marker.as_ref(), project)?;
-            run_checked(
-                Command::new(CONTAINER_BIN).args(["start", &project.id]),
-                "start shared container",
-            )?;
-            if inspect_container(&project.id)? == ContainerState::Running {
-                Ok(())
-            } else {
-                Err(anyhow!("shared container `{}` did not start", project.id))
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let inspection = inspect_container(&project.id)?;
+        match inspection.state {
+            ContainerState::Running => validate_shared_ownership(&inspection, project)?,
+            ContainerState::Absent | ContainerState::Stopped | ContainerState::Stopping => {
+                return Ok(false);
+            }
+            ContainerState::Unknown => {
+                return Err(anyhow!(
+                    "container `{}` entered an unsupported state while initializing",
+                    project.id
+                ));
             }
         }
-        ContainerState::Running => {
-            require_marker(marker.as_ref(), project)?;
-            Ok(())
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "container `{}` did not publish guest readiness within {} seconds: {}",
+                project.id,
+                GUEST_READY_TIMEOUT.as_secs(),
+                stderr
+            ));
         }
-        ContainerState::Stopping | ContainerState::Unknown => Err(anyhow!(
-            "container `{}` did not reach a usable state",
-            project.id
-        )),
+        thread::sleep(CONFLICT_RETRY_INTERVAL);
     }
 }
 
-/// Resolves creation-only inputs and creates an absent shared container.
-fn create_missing_shared_container(
-    project: &Project,
-    config: &Config,
-    state_dir: &Path,
-) -> Result<()> {
-    // Existing containers do not need their original image tag or mounts;
-    // only the absent branch performs these creation checks.
-    require_image()?;
+fn guest_ready_command(project: &Project) -> Command {
+    let mut command = Command::new(CONTAINER_BIN);
+    command
+        .args(["exec", "--user", "silo"])
+        .arg(&project.id)
+        .args(["test", "-e", GUEST_READY_PATH]);
+    command
+}
+
+/// Establishes a transient guest-side reservation before the user command is
+/// submitted. If PID 1 wins the idle race, only this safe helper is retried;
+/// the arbitrary user command is never replayed.
+fn reserve_shared_session(project: &Project, reservation: &str) -> Result<bool> {
+    let deadline = Instant::now() + CONFLICT_RETRY_TIMEOUT;
+    loop {
+        let output = session_reserve_command(project, reservation)
+            .output()
+            .map_err(spawn_error)?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let inspection = inspect_container(&project.id)?;
+        match inspection.state {
+            ContainerState::Running => validate_shared_ownership(&inspection, project)?,
+            ContainerState::Absent | ContainerState::Stopped | ContainerState::Stopping => {
+                return Ok(false);
+            }
+            ContainerState::Unknown => {
+                return Err(anyhow!(
+                    "container `{}` entered an unsupported state during session handoff",
+                    project.id
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "failed to reserve a session in container `{}`: {}",
+                project.id,
+                stderr
+            ));
+        }
+        thread::sleep(CONFLICT_RETRY_INTERVAL);
+    }
+}
+
+fn session_reserve_command(project: &Project, reservation: &str) -> Command {
+    let mut command = Command::new(CONTAINER_BIN);
+    command
+        .args(["exec", "--user", "silo"])
+        .arg(&project.id)
+        .arg(SESSION_RESERVE_COMMAND)
+        .arg(reservation);
+    command
+}
+
+fn session_reservation_token(project: &Project) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut hasher = Sha256::new();
+    hasher.update(project.root.as_os_str().as_bytes());
+    hasher.update(std::process::id().to_be_bytes());
+    hasher.update(timestamp.to_be_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Ensures the deterministic shared container exists, belongs to this
+/// project, matches the requested creation specification, and is running.
+fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
     let ids = host_ids()?;
     let config_mounts = resolve_config_mounts(config, &project.root)?;
     warn_mount_conflicts(project, &config_mounts);
-    create_shared_container(project, &ids, &config_mounts, state_dir)
-}
+    let identity = container_identity(
+        project,
+        &ids,
+        &config_mounts,
+        LABEL_SHARED_VALUE,
+        &[OsString::from(SHARED_INIT_COMMAND)],
+    );
+    let deadline = Instant::now() + CONFLICT_RETRY_TIMEOUT;
+    let mut checked_image = false;
+    let mut last_conflict = None;
 
-/// Rejects markerless deterministic containers instead of adopting them.
-fn require_marker(marker: Option<&ContainerMarker>, project: &Project) -> Result<()> {
-    if marker.is_some() {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "container `{}` exists without silo state; run `silo stop` to remove it safely",
-        project.id
-    ))
-}
-
-/// Waits briefly for a stopping container before ensure decides what to do.
-fn settled_container_state(id: &str) -> Result<ContainerState> {
-    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let state = inspect_container(id)?;
-        if state != ContainerState::Stopping || Instant::now() >= deadline {
-            return Ok(state);
+        let inspection = inspect_container(&project.id)?;
+        match inspection.state {
+            ContainerState::Absent => {
+                if !checked_image {
+                    require_image()?;
+                    checked_image = true;
+                }
+                match create_shared_container(project, &ids, &config_mounts, &identity) {
+                    Ok(()) => {}
+                    Err(err) => last_conflict = Some(err),
+                }
+            }
+            ContainerState::Running => {
+                validate_shared_container(&inspection, project, &identity)?;
+                return Ok(());
+            }
+            ContainerState::Stopped => {
+                validate_shared_container(&inspection, project, &identity)?;
+                let output = Command::new(CONTAINER_BIN)
+                    .args(["start", &project.id])
+                    .output()
+                    .map_err(spawn_error)?;
+                if !output.status.success() {
+                    last_conflict = Some(anyhow!(
+                        "failed to start shared container '{}': {}",
+                        project.id,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                }
+            }
+            ContainerState::Stopping => {}
+            ContainerState::Unknown => {
+                return Err(anyhow!(
+                    "container '{}' is in an unsupported runtime state",
+                    project.id
+                ));
+            }
         }
-        thread::sleep(Duration::from_millis(100));
+
+        if Instant::now() >= deadline {
+            return Err(last_conflict.unwrap_or_else(|| {
+                anyhow!(
+                    "container '{}' did not reach a usable state within {} seconds",
+                    project.id,
+                    CONFLICT_RETRY_TIMEOUT.as_secs()
+                )
+            }));
+        }
+        thread::sleep(CONFLICT_RETRY_INTERVAL);
     }
 }
 
-/// Creates and verifies a detached shared container.
+/// Creates a detached shared container with a unique, automatically removed
+/// cidfile beneath the current user's temporary directory.
 fn create_shared_container(
     project: &Project,
     ids: &HostIds,
     config_mounts: &ConfigMounts,
-    state_dir: &Path,
+    identity: &ContainerIdentity,
 ) -> Result<()> {
-    let cidfile = cidfile_path(state_dir, &project.id);
-    let _ = fs::remove_file(&cidfile);
-    let mut create = create_command(project, ids, config_mounts, &cidfile)?;
-    write_marker(state_dir, &ContainerMarker::new(project))?;
+    let cid_dir = tempfile::Builder::new()
+        .prefix("silo-cid-")
+        .tempdir_in(std::env::temp_dir())
+        .context("failed to create temporary cid directory")?;
+    let cidfile = cid_dir.path().join("container.cid");
+    let output = create_command(project, ids, config_mounts, &cidfile)?
+        .output()
+        .map_err(spawn_error)?;
 
-    // The provisional marker makes an interrupted creation discoverable.
-    let output = match create.output() {
-        Ok(output) => output,
-        Err(err) => {
-            remove_shared_state(state_dir, &project.id);
-            return Err(spawn_error(err));
-        }
-    };
     if !output.status.success() {
-        cleanup_failed_run(state_dir, &project.id, &cidfile);
+        cleanup_partial_creation(project, identity, &cidfile);
         return Err(anyhow!(
-            "failed to create shared container `{}`: {}",
+            "failed to create shared container '{}': {}",
             project.id,
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
 
-    let recorded = match fs::read_to_string(&cidfile) {
-        Ok(recorded) => recorded,
-        Err(err) => {
-            cleanup_failed_creation(state_dir, &project.id);
-            return Err(err)
-                .with_context(|| format!("failed to read cidfile `{}`", cidfile.display()));
-        }
-    };
+    let recorded = fs::read_to_string(&cidfile)
+        .with_context(|| format!("failed to read cidfile '{}'", cidfile.display()))?;
     if recorded.trim() != project.id {
-        cleanup_failed_creation(state_dir, &project.id);
         return Err(anyhow!(
-            "container runtime wrote unexpected ID `{}` to `{}`",
+            "container runtime wrote unexpected ID '{}' to '{}'",
             recorded.trim(),
             cidfile.display()
         ));
     }
-    let _ = fs::remove_file(&cidfile);
-    let state = match inspect_container(&project.id) {
-        Ok(state) => state,
-        Err(err) => {
-            cleanup_failed_creation(state_dir, &project.id);
-            return Err(err);
+    let inspection = inspect_container(&project.id)?;
+    validate_shared_container(&inspection, project, identity)?;
+    Ok(())
+}
+
+/// Deletes a failed creation only if this invocation's cidfile and the
+/// runtime's ownership labels independently confirm the target.
+fn cleanup_partial_creation(project: &Project, identity: &ContainerIdentity, cidfile: &Path) {
+    if !fs::read_to_string(cidfile).is_ok_and(|value| value.trim() == project.id) {
+        return;
+    }
+    let owned = inspect_container(&project.id).is_ok_and(|inspection| {
+        inspection.state != ContainerState::Absent
+            && validate_shared_ownership(&inspection, project).is_ok()
+            && inspection.labels.get(LABEL_SPEC) == Some(&identity.spec)
+    });
+    if owned && let Err(err) = delete_container(&project.id) {
+        eprintln!(
+            "warning: could not remove partially created container '{}': {err:#}",
+            project.id
+        );
+    }
+}
+
+/// Refuses to adopt containers that are not unambiguously owned by Silo and
+/// associated with the full canonical project digest.
+fn validate_shared_ownership(inspection: &ContainerInspection, project: &Project) -> Result<()> {
+    let expected_project = project_digest(&project.root);
+    for (key, expected) in [
+        (LABEL_OWNER, LABEL_OWNER_VALUE),
+        (LABEL_SCHEMA, LABEL_SCHEMA_VALUE),
+        (LABEL_PROJECT, expected_project.as_str()),
+        (LABEL_LIFECYCLE, LABEL_SHARED_VALUE),
+    ] {
+        let actual = inspection.labels.get(key).map(String::as_str);
+        if actual != Some(expected) {
+            return Err(anyhow!(
+                "refusing to manage container '{}': label '{}' is {:?}, expected '{}'",
+                project.id,
+                key,
+                actual,
+                expected
+            ));
         }
-    };
-    if state != ContainerState::Running {
-        cleanup_failed_creation(state_dir, &project.id);
+    }
+    Ok(())
+}
+
+fn validate_shared_container(
+    inspection: &ContainerInspection,
+    project: &Project,
+    identity: &ContainerIdentity,
+) -> Result<()> {
+    validate_shared_ownership(inspection, project)?;
+    let actual = inspection.labels.get(LABEL_SPEC).map(String::as_str);
+    if actual != Some(identity.spec.as_str()) {
         return Err(anyhow!(
-            "shared container `{}` stopped during startup",
+            "container '{}' was created from a different Silo specification; run 'silo stop' and retry",
             project.id
         ));
     }
     Ok(())
 }
 
-/// Cleans a failed `run` only when its cidfile proves this invocation created it.
-fn cleanup_failed_run(state_dir: &Path, id: &str, cidfile: &Path) {
-    let created_here = fs::read_to_string(cidfile).is_ok_and(|value| value.trim() == id);
-    if created_here {
-        cleanup_failed_creation(state_dir, id);
-    } else {
-        remove_shared_state(state_dir, id);
-    }
-}
-
-/// Removes a partially created container and clears state only once gone.
-fn cleanup_failed_creation(state_dir: &Path, id: &str) {
-    match delete_container(id) {
-        Ok(()) => remove_shared_state(state_dir, id),
-        Err(err) => {
-            eprintln!("warning: could not remove partially created container `{id}`: {err:#}");
+/// Stops and deletes only the inspect-validated shared container for this
+/// project. Conflicting runtime transitions are retried for a bounded time.
+fn stop_shared_container(project: &Project) -> Result<()> {
+    let deadline = Instant::now() + CONFLICT_RETRY_TIMEOUT;
+    let mut last_conflict = None;
+    loop {
+        let inspection = inspect_container(&project.id)?;
+        match inspection.state {
+            ContainerState::Absent => return Ok(()),
+            ContainerState::Running => {
+                validate_shared_ownership(&inspection, project)?;
+                let output = Command::new(CONTAINER_BIN)
+                    .args(["stop", &project.id])
+                    .output()
+                    .map_err(spawn_error)?;
+                if !output.status.success() {
+                    last_conflict = Some(anyhow!(
+                        "failed to stop shared container '{}': {}",
+                        project.id,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                }
+            }
+            ContainerState::Stopping => {
+                validate_shared_ownership(&inspection, project)?;
+            }
+            ContainerState::Stopped => {
+                validate_shared_ownership(&inspection, project)?;
+                let output = Command::new(CONTAINER_BIN)
+                    .args(["delete", &project.id])
+                    .output()
+                    .map_err(spawn_error)?;
+                if output.status.success()
+                    || String::from_utf8_lossy(&output.stderr)
+                        .to_lowercase()
+                        .contains("not found")
+                {
+                    return Ok(());
+                }
+                last_conflict = Some(anyhow!(
+                    "failed to delete shared container '{}': {}",
+                    project.id,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            ContainerState::Unknown => {
+                return Err(anyhow!(
+                    "container '{}' is in an unsupported runtime state and was not deleted",
+                    project.id
+                ));
+            }
         }
+        if Instant::now() >= deadline {
+            return Err(last_conflict.unwrap_or_else(|| {
+                anyhow!(
+                    "container '{}' did not stop within {} seconds",
+                    project.id,
+                    CONFLICT_RETRY_TIMEOUT.as_secs()
+                )
+            }));
+        }
+        thread::sleep(CONFLICT_RETRY_INTERVAL);
     }
 }
 
 /// Inspects a container, booting the container system and retrying once when needed.
-fn inspect_container(id: &str) -> Result<ContainerState> {
-    let (state, stderr) = probe_container(id)?;
-    if state.is_none() && system_not_started(&stderr) && start_container_system() {
-        let (state, stderr) = probe_container(id)?;
-        return state.ok_or_else(|| container_inspect_error(id, &stderr));
+fn inspect_container(id: &str) -> Result<ContainerInspection> {
+    let (inspection, stderr) = probe_container(id)?;
+    if inspection.is_none() && system_not_started(&stderr) && start_container_system() {
+        let (inspection, stderr) = probe_container(id)?;
+        return inspection.ok_or_else(|| container_inspect_error(id, &stderr));
     }
-    state.ok_or_else(|| container_inspect_error(id, &stderr))
+    inspection.ok_or_else(|| container_inspect_error(id, &stderr))
 }
 
 /// Runs one raw container inspection; not-found is represented as absence.
-fn probe_container(id: &str) -> Result<(Option<ContainerState>, String)> {
+fn probe_container(id: &str) -> Result<(Option<ContainerInspection>, String)> {
     let output = Command::new(CONTAINER_BIN)
         .args(["inspect", id])
         .output()
         .map_err(spawn_error)?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if output.status.success() {
-        return Ok((Some(parse_container_state(&output.stdout, id)?), stderr));
+        return Ok((
+            Some(parse_container_inspection(&output.stdout, id)?),
+            stderr,
+        ));
     }
     if stderr.to_lowercase().contains("not found") {
-        return Ok((Some(ContainerState::Absent), stderr));
+        return Ok((Some(ContainerInspection::absent()), stderr));
     }
     Ok((None, stderr))
 }
@@ -915,8 +1070,8 @@ fn container_inspect_error(id: &str, stderr: &str) -> anyhow::Error {
     anyhow!("could not inspect container `{id}`: {stderr}")
 }
 
-/// Parses current `status.state` and legacy flat `status` inspect shapes.
-fn parse_container_state(stdout: &[u8], id: &str) -> Result<ContainerState> {
+/// Parses the state and labels from current and older inspect JSON shapes.
+fn parse_container_inspection(stdout: &[u8], id: &str) -> Result<ContainerInspection> {
     let items: Vec<Value> =
         serde_json::from_slice(stdout).context("invalid container inspect JSON")?;
     let item = items
@@ -931,173 +1086,52 @@ fn parse_container_state(stdout: &[u8], id: &str) -> Result<ContainerState> {
         .and_then(Value::as_str)
         .or_else(|| item.get("status").and_then(Value::as_str))
         .ok_or_else(|| anyhow!("container inspect omitted the state for `{id}`"))?;
-    Ok(match status {
+    let state = match status {
         "running" => ContainerState::Running,
         "stopped" => ContainerState::Stopped,
         "stopping" => ContainerState::Stopping,
         _ => ContainerState::Unknown,
-    })
+    };
+    let labels = item
+        .pointer("/configuration/labels")
+        .or_else(|| item.get("labels"))
+        .map(parse_inspect_labels)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(ContainerInspection { state, labels })
 }
 
-/// Executes a non-interactive lifecycle command and includes stderr on failure.
-fn run_checked(command: &mut Command, action: &str) -> Result<()> {
-    let output = command.output().map_err(spawn_error)?;
-    if output.status.success() {
-        return Ok(());
+fn parse_inspect_labels(value: &Value) -> Result<HashMap<String, String>> {
+    if let Some(object) = value.as_object() {
+        return object
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|value| (key.clone(), value.to_string()))
+                    .ok_or_else(|| anyhow!("container inspect label `{key}` is not a string"))
+            })
+            .collect();
+    }
+    if let Some(items) = value.as_array() {
+        return items
+            .iter()
+            .map(|item| {
+                let key = item
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("container inspect label omitted its key"))?;
+                let value = item
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("container inspect label `{key}` omitted its value"))?;
+                Ok((key.to_string(), value.to_string()))
+            })
+            .collect();
     }
     Err(anyhow!(
-        "failed to {action}: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        "container inspect labels are not an object or array"
     ))
-}
-
-/// Records this run's container ID in the state directory before the child
-/// starts, so a silo killed hard (e.g. `kill -9`) leaves a marker the next
-/// run sweeps. Best effort: a warning is printed instead of failing the
-/// run.
-fn register_container(id: &str) {
-    let Some(dir) = container_state_dir() else {
-        return;
-    };
-    if let Err(err) = register_container_in(&dir, id) {
-        eprintln!(
-            "warning: could not record container `{id}` at `{}`: {err:#}",
-            dir.join(id).display()
-        );
-    }
-}
-
-/// Writes the marker file for container `id` into `dir`.
-///
-/// # Errors
-///
-/// Returns an error when the directory cannot be created or the marker
-/// cannot be written.
-fn register_container_in(dir: &Path, id: &str) -> Result<()> {
-    fs::create_dir_all(dir)
-        .with_context(|| format!("failed to create state dir `{}`", dir.display()))?;
-    fs::write(dir.join(id), format!("{id}\n"))
-        .with_context(|| format!("failed to write marker for container `{id}`"))
-}
-
-/// Removes the state marker of a container that is confirmed gone.
-fn unregister_container(id: &str) {
-    if let Some(dir) = container_state_dir() {
-        unregister_container_in(&dir, id);
-    }
-}
-
-/// Removes the marker file for container `id` from `dir`, if present.
-fn unregister_container_in(dir: &Path, id: &str) {
-    let _ = fs::remove_file(dir.join(id));
-}
-
-/// Sweeps dead-owner shared markers without touching running containers.
-fn sweep_stale_containers(skip_id: Option<&str>) {
-    let Ok(dir) = runtime_state_dir() else {
-        return;
-    };
-    sweep_shared_in(&dir, skip_id, inspect_container, delete_container);
-    sweep_legacy_in(&dir, delete_container);
-}
-
-/// Testable shared-marker sweep implementation.
-fn sweep_shared_in(
-    dir: &Path,
-    skip_id: Option<&str>,
-    mut inspect: impl FnMut(&str) -> Result<ContainerState>,
-    mut delete: impl FnMut(&str) -> Result<()>,
-) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension() != Some(OsStr::new("json")) {
-            continue;
-        }
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
-        let Ok(marker) = serde_json::from_slice::<ContainerMarker>(&bytes) else {
-            eprintln!(
-                "warning: ignoring invalid container marker `{}`",
-                path.display()
-            );
-            continue;
-        };
-        let id = marker.container_id.as_str();
-        if marker.version != MARKER_VERSION
-            || path.file_stem().and_then(OsStr::to_str) != Some(id)
-            || !id.starts_with(CONTAINER_NAME_PREFIX)
-        {
-            eprintln!(
-                "warning: ignoring inconsistent container marker `{}`",
-                path.display()
-            );
-            continue;
-        }
-        if skip_id == Some(id) {
-            continue;
-        }
-        let Ok(pid) = libc::pid_t::try_from(marker.creator_pid) else {
-            continue;
-        };
-        if owner_alive(pid) {
-            continue;
-        }
-        let Ok(Some(_lock)) = ProjectLock::acquire(&lock_path(dir, id), true) else {
-            continue;
-        };
-        match inspect(id) {
-            Ok(ContainerState::Absent) => remove_shared_state(dir, id),
-            Ok(ContainerState::Stopped) => match delete(id) {
-                Ok(()) => remove_shared_state(dir, id),
-                Err(err) => {
-                    eprintln!("warning: could not remove stale container `{id}`: {err:#}");
-                }
-            },
-            Ok(ContainerState::Running | ContainerState::Stopping | ContainerState::Unknown) => {}
-            Err(err) => eprintln!("warning: could not inspect stale container `{id}`: {err:#}"),
-        }
-    }
-}
-
-/// Preserves cleanup for PID-named markers written by older isolated runs.
-fn sweep_legacy_in(dir: &Path, mut delete: impl FnMut(&str) -> Result<()>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let id = entry.file_name();
-        let Some(id) = id.to_str() else {
-            continue;
-        };
-        let Some(pid) = id
-            .strip_prefix(CONTAINER_NAME_PREFIX)
-            .and_then(|rest| rest.parse::<libc::pid_t>().ok())
-        else {
-            continue;
-        };
-        if owner_alive(pid) {
-            continue;
-        }
-        match delete(id) {
-            Ok(()) => unregister_container_in(dir, id),
-            Err(err) => eprintln!("warning: could not remove stale container `{id}`: {err:#}"),
-        }
-    }
-}
-
-/// Returns whether the process `pid` is alive, i.e. the silo that started
-/// the container is still running and its container must not be touched.
-fn owner_alive(pid: libc::pid_t) -> bool {
-    // Signal 0 only checks for existence; no signal is delivered.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    // The process exists but belongs to another user.
-    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Returns whether the `container delete` result means the container is
@@ -1129,16 +1163,105 @@ fn delete_container(id: &str) -> Result<()> {
     ))
 }
 
-/// Removes this run's container after the `container run` child has exited,
-/// whatever the reason, and forgets its ID once it is gone. `--rm` already
-/// removes the container on a normal exit, so this is a safety net for runs
-/// killed or crashed; a leftover stays marked and is swept by the next run.
-fn cleanup_container(id: &str) {
-    match delete_container(id) {
-        Ok(()) => unregister_container(id),
-        Err(err) => eprintln!(
-            "warning: could not remove container `{id}`: {err:#} (it will be removed at the next `silo run`)"
-        ),
+/// Removes isolated containers whose PID-named owner no longer exists. The
+/// runtime labels are the durable ownership record; listing is used only to
+/// discover candidates, and each candidate is inspected again before deletion.
+fn sweep_orphaned_isolated_containers(current_id: Option<&str>) {
+    let output = match Command::new(CONTAINER_BIN)
+        .args(["list", "--all", "--format", "json"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            eprintln!("warning: could not enumerate isolated containers: {err}");
+            return;
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !system_not_started(&stderr) {
+            eprintln!(
+                "warning: could not enumerate isolated containers: {}",
+                stderr.trim()
+            );
+        }
+        return;
+    }
+    let ids = match parse_container_ids(&output.stdout) {
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("warning: could not parse isolated containers: {err:#}");
+            return;
+        }
+    };
+    for id in ids {
+        let Some(owner) = isolated_owner_pid(&id) else {
+            continue;
+        };
+        if current_id != Some(id.as_str()) && owner_alive(owner) {
+            continue;
+        }
+        let Ok(inspection) = inspect_container(&id) else {
+            continue;
+        };
+        if inspection.state == ContainerState::Absent || !is_owned_isolated(&inspection) {
+            continue;
+        }
+        if let Err(err) = delete_container(&id) {
+            eprintln!("warning: could not remove orphaned isolated container `{id}`: {err:#}");
+        }
+    }
+}
+
+fn parse_container_ids(stdout: &[u8]) -> Result<Vec<String>> {
+    let items: Vec<Value> =
+        serde_json::from_slice(stdout).context("invalid container list JSON")?;
+    items
+        .iter()
+        .map(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .or_else(|| item.pointer("/configuration/id").and_then(Value::as_str))
+                .map(ToString::to_string)
+                .ok_or_else(|| anyhow!("container list item omitted its ID"))
+        })
+        .collect()
+}
+
+fn isolated_owner_pid(id: &str) -> Option<libc::pid_t> {
+    id.strip_prefix(CONTAINER_NAME_PREFIX)?
+        .parse()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
+fn is_owned_isolated(inspection: &ContainerInspection) -> bool {
+    [
+        (LABEL_OWNER, LABEL_OWNER_VALUE),
+        (LABEL_SCHEMA, LABEL_SCHEMA_VALUE),
+        (LABEL_LIFECYCLE, LABEL_ISOLATED_VALUE),
+    ]
+    .into_iter()
+    .all(|(key, value)| inspection.labels.get(key).map(String::as_str) == Some(value))
+        && [LABEL_PROJECT, LABEL_SPEC].into_iter().all(|key| {
+            inspection.labels.get(key).is_some_and(|value| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        })
+}
+
+fn owner_alive(pid: libc::pid_t) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Removes an isolated container after its foreground process exits. `--rm`
+/// normally did this already; force deletion is a best-effort crash safety net.
+fn cleanup_isolated_container(id: &str) {
+    if let Err(err) = delete_container(id) {
+        eprintln!("warning: could not remove isolated container `{id}`: {err:#}");
     }
 }
 
@@ -1397,12 +1520,25 @@ fn isolated_run_command(
     command: &[OsString],
 ) -> Result<Command> {
     let shared_dir = shared_dir_name(project_root)?;
+    let project = Project {
+        root: project_root.to_path_buf(),
+        workdir: shared_dir.clone(),
+        id: id.to_string(),
+    };
+    let identity = container_identity(
+        &project,
+        host_ids,
+        config_mounts,
+        LABEL_ISOLATED_VALUE,
+        command,
+    );
     let mut run = Command::new(CONTAINER_BIN);
     run.arg("run").arg("--name").arg(id).arg("--rm").arg("-i");
     if interactive {
         // Allocating a pty without a terminal fails with ENOTTY.
         run.arg("-t");
     }
+    append_identity_labels(&mut run, &identity, LABEL_ISOLATED_VALUE);
     append_creation_mounts(&mut run, project_root, &shared_dir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
     run.arg(IMAGE_TAG).args(command);
@@ -1416,6 +1552,13 @@ fn create_command(
     config_mounts: &ConfigMounts,
     cidfile: &Path,
 ) -> Result<Command> {
+    let identity = container_identity(
+        project,
+        host_ids,
+        config_mounts,
+        LABEL_SHARED_VALUE,
+        &[OsString::from(SHARED_INIT_COMMAND)],
+    );
     let mut run = Command::new(CONTAINER_BIN);
     run.arg("run")
         .arg("--name")
@@ -1423,9 +1566,10 @@ fn create_command(
         .arg("--cidfile")
         .arg(cidfile)
         .arg("-d");
+    append_identity_labels(&mut run, &identity, LABEL_SHARED_VALUE);
     append_creation_mounts(&mut run, &project.root, &project.workdir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
-    run.arg(IMAGE_TAG).args(SHARED_INIT_COMMAND);
+    run.arg(IMAGE_TAG).arg(SHARED_INIT_COMMAND);
     Ok(run)
 }
 
@@ -1471,7 +1615,12 @@ fn append_host_ids(run: &mut Command, host_ids: &HostIds) {
 }
 
 /// Builds one session attachment command for the running shared container.
-fn exec_command(interactive: bool, project: &Project, command: &[OsString]) -> Command {
+fn exec_command(
+    interactive: bool,
+    project: &Project,
+    reservation: &str,
+    command: &[OsString],
+) -> Command {
     let mut exec = Command::new(CONTAINER_BIN);
     exec.arg("exec").arg("-i");
     if interactive {
@@ -1484,6 +1633,7 @@ fn exec_command(interactive: bool, project: &Project, command: &[OsString]) -> C
     exec.arg("--env")
         .arg(format!("HOME={CONTAINER_HOME}"))
         .arg(&project.id);
+    exec.arg(SESSION_WRAPPER_COMMAND).arg(reservation);
     if command.is_empty() {
         exec.arg(DEFAULT_SESSION_COMMAND);
     } else {

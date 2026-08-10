@@ -5,6 +5,33 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn args_without_labels(command: &Command) -> Vec<&str> {
+    let mut arguments = command
+        .get_args()
+        .map(|argument| argument.to_str().expect("argument is UTF-8"));
+    let mut filtered = Vec::new();
+    while let Some(argument) = arguments.next() {
+        if argument == "--label" {
+            arguments.next().expect("label has a value");
+        } else {
+            filtered.push(argument);
+        }
+    }
+    filtered
+}
+
+fn command_labels(command: &Command) -> HashMap<&str, &str> {
+    let arguments: Vec<&str> = command
+        .get_args()
+        .map(|argument| argument.to_str().expect("argument is UTF-8"))
+        .collect();
+    arguments
+        .windows(2)
+        .filter(|pair| pair[0] == "--label")
+        .map(|pair| pair[1].split_once('=').expect("label has key and value"))
+        .collect()
+}
+
 #[test]
 fn dockerfile_embeds_ubuntu_latest() {
     assert!(
@@ -37,10 +64,7 @@ fn built_in_images_remain_shared_by_default() {
 fn build_command_targets_embedded_dockerfile() {
     let command = build_command(Path::new("/tmp/Dockerfile"), Path::new("/tmp/context"));
     let program = command.get_program().to_str().expect("program is UTF-8");
-    let args: Vec<&str> = command
-        .get_args()
-        .map(|arg| arg.to_str().expect("arg is UTF-8"))
-        .collect();
+    let args = args_without_labels(&command);
     assert_eq!(program, CONTAINER_BIN);
     assert_eq!(
         args,
@@ -71,10 +95,7 @@ fn run_command_starts_interactive_shell() {
         &[],
     )
     .expect("command builds");
-    let args: Vec<&str> = command
-        .get_args()
-        .map(|arg| arg.to_str().expect("arg is UTF-8"))
-        .collect();
+    let args = args_without_labels(&command);
     assert_eq!(
         args,
         [
@@ -95,6 +116,10 @@ fn run_command_starts_interactive_shell() {
             "silo:latest",
         ]
     );
+    assert_eq!(
+        command_labels(&command).get(LABEL_LIFECYCLE),
+        Some(&LABEL_ISOLATED_VALUE)
+    );
 }
 
 #[test]
@@ -112,10 +137,7 @@ fn run_command_omits_pty_when_not_interactive() {
         &[],
     )
     .expect("command builds");
-    let args: Vec<&str> = command
-        .get_args()
-        .map(|arg| arg.to_str().expect("arg is UTF-8"))
-        .collect();
+    let args = args_without_labels(&command);
     assert_eq!(
         args,
         [
@@ -614,10 +636,7 @@ fn run_command_appends_the_passed_command() {
         ],
     )
     .expect("command builds");
-    let args: Vec<&str> = command
-        .get_args()
-        .map(|arg| arg.to_str().expect("arg is UTF-8"))
-        .collect();
+    let args = args_without_labels(&command);
     assert_eq!(
         args,
         [
@@ -1187,7 +1206,10 @@ fn discovered_project_root_drives_shared_and_isolated_mounts() {
 
     assert_eq!(volume_specs(&isolated), std::slice::from_ref(&expected));
     assert_eq!(volume_specs(&shared), [expected]);
-    assert_eq!(ContainerMarker::new(&project).project, canonical(&root));
+    assert_eq!(
+        project_digest(&project.root),
+        project_digest(&canonical(&root))
+    );
 }
 
 #[cfg(unix)]
@@ -1220,7 +1242,7 @@ fn test_project(root: &str) -> Project {
 }
 
 #[test]
-fn create_command_starts_a_detached_keeper() {
+fn create_command_starts_the_detached_supervisor() {
     let project = test_project("/tmp/project");
     let ids = HostIds {
         uid: "501".into(),
@@ -1233,10 +1255,7 @@ fn create_command_starts_a_detached_keeper() {
         Path::new("/tmp/project.cid"),
     )
     .expect("command builds");
-    let args: Vec<&str> = command
-        .get_args()
-        .map(|arg| arg.to_str().expect("arg is UTF-8"))
-        .collect();
+    let args = args_without_labels(&command);
     assert_eq!(
         args,
         [
@@ -1255,10 +1274,15 @@ fn create_command_starts_a_detached_keeper() {
             "--env",
             "SILO_GID=20",
             "silo:latest",
-            "sleep",
-            "infinity",
+            "/usr/local/bin/silo-supervisor",
         ]
     );
+    let labels = command_labels(&command);
+    assert_eq!(labels.get(LABEL_OWNER), Some(&LABEL_OWNER_VALUE));
+    assert_eq!(labels.get(LABEL_SCHEMA), Some(&LABEL_SCHEMA_VALUE));
+    assert_eq!(labels.get(LABEL_LIFECYCLE), Some(&LABEL_SHARED_VALUE));
+    assert_eq!(labels.get(LABEL_PROJECT).map(|value| value.len()), Some(64));
+    assert_eq!(labels.get(LABEL_SPEC).map(|value| value.len()), Some(64));
 }
 
 #[test]
@@ -1267,6 +1291,7 @@ fn exec_command_attaches_as_silo_with_home() {
     let command = exec_command(
         true,
         &project,
+        "abc123",
         &[OsString::from("codex"), OsString::from("--compact")],
     );
     let args: Vec<&str> = command
@@ -1286,6 +1311,8 @@ fn exec_command_attaches_as_silo_with_home() {
             "--env",
             "HOME=/home/silo",
             project.id.as_str(),
+            "/usr/local/bin/silo-session",
+            "abc123",
             "codex",
             "--compact",
         ]
@@ -1295,7 +1322,7 @@ fn exec_command_attaches_as_silo_with_home() {
 #[test]
 fn exec_command_uses_nu_and_omits_tty_without_a_terminal() {
     let project = test_project("/tmp/project");
-    let command = exec_command(false, &project, &[]);
+    let command = exec_command(false, &project, "abc123", &[]);
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
@@ -1306,11 +1333,159 @@ fn exec_command_uses_nu_and_omits_tty_without_a_terminal() {
 }
 
 #[test]
+fn guest_readiness_probe_targets_the_explicit_marker() {
+    let project = test_project("/tmp/project");
+    let command = guest_ready_command(&project);
+    let args: Vec<&str> = command
+        .get_args()
+        .map(|arg| arg.to_str().expect("argument is UTF-8"))
+        .collect();
+
+    assert_eq!(
+        args,
+        [
+            "exec",
+            "--user",
+            "silo",
+            project.id.as_str(),
+            "test",
+            "-e",
+            "/run/silo/ready",
+        ]
+    );
+}
+
+#[test]
+fn session_reservation_is_submitted_before_the_user_command() {
+    let project = test_project("/tmp/project");
+    let reserve = session_reserve_command(&project, "abc123");
+    let reserve_args: Vec<&str> = reserve
+        .get_args()
+        .map(|arg| arg.to_str().expect("argument is UTF-8"))
+        .collect();
+    assert_eq!(
+        reserve_args,
+        [
+            "exec",
+            "--user",
+            "silo",
+            project.id.as_str(),
+            "/usr/local/bin/silo-reserve",
+            "abc123",
+        ]
+    );
+
+    let session = exec_command(false, &project, "abc123", &[OsString::from("true")]);
+    let session_args: Vec<&str> = session
+        .get_args()
+        .map(|arg| arg.to_str().expect("argument is UTF-8"))
+        .collect();
+    let wrapper = session_args
+        .iter()
+        .position(|arg| *arg == SESSION_WRAPPER_COMMAND)
+        .expect("session wrapper is present");
+    assert_eq!(session_args[wrapper + 1..], ["abc123", "true"]);
+}
+
+#[test]
+fn reservation_tokens_are_opaque_lowercase_digests() {
+    let token = session_reservation_token(&test_project("/tmp/project"));
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(token, token.to_lowercase());
+}
+
+// These scripts are part of the Linux guest image and deliberately depend on
+// util-linux `flock`. Running them directly is therefore a Linux integration
+// test; macOS does not provide the guest's locking command.
+#[cfg(target_os = "linux")]
+#[test]
+fn guest_reservation_keeps_pid_one_alive_during_session_handoff() {
+    let dir = TestDir::new("guest-handoff");
+    let runtime = dir.path().join("runtime");
+    let reservations = runtime.join("reservations");
+    fs::create_dir_all(&reservations).expect("runtime directories create");
+    let supervisor_path = dir.path().join("supervisor");
+    let reserve_path = dir.path().join("reserve");
+    let session_path = dir.path().join("session");
+    fs::write(&supervisor_path, SUPERVISOR).expect("supervisor writes");
+    fs::write(&reserve_path, SESSION_RESERVER).expect("reserver writes");
+    fs::write(&session_path, SESSION_WRAPPER).expect("wrapper writes");
+
+    let mut supervisor = Command::new("sh")
+        .arg(&supervisor_path)
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .spawn()
+        .expect("supervisor starts");
+    run_guest_script(&reserve_path, &runtime, &["aa11"]).expect("first session reserves");
+    let mut first = Command::new("sh")
+        .arg(&session_path)
+        .args(["aa11", "sh", "-c", "sleep 0.5"])
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .spawn()
+        .expect("first session starts");
+    wait_for_path(&runtime.join("armed"));
+
+    run_guest_script(&reserve_path, &runtime, &["bb22"]).expect("handoff reserves");
+    assert!(first.wait().expect("first session waits").success());
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        supervisor.try_wait().expect("supervisor polls").is_none(),
+        "the pending reservation must prevent PID 1 from exiting"
+    );
+
+    run_guest_script(&session_path, &runtime, &["bb22", "true"]).expect("second session runs");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if supervisor.try_wait().expect("supervisor polls").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "supervisor did not stop after idle"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_guest_script(path: &Path, runtime: &Path, arguments: &[&str]) -> Result<()> {
+    let output = Command::new("sh")
+        .arg(path)
+        .args(arguments)
+        .env("SILO_RUNTIME_DIR", runtime)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "guest script failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} was not created",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn inspect_parser_accepts_current_nested_state() {
     let json = br#"[{"id":"silo-test","status":{"state":"running","networks":[]}}]"#;
     assert_eq!(
-        parse_container_state(json, "silo-test").expect("state parses"),
-        ContainerState::Running
+        parse_container_inspection(json, "silo-test")
+            .expect("state parses")
+            .state,
+        ContainerState::Running,
     );
 }
 
@@ -1318,8 +1493,10 @@ fn inspect_parser_accepts_current_nested_state() {
 fn inspect_parser_accepts_legacy_flat_state() {
     let json = br#"[{"configuration":{"id":"silo-test"},"status":"stopped"}]"#;
     assert_eq!(
-        parse_container_state(json, "silo-test").expect("state parses"),
-        ContainerState::Stopped
+        parse_container_inspection(json, "silo-test")
+            .expect("state parses")
+            .state,
+        ContainerState::Stopped,
     );
 }
 
@@ -1328,12 +1505,16 @@ fn inspect_parser_maps_transient_and_unknown_states() {
     let stopping = br#"[{"id":"silo-test","status":{"state":"stopping"}}]"#;
     let future = br#"[{"id":"silo-test","status":{"state":"paused"}}]"#;
     assert_eq!(
-        parse_container_state(stopping, "silo-test").expect("state parses"),
-        ContainerState::Stopping
+        parse_container_inspection(stopping, "silo-test")
+            .expect("state parses")
+            .state,
+        ContainerState::Stopping,
     );
     assert_eq!(
-        parse_container_state(future, "silo-test").expect("state parses"),
-        ContainerState::Unknown
+        parse_container_inspection(future, "silo-test")
+            .expect("state parses")
+            .state,
+        ContainerState::Unknown,
     );
 }
 
@@ -1341,263 +1522,221 @@ fn inspect_parser_maps_transient_and_unknown_states() {
 fn inspect_parser_rejects_missing_container_and_state() {
     let wrong = br#"[{"id":"other","status":{"state":"running"}}]"#;
     let missing = br#"[{"id":"silo-test","status":{}}]"#;
-    assert!(parse_container_state(wrong, "silo-test").is_err());
-    assert!(parse_container_state(missing, "silo-test").is_err());
+    assert!(parse_container_inspection(wrong, "silo-test").is_err());
+    assert!(parse_container_inspection(missing, "silo-test").is_err());
 }
 
 #[test]
-fn shared_marker_round_trips_project_and_creator() {
-    let dir = TestDir::new("shared-marker");
-    let project = test_project("/tmp/project");
-    let marker = ContainerMarker::new(&project);
-    write_marker(dir.path(), &marker).expect("marker writes");
+fn inspect_parser_reads_runtime_labels() {
+    let json = br#"[{
+        "id":"silo-test",
+        "configuration":{"labels":{
+            "dev.silo.owner":"silo",
+            "dev.silo.schema":"1",
+            "dev.silo.project":"project-digest",
+            "dev.silo.lifecycle":"shared",
+            "dev.silo.spec":"spec-digest"
+        }},
+        "status":{"state":"running"}
+    }]"#;
+    let inspection = parse_container_inspection(json, "silo-test").expect("inspection parses");
+
+    assert_eq!(inspection.state, ContainerState::Running);
     assert_eq!(
-        read_marker(dir.path(), &project.id).expect("marker reads"),
-        Some(marker)
-    );
-    remove_shared_state(dir.path(), &project.id);
-    assert!(!marker_path(dir.path(), &project.id).exists());
-}
-
-#[test]
-fn shared_marker_atomically_replaces_invalid_contents() {
-    let dir = TestDir::new("shared-marker-replace");
-    let project = test_project("/tmp/project");
-    let marker = ContainerMarker::new(&project);
-    fs::write(marker_path(dir.path(), &project.id), b"{partial")
-        .expect("partial old marker writes");
-
-    write_marker(dir.path(), &marker).expect("marker replacement succeeds");
-
-    assert_eq!(
-        read_marker(dir.path(), &project.id).expect("replacement reads"),
-        Some(marker)
-    );
-    assert!(!marker_temp_path(dir.path(), &project.id).exists());
-}
-
-#[test]
-fn failed_shared_marker_replacement_preserves_live_marker() {
-    let dir = TestDir::new("shared-marker-preserve");
-    let project = test_project("/tmp/project");
-    let original = ContainerMarker::new(&project);
-    write_marker(dir.path(), &original).expect("original marker writes");
-    fs::create_dir(marker_temp_path(dir.path(), &project.id))
-        .expect("directory blocks temporary marker creation");
-    let mut replacement = original.clone();
-    replacement.creator_pid += 1;
-
-    write_marker(dir.path(), &replacement).expect_err("replacement cannot be staged");
-
-    assert_eq!(
-        read_marker(dir.path(), &project.id).expect("live marker remains readable"),
-        Some(original)
-    );
-}
-
-#[test]
-fn shared_state_cleanup_removes_interrupted_marker_temporary() {
-    let dir = TestDir::new("shared-marker-temp-cleanup");
-    let project = test_project("/tmp/project");
-    fs::write(marker_temp_path(dir.path(), &project.id), b"{partial")
-        .expect("temporary marker writes");
-
-    remove_shared_state(dir.path(), &project.id);
-
-    assert!(!marker_temp_path(dir.path(), &project.id).exists());
-}
-
-#[test]
-fn project_lock_excludes_a_second_ensure() {
-    let dir = TestDir::new("project-lock");
-    let path = dir.path().join("project.lock");
-    let first = ProjectLock::acquire(&path, false)
-        .expect("first lock succeeds")
-        .expect("blocking lock is returned");
-    assert!(
-        ProjectLock::acquire(&path, true)
-            .expect("nonblocking attempt succeeds")
-            .is_none(),
-        "second ensure must observe the busy lock"
-    );
-    drop(first);
-    assert!(
-        ProjectLock::acquire(&path, true)
-            .expect("lock succeeds after release")
-            .is_some()
-    );
-}
-
-#[test]
-fn state_dir_follows_the_config_dir() {
-    assert_eq!(
-        container_state_dir_from(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/user"))),
-        Some(PathBuf::from("/xdg/silo/containers"))
+        inspection.labels.get(LABEL_OWNER).map(String::as_str),
+        Some(LABEL_OWNER_VALUE)
     );
     assert_eq!(
-        container_state_dir_from(None, Some(OsStr::new("/home/user"))),
-        Some(PathBuf::from("/home/user/.config/silo/containers"))
+        inspection.labels.get(LABEL_SPEC).map(String::as_str),
+        Some("spec-digest")
     );
-    assert_eq!(container_state_dir_from(None, None), None);
 }
 
 #[test]
-fn register_and_unregister_markers() {
-    let dir = TestDir::new("markers");
-    register_container_in(dir.path(), "silo-123").expect("register succeeds");
-    assert!(dir.path().join("silo-123").is_file());
-    unregister_container_in(dir.path(), "silo-123");
-    assert!(!dir.path().join("silo-123").exists());
-}
-
-#[test]
-fn owner_alive_detects_live_processes() {
-    let pid = libc::pid_t::try_from(std::process::id()).expect("pid fits in pid_t");
-    assert!(owner_alive(pid));
-}
-
-#[test]
-fn owner_alive_detects_dead_processes() {
-    let mut child = Command::new("true").spawn().expect("spawn succeeds");
-    let pid = libc::pid_t::try_from(child.id()).expect("pid fits in pid_t");
-    child.wait().expect("wait succeeds");
-    assert!(!owner_alive(pid));
-}
-
-fn dead_owner_marker(dir: &Path, name: &str) -> ContainerMarker {
-    let mut child = Command::new("true").spawn().expect("spawn succeeds");
-    let creator_pid = child.id();
-    child.wait().expect("wait succeeds");
-    let project = test_project(&format!("/tmp/{name}"));
-    let mut marker = ContainerMarker::new(&project);
-    marker.creator_pid = creator_pid;
-    write_marker(dir, &marker).expect("marker writes");
-    marker
-}
-
-#[test]
-fn shared_sweep_never_deletes_a_running_container() {
-    let dir = TestDir::new("shared-sweep-running");
-    let marker = dead_owner_marker(dir.path(), "running-project");
-    let deleted = Cell::new(false);
-    sweep_shared_in(
-        dir.path(),
-        None,
-        |_| Ok(ContainerState::Running),
-        |_| {
-            deleted.set(true);
-            Ok(())
+fn inspect_parser_accepts_label_array_shape() {
+    let json = br#"[{
+        "configuration":{
+            "id":"silo-test",
+            "labels":[{"key":"dev.silo.owner","value":"silo"}]
         },
-    );
-    assert!(!deleted.get());
-    assert!(marker_path(dir.path(), &marker.container_id).exists());
-}
+        "status":"stopped"
+    }]"#;
+    let inspection = parse_container_inspection(json, "silo-test").expect("inspection parses");
 
-#[test]
-fn shared_sweep_deletes_only_stopped_dead_owner_containers() {
-    let dir = TestDir::new("shared-sweep-stopped");
-    let marker = dead_owner_marker(dir.path(), "stopped-project");
-    let mut deleted = Vec::new();
-    sweep_shared_in(
-        dir.path(),
-        None,
-        |_| Ok(ContainerState::Stopped),
-        |id| {
-            deleted.push(id.to_string());
-            Ok(())
-        },
-    );
+    assert_eq!(inspection.state, ContainerState::Stopped);
     assert_eq!(
-        deleted.as_slice(),
-        std::slice::from_ref(&marker.container_id)
+        inspection.labels.get(LABEL_OWNER).map(String::as_str),
+        Some(LABEL_OWNER_VALUE)
     );
-    assert!(!marker_path(dir.path(), &marker.container_id).exists());
+}
+
+fn shared_identity(project: &Project) -> ContainerIdentity {
+    container_identity(
+        project,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts::default(),
+        LABEL_SHARED_VALUE,
+        &[OsString::from(SHARED_INIT_COMMAND)],
+    )
+}
+
+fn shared_inspection(project: &Project, identity: &ContainerIdentity) -> ContainerInspection {
+    ContainerInspection {
+        state: ContainerState::Running,
+        labels: HashMap::from([
+            (LABEL_OWNER.to_string(), LABEL_OWNER_VALUE.to_string()),
+            (LABEL_SCHEMA.to_string(), LABEL_SCHEMA_VALUE.to_string()),
+            (LABEL_PROJECT.to_string(), project_digest(&project.root)),
+            (LABEL_LIFECYCLE.to_string(), LABEL_SHARED_VALUE.to_string()),
+            (LABEL_SPEC.to_string(), identity.spec.clone()),
+        ]),
+    }
 }
 
 #[test]
-fn shared_sweep_clears_absent_markers_without_deleting() {
-    let dir = TestDir::new("shared-sweep-absent");
-    let marker = dead_owner_marker(dir.path(), "absent-project");
-    sweep_shared_in(
-        dir.path(),
-        None,
-        |_| Ok(ContainerState::Absent),
-        |_| panic!("absent containers need no delete"),
-    );
-    assert!(!marker_path(dir.path(), &marker.container_id).exists());
+fn inspect_identity_accepts_an_exact_shared_specification() {
+    let project = test_project("/tmp/project");
+    let identity = shared_identity(&project);
+    let inspection = shared_inspection(&project, &identity);
+
+    validate_shared_container(&inspection, &project, &identity)
+        .expect("matching inspect labels are accepted");
 }
 
 #[test]
-fn shared_sweep_keeps_live_owner_and_current_project_markers() {
-    let dir = TestDir::new("shared-sweep-protected");
-    let live_project = test_project("/tmp/live-project");
-    write_marker(dir.path(), &ContainerMarker::new(&live_project)).expect("live marker writes");
-    let dead = dead_owner_marker(dir.path(), "current-project");
-    sweep_shared_in(
-        dir.path(),
-        Some(&dead.container_id),
-        |_| panic!("protected markers are not inspected"),
-        |_| panic!("protected markers are not deleted"),
-    );
-    assert!(marker_path(dir.path(), &live_project.id).exists());
-    assert!(marker_path(dir.path(), &dead.container_id).exists());
+fn inspect_identity_refuses_foreign_containers_including_buildkit() {
+    let project = test_project("/tmp/project");
+    let identity = shared_identity(&project);
+    let foreign = ContainerInspection {
+        state: ContainerState::Running,
+        labels: HashMap::new(),
+    };
+
+    let error = validate_shared_container(&foreign, &project, &identity)
+        .expect_err("an unlabeled runtime container must never be adopted");
+
+    assert!(error.to_string().contains(LABEL_OWNER));
 }
 
 #[test]
-fn shared_sweep_retains_marker_when_delete_fails() {
-    let dir = TestDir::new("shared-sweep-delete-failure");
-    let marker = dead_owner_marker(dir.path(), "failed-project");
-    sweep_shared_in(
-        dir.path(),
-        None,
-        |_| Ok(ContainerState::Stopped),
-        |_| Err(anyhow!("delete failed")),
-    );
-    assert!(marker_path(dir.path(), &marker.container_id).exists());
+fn inspect_identity_requires_explicit_stop_for_spec_drift() {
+    let project = test_project("/tmp/project");
+    let identity = shared_identity(&project);
+    let mut inspection = shared_inspection(&project, &identity);
+    inspection
+        .labels
+        .insert(LABEL_SPEC.to_string(), "different".to_string());
+
+    let error = validate_shared_container(&inspection, &project, &identity)
+        .expect_err("specification drift must be refused");
+
+    assert!(error.to_string().contains("silo stop"));
 }
 
 #[test]
-fn legacy_sweep_removes_markers_of_dead_owners_only() {
-    let dir = TestDir::new("sweep");
-    // Live owner (this process): its container must be left alone.
-    let live = format!("silo-{}", std::process::id());
-    register_container_in(dir.path(), &live).expect("register succeeds");
-    // Dead owner: its container must be swept.
-    let mut child = Command::new("true").spawn().expect("spawn succeeds");
-    let dead_pid = child.id();
-    child.wait().expect("wait succeeds");
-    let dead = format!("silo-{dead_pid}");
-    register_container_in(dir.path(), &dead).expect("register succeeds");
-    // Foreign marker: must be ignored.
-    fs::write(dir.path().join("other"), "x").expect("write succeeds");
-    // Malformed silo marker: must be ignored.
-    fs::write(dir.path().join("silo-not-a-pid"), "x").expect("write succeeds");
+fn isolated_orphan_discovery_reads_runtime_ids_without_matching_buildkit() {
+    let json = br#"[
+        {"id":"silo-123","status":{"state":"running"}},
+        {"configuration":{"id":"silo-456"},"status":{"state":"stopped"}},
+        {"id":"buildkit","status":{"state":"running"}}
+    ]"#;
+    let ids = parse_container_ids(json).expect("container list parses");
 
-    let mut deleted = Vec::new();
-    sweep_legacy_in(dir.path(), |id| {
-        deleted.push(id.to_string());
-        Ok(())
+    assert_eq!(ids, ["silo-123", "silo-456", "buildkit"]);
+    assert_eq!(isolated_owner_pid(&ids[0]), Some(123));
+    assert_eq!(isolated_owner_pid(&ids[1]), Some(456));
+    assert_eq!(isolated_owner_pid(&ids[2]), None);
+}
+
+#[test]
+fn isolated_orphan_cleanup_requires_complete_runtime_ownership_labels() {
+    let project = test_project("/tmp/project");
+    let identity = container_identity(
+        &project,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts::default(),
+        LABEL_ISOLATED_VALUE,
+        &[],
+    );
+    let mut inspection = ContainerInspection {
+        state: ContainerState::Running,
+        labels: HashMap::from([
+            (LABEL_OWNER.to_string(), LABEL_OWNER_VALUE.to_string()),
+            (LABEL_SCHEMA.to_string(), LABEL_SCHEMA_VALUE.to_string()),
+            (
+                LABEL_LIFECYCLE.to_string(),
+                LABEL_ISOLATED_VALUE.to_string(),
+            ),
+            (LABEL_PROJECT.to_string(), identity.project),
+            (LABEL_SPEC.to_string(), identity.spec),
+        ]),
+    };
+    assert!(is_owned_isolated(&inspection));
+
+    inspection.labels.remove(LABEL_SPEC);
+    assert!(!is_owned_isolated(&inspection));
+    inspection.labels.clear();
+    assert!(
+        !is_owned_isolated(&inspection),
+        "BuildKit must remain foreign"
+    );
+}
+
+#[test]
+fn owner_liveness_distinguishes_current_and_exited_processes() {
+    let current = libc::pid_t::try_from(std::process::id()).expect("PID fits");
+    assert!(owner_alive(current));
+
+    let mut child = Command::new("true").spawn().expect("child starts");
+    let child_pid = libc::pid_t::try_from(child.id()).expect("PID fits");
+    child.wait().expect("child waits");
+    assert!(!owner_alive(child_pid));
+}
+
+#[test]
+fn specification_digest_is_deterministic_and_creation_sensitive() {
+    let project = test_project("/tmp/project");
+    let base = shared_identity(&project);
+    let mut mounts = ConfigMounts::default();
+    mounts.shared.push(ResolvedShared {
+        host: PathBuf::from("/tmp/shared"),
+        dest: PathBuf::from("/home/silo/shared"),
+        permission: Permission::ReadOnly,
     });
+    let changed = container_identity(
+        &project,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &mounts,
+        LABEL_SHARED_VALUE,
+        &[OsString::from(SHARED_INIT_COMMAND)],
+    );
 
-    assert_eq!(deleted, vec![dead.clone()]);
-    assert!(dir.path().join(&live).exists());
-    assert!(!dir.path().join(&dead).exists());
-    assert!(dir.path().join("other").exists());
-    assert!(dir.path().join("silo-not-a-pid").exists());
+    assert_eq!(base, shared_identity(&project));
+    assert_ne!(base.spec, changed.spec);
+    assert_eq!(base.project.len(), 64);
 }
 
 #[test]
-fn legacy_sweep_keeps_markers_when_delete_fails() {
-    let dir = TestDir::new("sweep-fail");
-    let mut child = Command::new("true").spawn().expect("spawn succeeds");
-    let dead_pid = child.id();
-    child.wait().expect("wait succeeds");
-    let dead = format!("silo-{dead_pid}");
-    register_container_in(dir.path(), &dead).expect("register succeeds");
-
-    sweep_legacy_in(dir.path(), |_| Err(anyhow!("delete failed")));
-
-    assert!(dir.path().join(&dead).exists());
+fn embedded_image_contains_guest_lifecycle_programs() {
+    assert!(DOCKERFILE.contains("COPY silo-supervisor.sh"));
+    assert!(DOCKERFILE.contains("COPY silo-session.sh"));
+    assert!(DOCKERFILE.contains("COPY silo-reserve.sh"));
+    assert!(DOCKERFILE.contains("util-linux"));
+    assert!(SUPERVISOR.contains("flock --exclusive --nonblock"));
+    assert!(SUPERVISOR.contains("-ge 100"));
+    assert!(SESSION_WRAPPER.contains("flock --shared"));
+    assert!(SESSION_WRAPPER.contains("reservation_file"));
+    assert!(SESSION_RESERVER.contains("flock --shared"));
+    assert!(SESSION_WRAPPER.contains("exec \"$@\""));
 }
 
 #[test]

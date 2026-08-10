@@ -28,6 +28,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         pkg-config \
         python3 \
         sudo \
+        util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- User --------------------------------------------------------------------
@@ -66,6 +67,14 @@ USER root
 RUN usermod --shell "${BREW_PREFIX}/bin/nu" silo \
     && printf '%s\n' "${BREW_PREFIX}/bin/nu" >> /etc/shells
 
+COPY silo-supervisor.sh /usr/local/bin/silo-supervisor
+COPY silo-session.sh /usr/local/bin/silo-session
+COPY silo-reserve.sh /usr/local/bin/silo-reserve
+RUN chmod 0755 \
+        /usr/local/bin/silo-supervisor \
+        /usr/local/bin/silo-session \
+        /usr/local/bin/silo-reserve
+
 RUN cat > /usr/local/bin/silo-entrypoint <<'EOF'
 #!/bin/sh
 set -eu
@@ -78,10 +87,18 @@ if [ -n "${SILO_GID:-}" ]; then
     groupmod -o -g "$SILO_GID" silo
 fi
 
+# Runtime-only coordination belongs to the container, not the host config.
+rm -rf /run/silo
+install -d -o silo -g silo -m 0700 /run/silo /run/silo/reservations
+
 # Re-own the brew prefix if it belongs to a stale uid (one-time per host uid).
 if [ "$(stat -c %u /home/linuxbrew/.linuxbrew)" != "$(id -u silo)" ]; then
     chown -R silo:silo /home/linuxbrew
 fi
+
+# Published only after all entrypoint initialization is complete. The host
+# waits for this before attempting the session reservation handshake.
+touch /run/silo/ready
 
 exec setpriv --reuid "$(id -u silo)" --regid "$(id -g silo)" --init-groups \
     env HOME=/home/silo "$@"
