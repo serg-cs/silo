@@ -70,10 +70,14 @@ RUN usermod --shell "${BREW_PREFIX}/bin/nu" silo \
 COPY silo-supervisor.sh /usr/local/bin/silo-supervisor
 COPY silo-session.sh /usr/local/bin/silo-session
 COPY silo-reserve.sh /usr/local/bin/silo-reserve
+COPY silo-status.sh /usr/local/bin/silo-status
+COPY silo-stop-guard.sh /usr/local/bin/silo-stop-guard
 RUN chmod 0755 \
         /usr/local/bin/silo-supervisor \
         /usr/local/bin/silo-session \
-        /usr/local/bin/silo-reserve
+        /usr/local/bin/silo-reserve \
+        /usr/local/bin/silo-status \
+        /usr/local/bin/silo-stop-guard
 
 RUN cat > /usr/local/bin/silo-entrypoint <<'EOF'
 #!/bin/sh
@@ -89,7 +93,8 @@ fi
 
 # Runtime-only coordination belongs to the container, not the host config.
 rm -rf /run/silo
-install -d -o silo -g silo -m 0700 /run/silo /run/silo/reservations
+install -d -o silo -g silo -m 0700 \
+    /run/silo /run/silo/reservations /run/silo/sessions
 
 # Re-own the brew prefix if it belongs to a stale uid (one-time per host uid).
 if [ "$(stat -c %u /home/linuxbrew/.linuxbrew)" != "$(id -u silo)" ]; then

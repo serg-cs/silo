@@ -52,6 +52,7 @@ exec 9>"$lock"
 while :; do
     if flock --exclusive --nonblock 9; then
         if ! has_live_reservation; then
+            rm -f "$runtime/sessions"/*
             exit 0
         fi
         flock --unlock 9

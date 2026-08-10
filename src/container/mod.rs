@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets::NOTHING};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -30,6 +32,12 @@ const SESSION_WRAPPER: &str = include_str!("silo-session.sh");
 
 /// Session reservation helper embedded alongside the built-in Dockerfile.
 const SESSION_RESERVER: &str = include_str!("silo-reserve.sh");
+
+/// Session counter embedded alongside the built-in Dockerfile.
+const STATUS_HELPER: &str = include_str!("silo-status.sh");
+
+/// Stop guard embedded alongside the built-in Dockerfile.
+const STOP_GUARD: &str = include_str!("silo-stop-guard.sh");
 
 const CONTAINER_BIN: &str = "container";
 
@@ -55,18 +63,21 @@ const SHARED_INIT_COMMAND: &str = "/usr/local/bin/silo-supervisor";
 /// Guest wrapper that holds a shared lease for the command and all children.
 const SESSION_WRAPPER_COMMAND: &str = "/usr/local/bin/silo-session";
 const SESSION_RESERVE_COMMAND: &str = "/usr/local/bin/silo-reserve";
+const STATUS_COMMAND: &str = "/usr/local/bin/silo-status";
+const STOP_GUARD_COMMAND: &str = "/usr/local/bin/silo-stop-guard";
 const GUEST_READY_PATH: &str = "/run/silo/ready";
 
 const LABEL_OWNER: &str = "dev.silo.owner";
 const LABEL_SCHEMA: &str = "dev.silo.schema";
 const LABEL_PROJECT: &str = "dev.silo.project";
+const LABEL_PROJECT_ROOT: &str = "dev.silo.project-root";
 const LABEL_LIFECYCLE: &str = "dev.silo.lifecycle";
 const LABEL_SPEC: &str = "dev.silo.spec";
 const LABEL_OWNER_VALUE: &str = "silo";
 const LABEL_SCHEMA_VALUE: &str = "1";
 const LABEL_SHARED_VALUE: &str = "shared";
 const LABEL_ISOLATED_VALUE: &str = "isolated";
-const LIFECYCLE_PROTOCOL_VERSION: &str = "2";
+const LIFECYCLE_PROTOCOL_VERSION: &str = "3";
 
 /// Runtime races are retried only for this bounded interval.
 const CONFLICT_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -151,6 +162,7 @@ enum ContainerState {
 struct ContainerInspection {
     state: ContainerState,
     labels: HashMap<String, String>,
+    image: Option<String>,
 }
 
 impl ContainerInspection {
@@ -158,14 +170,60 @@ impl ContainerInspection {
         Self {
             state: ContainerState::Absent,
             labels: HashMap::new(),
+            image: None,
         }
     }
+}
+
+impl ContainerState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Stopping => "stopping",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ContainerLifecycle {
+    Shared,
+    Isolated,
+}
+
+impl ContainerLifecycle {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => LABEL_SHARED_VALUE,
+            Self::Isolated => LABEL_ISOLATED_VALUE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerInfo {
+    id: String,
+    lifecycle: ContainerLifecycle,
+    state: ContainerState,
+    sessions: Option<usize>,
+    project: PathBuf,
+    spec: String,
+    image: String,
+}
+
+#[derive(Default)]
+struct ContainerInventory {
+    items: Vec<ContainerInfo>,
+    warnings: Vec<String>,
 }
 
 /// Runtime labels expected on the deterministic shared container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContainerIdentity {
     project: String,
+    project_root: String,
     spec: String,
 }
 
@@ -296,6 +354,14 @@ impl BuildDir {
     fn session_reserver(&self) -> PathBuf {
         self.0.join("silo-reserve.sh")
     }
+
+    fn status_helper(&self) -> PathBuf {
+        self.0.join("silo-status.sh")
+    }
+
+    fn stop_guard(&self) -> PathBuf {
+        self.0.join("silo-stop-guard.sh")
+    }
 }
 
 impl Drop for BuildDir {
@@ -329,6 +395,9 @@ pub fn build_image(config: &Config) -> Result<ExitCode> {
         .context("failed to write session wrapper")?;
     fs::write(build_dir.session_reserver(), SESSION_RESERVER)
         .context("failed to write session reserver")?;
+    fs::write(build_dir.status_helper(), STATUS_HELPER)
+        .context("failed to write session status helper")?;
+    fs::write(build_dir.stop_guard(), STOP_GUARD).context("failed to write stop guard")?;
     execute_build(&mut build_command(
         &build_dir.dockerfile(),
         build_dir.path(),
@@ -514,15 +583,565 @@ fn warn_mount_conflicts(project: &Project, config_mounts: &ConfigMounts) {
     }
 }
 
-/// Stops and deletes the shared container for the current project.
-///
-/// An absent container is an idempotent success.
-pub fn stop_image(project: &Project) -> Result<ExitCode> {
-    stop_shared_container(project)?;
+/// Prints a snapshot of every runtime container unambiguously owned by Silo.
+pub fn print_containers() -> Result<ExitCode> {
+    let inventory = container_inventory()?;
+    if inventory.items.is_empty() {
+        println!("No Silo containers.");
+    } else {
+        println!("{}", render_container_table(&inventory.items));
+    }
+    for warning in inventory.warnings {
+        eprintln!("warning: {warning}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
-/// Returns the legacy one-shot ID, `<prefix><pid>`.
+/// Stops the single Silo container selected by ID or project, preserving it.
+pub fn stop_container(selector: &str, force: bool) -> Result<ExitCode> {
+    let inventory = container_inventory()?;
+    let container = select_container(&inventory.items, selector)?.clone();
+    stop_selected_container(&container, force)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Stops and then deletes the single Silo container selected by ID or project.
+pub fn delete_selected_container(selector: &str, force: bool) -> Result<ExitCode> {
+    let inventory = container_inventory()?;
+    let container = select_container(&inventory.items, selector)?.clone();
+    stop_selected_container(&container, force)?;
+    if force {
+        if revalidate_selected_container(&container)?.is_some() {
+            delete_container(&container.id)?;
+        }
+    } else {
+        delete_stopped_container(&container)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn stop_selected_container(container: &ContainerInfo, force: bool) -> Result<()> {
+    let Some(inspection) = revalidate_selected_container(container)? else {
+        return Ok(());
+    };
+    match inspection.state {
+        ContainerState::Running => {
+            if force {
+                stop_runtime_container(container)?;
+            } else {
+                require_current_inactive(container)?;
+                if container.lifecycle != ContainerLifecycle::Shared {
+                    return Err(anyhow!(
+                        "container `{}` is an active isolated session; use `--force` to terminate it",
+                        container.id
+                    ));
+                }
+                guarded_stop(container)?;
+            }
+        }
+        ContainerState::Stopped | ContainerState::Absent => {}
+        ContainerState::Stopping => wait_until_stopped(container)?,
+        ContainerState::Unknown => {
+            if force {
+                stop_runtime_container(container)?;
+            } else {
+                return Err(anyhow!(
+                    "container `{}` is in an unsupported runtime state; use `--force` to stop it",
+                    container.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn revalidate_selected_container(container: &ContainerInfo) -> Result<Option<ContainerInspection>> {
+    let inspection = inspect_container(&container.id)?;
+    if inspection.state == ContainerState::Absent {
+        return Ok(None);
+    }
+    validate_selected_ownership(container, &inspection)?;
+    Ok(Some(inspection))
+}
+
+fn validate_selected_ownership(
+    container: &ContainerInfo,
+    inspection: &ContainerInspection,
+) -> Result<()> {
+    let Some((lifecycle, project, spec)) = silo_metadata(inspection) else {
+        return Err(anyhow!(
+            "refusing to manage container `{}` because its ownership labels changed",
+            container.id
+        ));
+    };
+    if lifecycle != container.lifecycle || project != container.project || spec != container.spec {
+        return Err(anyhow!(
+            "refusing to manage container `{}` because it no longer matches the selected Silo container",
+            container.id
+        ));
+    }
+    Ok(())
+}
+
+fn require_current_inactive(container: &ContainerInfo) -> Result<()> {
+    let sessions = match container.lifecycle {
+        ContainerLifecycle::Isolated => Some(1),
+        ContainerLifecycle::Shared => match inspect_session_count(&container.id) {
+            Ok(count) => Some(count),
+            Err(err) => {
+                let state = revalidate_selected_container(container)?
+                    .map_or(ContainerState::Absent, |inspection| inspection.state);
+                if matches!(state, ContainerState::Absent | ContainerState::Stopped) {
+                    return Ok(());
+                }
+                return Err(err.context(format!(
+                    "container `{}` has unknown session state; use `--force` to terminate it",
+                    container.id
+                )));
+            }
+        },
+    };
+    require_inactive_sessions(&container.id, sessions)
+}
+
+fn require_inactive_sessions(id: &str, sessions: Option<usize>) -> Result<()> {
+    let sessions = sessions.ok_or_else(|| {
+        anyhow!("container `{id}` has unknown session state; use `--force` to terminate it")
+    })?;
+    if sessions == 0 {
+        return Ok(());
+    }
+    let noun = if sessions == 1 { "session" } else { "sessions" };
+    Err(anyhow!(
+        "container `{id}` has {sessions} active {noun}; use `--force` to terminate them"
+    ))
+}
+
+fn container_inventory() -> Result<ContainerInventory> {
+    let mut inventory = ContainerInventory::default();
+    for id in list_container_ids()? {
+        let inspection = match inspect_container(&id) {
+            Ok(inspection) if inspection.state != ContainerState::Absent => inspection,
+            Ok(_) => continue,
+            Err(err) => {
+                inventory
+                    .warnings
+                    .push(format!("could not inspect container `{id}`: {err:#}"));
+                continue;
+            }
+        };
+        let Some((lifecycle, project, spec)) = silo_metadata(&inspection) else {
+            continue;
+        };
+        let sessions = match (inspection.state, lifecycle) {
+            (ContainerState::Stopped, _) => Some(0),
+            (ContainerState::Running, ContainerLifecycle::Isolated) => Some(1),
+            _ => None,
+        };
+        inventory.items.push(ContainerInfo {
+            id,
+            lifecycle,
+            state: inspection.state,
+            sessions,
+            project,
+            spec,
+            image: inspection.image.unwrap_or_else(|| IMAGE_TAG.to_string()),
+        });
+    }
+    populate_session_counts(&mut inventory);
+    inventory.items.sort_by(|left, right| {
+        left.project
+            .cmp(&right.project)
+            .then_with(|| left.lifecycle.cmp(&right.lifecycle))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(inventory)
+}
+
+fn populate_session_counts(inventory: &mut ContainerInventory) {
+    const MAX_SESSION_WORKERS: usize = 8;
+
+    let targets: Vec<(usize, String)> = inventory
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.state == ContainerState::Running && item.lifecycle == ContainerLifecycle::Shared
+        })
+        .map(|(index, item)| (index, item.id.clone()))
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..targets.len().min(MAX_SESSION_WORKERS) {
+            let sender = sender.clone();
+            let targets = &targets;
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let target = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((index, id)) = targets.get(target) else {
+                        break;
+                    };
+                    if sender
+                        .send((*index, id.clone(), inspect_session_count(id)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        for (index, id, result) in receiver {
+            match result {
+                Ok(count) => inventory.items[index].sessions = Some(count),
+                Err(err) => inventory.warnings.push(format!(
+                    "could not read sessions for container `{id}`: {err:#}"
+                )),
+            }
+        }
+    });
+    inventory.warnings.sort();
+}
+
+fn list_container_ids() -> Result<Vec<String>> {
+    let (ids, stderr) = probe_container_ids()?;
+    if let Some(ids) = ids {
+        return Ok(ids);
+    }
+    if system_not_started(&stderr) && start_container_system() {
+        let (ids, stderr) = probe_container_ids()?;
+        return ids.ok_or_else(|| anyhow!("could not list containers: {stderr}"));
+    }
+    Err(anyhow!("could not list containers: {stderr}"))
+}
+
+fn probe_container_ids() -> Result<(Option<Vec<String>>, String)> {
+    let output = Command::new(CONTAINER_BIN)
+        .args(["list", "--all", "--format", "json"])
+        .output()
+        .map_err(spawn_error)?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        Ok((Some(parse_container_ids(&output.stdout)?), stderr))
+    } else {
+        Ok((None, stderr))
+    }
+}
+
+fn silo_metadata(
+    inspection: &ContainerInspection,
+) -> Option<(ContainerLifecycle, PathBuf, String)> {
+    let labels = &inspection.labels;
+    if labels.get(LABEL_OWNER).map(String::as_str) != Some(LABEL_OWNER_VALUE) {
+        return None;
+    }
+    let lifecycle = match labels.get(LABEL_LIFECYCLE).map(String::as_str) {
+        Some(LABEL_SHARED_VALUE) => ContainerLifecycle::Shared,
+        Some(LABEL_ISOLATED_VALUE) => ContainerLifecycle::Isolated,
+        _ => return None,
+    };
+    if labels.get(LABEL_SCHEMA).map(String::as_str) != Some(LABEL_SCHEMA_VALUE) {
+        return None;
+    }
+    let digest = labels.get(LABEL_PROJECT)?;
+    let spec = labels.get(LABEL_SPEC)?;
+    if !is_digest(digest) || !is_digest(spec) {
+        return None;
+    }
+    let project = PathBuf::from(labels.get(LABEL_PROJECT_ROOT)?);
+    if project_digest(&project) != *digest {
+        return None;
+    }
+    Some((lifecycle, project, spec.clone()))
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn inspect_session_count(id: &str) -> Result<usize> {
+    let output = Command::new(CONTAINER_BIN)
+        .args(["exec", "--user", "silo", id, STATUS_COMMAND])
+        .output()
+        .map_err(spawn_error)?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .context("guest returned an invalid session count")
+}
+
+fn render_container_table(items: &[ContainerInfo]) -> String {
+    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let mut table = Table::new();
+    table
+        .load_preset(NOTHING)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(
+            ["CONTAINER", "TYPE", "STATE", "SESSIONS", "PROJECT", "IMAGE"]
+                .into_iter()
+                .map(|value| Cell::new(value).add_attribute(Attribute::Bold)),
+        );
+    for item in items {
+        let mut state = Cell::new(item.state.as_str());
+        if color {
+            state = state.fg(match item.state {
+                ContainerState::Running => Color::Green,
+                ContainerState::Stopping => Color::Yellow,
+                ContainerState::Stopped | ContainerState::Absent => Color::DarkGrey,
+                ContainerState::Unknown => Color::Red,
+            });
+        }
+        table.add_row([
+            Cell::new(short_id(&item.id)),
+            Cell::new(item.lifecycle.as_str()),
+            state,
+            Cell::new(
+                item.sessions
+                    .map_or_else(|| "?".to_string(), |count| count.to_string()),
+            ),
+            Cell::new(display_project(item)),
+            Cell::new(&item.image),
+        ]);
+    }
+    table.to_string()
+}
+
+fn short_id(id: &str) -> String {
+    const DISPLAY_CHARS: usize = 16;
+    if id.chars().count() <= DISPLAY_CHARS {
+        id.to_string()
+    } else {
+        id.chars().take(DISPLAY_CHARS).collect()
+    }
+}
+
+fn display_project(item: &ContainerInfo) -> String {
+    let project = &item.project;
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return project.display().to_string();
+    };
+    project.strip_prefix(&home).map_or_else(
+        |_| project.display().to_string(),
+        |relative| {
+            if relative.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", relative.display())
+            }
+        },
+    )
+}
+
+fn select_container<'a>(items: &'a [ContainerInfo], selector: &str) -> Result<&'a ContainerInfo> {
+    if let Some(item) = items.iter().find(|item| item.id == selector) {
+        return Ok(item);
+    }
+    let expanded = expand_selector_home(selector);
+    let path_matches: Vec<_> = items
+        .iter()
+        .filter(|item| item.project == expanded)
+        .collect();
+    if !path_matches.is_empty() {
+        return one_match(selector, &path_matches);
+    }
+
+    let name_matches: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            item.project
+                .file_name()
+                .is_some_and(|name| name == selector)
+        })
+        .collect();
+    if !name_matches.is_empty() {
+        return one_match(selector, &name_matches);
+    }
+    let id_matches: Vec<_> = items
+        .iter()
+        .filter(|item| item.id.starts_with(selector))
+        .collect();
+    if !id_matches.is_empty() {
+        return one_match(selector, &id_matches);
+    }
+    Err(anyhow!("no Silo container matches `{selector}`"))
+}
+
+fn one_match<'a>(selector: &str, matches: &[&'a ContainerInfo]) -> Result<&'a ContainerInfo> {
+    if let [item] = matches {
+        return Ok(*item);
+    }
+    Err(anyhow!(
+        "selector `{selector}` is ambiguous; matching containers: {}",
+        matches
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+fn expand_selector_home(selector: &str) -> PathBuf {
+    if selector == "~" {
+        return std::env::var_os("HOME").map_or_else(|| PathBuf::from(selector), PathBuf::from);
+    }
+    if let Some(relative) = selector.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(relative);
+    }
+    PathBuf::from(selector)
+}
+
+fn guarded_stop(container: &ContainerInfo) -> Result<()> {
+    let id = &container.id;
+    let mut guard = Command::new(CONTAINER_BIN)
+        .args(["exec", "--user", "silo", id, STOP_GUARD_COMMAND])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(spawn_error)?;
+    let input = guard
+        .stdin
+        .take()
+        .context("stop guard stdin was not piped")?;
+    let stdout = guard
+        .stdout
+        .take()
+        .context("stop guard stdout was not piped")?;
+    let mut ready = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut ready)
+        .context("failed to read stop guard readiness")?;
+    if ready.trim() != "ready" {
+        drop(input);
+        let status = guard.wait().context("failed to wait for stop guard")?;
+        let mut stderr = String::new();
+        if let Some(mut pipe) = guard.stderr.take() {
+            pipe.read_to_string(&mut stderr)
+                .context("failed to read stop guard error")?;
+        }
+        if status.code() == Some(75) {
+            return Err(anyhow!(
+                "container `{id}` became active while stopping; retry after its sessions finish or use `--force`"
+            ));
+        }
+        return Err(anyhow!(
+            "could not guard container `{id}`: {}",
+            stderr.trim()
+        ));
+    }
+
+    if revalidate_selected_container(container)?.is_none() {
+        drop(input);
+        let _ = guard.wait();
+        return Ok(());
+    }
+
+    let output = Command::new(CONTAINER_BIN)
+        .args(["stop", id])
+        .output()
+        .map_err(spawn_error)?;
+    drop(input);
+    let _ = guard.wait();
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "failed to stop container `{id}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn delete_stopped_container(container: &ContainerInfo) -> Result<()> {
+    let Some(inspection) = revalidate_selected_container(container)? else {
+        return Ok(());
+    };
+    if inspection.state != ContainerState::Stopped {
+        return Err(anyhow!(
+            "container `{}` is no longer stopped and was not deleted",
+            container.id
+        ));
+    }
+    let id = &container.id;
+    let output = Command::new(CONTAINER_BIN)
+        .args(["delete", id])
+        .output()
+        .map_err(spawn_error)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if delete_succeeded(output.status, &stderr) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "failed to delete container `{id}`: {}",
+            stderr.trim()
+        ))
+    }
+}
+
+fn stop_runtime_container(container: &ContainerInfo) -> Result<()> {
+    let Some(inspection) = revalidate_selected_container(container)? else {
+        return Ok(());
+    };
+    if inspection.state == ContainerState::Stopped {
+        return Ok(());
+    }
+    let id = &container.id;
+    let output = Command::new(CONTAINER_BIN)
+        .args(["stop", id])
+        .output()
+        .map_err(spawn_error)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() || stderr.to_lowercase().contains("not found") {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "failed to stop container `{id}`: {}",
+            stderr.trim()
+        ))
+    }
+}
+
+fn wait_until_stopped(container: &ContainerInfo) -> Result<()> {
+    let id = &container.id;
+    let deadline = Instant::now() + CONFLICT_RETRY_TIMEOUT;
+    loop {
+        let Some(inspection) = revalidate_selected_container(container)? else {
+            return Ok(());
+        };
+        match inspection.state {
+            ContainerState::Absent | ContainerState::Stopped => return Ok(()),
+            ContainerState::Stopping => {}
+            _ => {
+                return Err(anyhow!(
+                    "container `{id}` left the stopping state; retry or use `--force`"
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "container `{id}` did not stop within {} seconds",
+                CONFLICT_RETRY_TIMEOUT.as_secs()
+            ));
+        }
+        thread::sleep(CONFLICT_RETRY_INTERVAL);
+    }
+}
+
+/// Returns the one-shot container ID, `<prefix><pid>`.
 fn isolated_container_id() -> String {
     format!("{CONTAINER_NAME_PREFIX}{}", std::process::id())
 }
@@ -676,6 +1295,7 @@ fn container_identity(
     }
     ContainerIdentity {
         project: project_digest(&project.root),
+        project_root: project.root.to_string_lossy().into_owned(),
         spec: format!("{:x}", hasher.finalize()),
     }
 }
@@ -694,6 +1314,7 @@ fn append_identity_labels(run: &mut Command, identity: &ContainerIdentity, lifec
         (LABEL_OWNER, LABEL_OWNER_VALUE),
         (LABEL_SCHEMA, LABEL_SCHEMA_VALUE),
         (LABEL_PROJECT, identity.project.as_str()),
+        (LABEL_PROJECT_ROOT, identity.project_root.as_str()),
         (LABEL_LIFECYCLE, lifecycle),
         (LABEL_SPEC, identity.spec.as_str()),
     ] {
@@ -942,6 +1563,7 @@ fn validate_shared_ownership(inspection: &ContainerInspection, project: &Project
         (LABEL_OWNER, LABEL_OWNER_VALUE),
         (LABEL_SCHEMA, LABEL_SCHEMA_VALUE),
         (LABEL_PROJECT, expected_project.as_str()),
+        (LABEL_PROJECT_ROOT, project.root.to_string_lossy().as_ref()),
         (LABEL_LIFECYCLE, LABEL_SHARED_VALUE),
     ] {
         let actual = inspection.labels.get(key).map(String::as_str);
@@ -967,76 +1589,12 @@ fn validate_shared_container(
     let actual = inspection.labels.get(LABEL_SPEC).map(String::as_str);
     if actual != Some(identity.spec.as_str()) {
         return Err(anyhow!(
-            "container '{}' was created from a different Silo specification; run 'silo stop' and retry",
+            "container '{}' was created from a different Silo specification; run 'silo containers delete {}' and retry",
+            project.id,
             project.id
         ));
     }
     Ok(())
-}
-
-/// Stops and deletes only the inspect-validated shared container for this
-/// project. Conflicting runtime transitions are retried for a bounded time.
-fn stop_shared_container(project: &Project) -> Result<()> {
-    let deadline = Instant::now() + CONFLICT_RETRY_TIMEOUT;
-    let mut last_conflict = None;
-    loop {
-        let inspection = inspect_container(&project.id)?;
-        match inspection.state {
-            ContainerState::Absent => return Ok(()),
-            ContainerState::Running => {
-                validate_shared_ownership(&inspection, project)?;
-                let output = Command::new(CONTAINER_BIN)
-                    .args(["stop", &project.id])
-                    .output()
-                    .map_err(spawn_error)?;
-                if !output.status.success() {
-                    last_conflict = Some(anyhow!(
-                        "failed to stop shared container '{}': {}",
-                        project.id,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ));
-                }
-            }
-            ContainerState::Stopping => {
-                validate_shared_ownership(&inspection, project)?;
-            }
-            ContainerState::Stopped => {
-                validate_shared_ownership(&inspection, project)?;
-                let output = Command::new(CONTAINER_BIN)
-                    .args(["delete", &project.id])
-                    .output()
-                    .map_err(spawn_error)?;
-                if output.status.success()
-                    || String::from_utf8_lossy(&output.stderr)
-                        .to_lowercase()
-                        .contains("not found")
-                {
-                    return Ok(());
-                }
-                last_conflict = Some(anyhow!(
-                    "failed to delete shared container '{}': {}",
-                    project.id,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
-            }
-            ContainerState::Unknown => {
-                return Err(anyhow!(
-                    "container '{}' is in an unsupported runtime state and was not deleted",
-                    project.id
-                ));
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(last_conflict.unwrap_or_else(|| {
-                anyhow!(
-                    "container '{}' did not stop within {} seconds",
-                    project.id,
-                    CONFLICT_RETRY_TIMEOUT.as_secs()
-                )
-            }));
-        }
-        thread::sleep(CONFLICT_RETRY_INTERVAL);
-    }
 }
 
 /// Inspects a container, booting the container system and retrying once when needed.
@@ -1100,7 +1658,18 @@ fn parse_container_inspection(stdout: &[u8], id: &str) -> Result<ContainerInspec
         .map(parse_inspect_labels)
         .transpose()?
         .unwrap_or_default();
-    Ok(ContainerInspection { state, labels })
+    let image = item
+        .pointer("/configuration/image/reference")
+        .and_then(Value::as_str)
+        .or_else(|| item.pointer("/configuration/image").and_then(Value::as_str))
+        .or_else(|| item.pointer("/image/reference").and_then(Value::as_str))
+        .or_else(|| item.get("image").and_then(Value::as_str))
+        .map(ToString::to_string);
+    Ok(ContainerInspection {
+        state,
+        labels,
+        image,
+    })
 }
 
 fn parse_inspect_labels(value: &Value) -> Result<HashMap<String, String>> {
@@ -1238,18 +1807,8 @@ fn isolated_owner_pid(id: &str) -> Option<libc::pid_t> {
 }
 
 fn is_owned_isolated(inspection: &ContainerInspection) -> bool {
-    [
-        (LABEL_OWNER, LABEL_OWNER_VALUE),
-        (LABEL_SCHEMA, LABEL_SCHEMA_VALUE),
-        (LABEL_LIFECYCLE, LABEL_ISOLATED_VALUE),
-    ]
-    .into_iter()
-    .all(|(key, value)| inspection.labels.get(key).map(String::as_str) == Some(value))
-        && [LABEL_PROJECT, LABEL_SPEC].into_iter().all(|key| {
-            inspection.labels.get(key).is_some_and(|value| {
-                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-        })
+    silo_metadata(inspection)
+        .is_some_and(|(lifecycle, _, _)| lifecycle == ContainerLifecycle::Isolated)
 }
 
 fn owner_alive(pid: libc::pid_t) -> bool {

@@ -11,9 +11,11 @@
 # complete global collection when present.
 #
 # The optional read-only `.git` and configured shared mounts are applied on top
-# of the project directory. A project container stays running after its last
-# session. Run `silo stop` to stop and delete it. Image rebuilds and changes to
-# mount entries or read_only_git take effect after `silo stop` and the next run.
+# of the project directory. A project container stops after its last session
+# but remains available for the next run. Use `silo containers` to find it and
+# `silo containers delete <container-or-project>` to delete it. Image rebuilds
+# and changes to mount entries or read_only_git take effect after deletion and
+# the next run recreates the container.
 
 # Dockerfile that defines the image `silo image build` builds and `silo run`
 # runs. When unset, the built-in silo image is used.
@@ -39,7 +41,8 @@ read_only_git = true
 # in this global file. Project sources may also be relative to the discovered
 # project root. A bare `~` is your home directory; `~user` paths are not
 # supported. The source must exist when a container is created (for shared
-# runs: at `silo stop` + the next `silo run`), or the run fails. Mounts are
+# runs: after `silo containers delete` + the next `silo run`), or the run fails.
+# Mounts are
 # passed to the container CLI in this order: project directory, `.git`
 # (read-only), shared mounts — when two mounts share a target, the last one
 # passed wins.
@@ -55,7 +58,8 @@ read_only_git = true
 #   codex = ["codex"]
 #   cx    = ["codex", "--model", "compact"]
 #
-# A name must not collide with a built-in command (`run`, `stop`, `image`, `help`)
-# and must not start with `-`: the built-in command always wins, and flag-
+# A name must not collide with a built-in command (`run`, `containers`, `image`,
+# `help`) and must not start with `-`: the
+# built-in command always wins, and flag-
 # shaped tokens are reserved for silo's own options, so such a quick command
 # could never run. Unusable names are reported as a warning when silo runs.

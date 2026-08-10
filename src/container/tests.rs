@@ -1282,6 +1282,7 @@ fn create_command_starts_the_detached_supervisor() {
     assert_eq!(labels.get(LABEL_SCHEMA), Some(&LABEL_SCHEMA_VALUE));
     assert_eq!(labels.get(LABEL_LIFECYCLE), Some(&LABEL_SHARED_VALUE));
     assert_eq!(labels.get(LABEL_PROJECT).map(|value| value.len()), Some(64));
+    assert_eq!(labels.get(LABEL_PROJECT_ROOT), Some(&"/tmp/project"));
     assert_eq!(labels.get(LABEL_SPEC).map(|value| value.len()), Some(64));
 }
 
@@ -1405,6 +1406,7 @@ fn guest_reservation_keeps_pid_one_alive_during_session_handoff() {
     let runtime = dir.path().join("runtime");
     let reservations = runtime.join("reservations");
     fs::create_dir_all(&reservations).expect("runtime directories create");
+    fs::create_dir(runtime.join("sessions")).expect("session directory creates");
     let supervisor_path = dir.path().join("supervisor");
     let reserve_path = dir.path().join("reserve");
     let session_path = dir.path().join("session");
@@ -1480,13 +1482,14 @@ fn wait_for_path(path: &Path) {
 
 #[test]
 fn inspect_parser_accepts_current_nested_state() {
-    let json = br#"[{"id":"silo-test","status":{"state":"running","networks":[]}}]"#;
-    assert_eq!(
-        parse_container_inspection(json, "silo-test")
-            .expect("state parses")
-            .state,
-        ContainerState::Running,
-    );
+    let json = br#"[{
+        "id":"silo-test",
+        "configuration":{"image":{"reference":"silo:latest"}},
+        "status":{"state":"running","networks":[]}
+    }]"#;
+    let inspection = parse_container_inspection(json, "silo-test").expect("state parses");
+    assert_eq!(inspection.state, ContainerState::Running);
+    assert_eq!(inspection.image.as_deref(), Some("silo:latest"));
 }
 
 #[test]
@@ -1590,9 +1593,14 @@ fn shared_inspection(project: &Project, identity: &ContainerIdentity) -> Contain
             (LABEL_OWNER.to_string(), LABEL_OWNER_VALUE.to_string()),
             (LABEL_SCHEMA.to_string(), LABEL_SCHEMA_VALUE.to_string()),
             (LABEL_PROJECT.to_string(), project_digest(&project.root)),
+            (
+                LABEL_PROJECT_ROOT.to_string(),
+                project.root.display().to_string(),
+            ),
             (LABEL_LIFECYCLE.to_string(), LABEL_SHARED_VALUE.to_string()),
             (LABEL_SPEC.to_string(), identity.spec.clone()),
         ]),
+        image: Some(IMAGE_TAG.to_string()),
     }
 }
 
@@ -1613,6 +1621,7 @@ fn inspect_identity_refuses_foreign_containers_including_buildkit() {
     let foreign = ContainerInspection {
         state: ContainerState::Running,
         labels: HashMap::new(),
+        image: None,
     };
 
     let error = validate_shared_container(&foreign, &project, &identity)
@@ -1633,7 +1642,7 @@ fn inspect_identity_requires_explicit_stop_for_spec_drift() {
     let error = validate_shared_container(&inspection, &project, &identity)
         .expect_err("specification drift must be refused");
 
-    assert!(error.to_string().contains("silo stop"));
+    assert!(error.to_string().contains("silo containers delete"));
 }
 
 #[test]
@@ -1674,8 +1683,10 @@ fn isolated_orphan_cleanup_requires_complete_runtime_ownership_labels() {
                 LABEL_ISOLATED_VALUE.to_string(),
             ),
             (LABEL_PROJECT.to_string(), identity.project),
+            (LABEL_PROJECT_ROOT.to_string(), identity.project_root),
             (LABEL_SPEC.to_string(), identity.spec),
         ]),
+        image: Some(IMAGE_TAG.to_string()),
     };
     assert!(is_owned_isolated(&inspection));
 
@@ -1730,13 +1741,230 @@ fn embedded_image_contains_guest_lifecycle_programs() {
     assert!(DOCKERFILE.contains("COPY silo-supervisor.sh"));
     assert!(DOCKERFILE.contains("COPY silo-session.sh"));
     assert!(DOCKERFILE.contains("COPY silo-reserve.sh"));
+    assert!(DOCKERFILE.contains("COPY silo-status.sh"));
+    assert!(DOCKERFILE.contains("COPY silo-stop-guard.sh"));
     assert!(DOCKERFILE.contains("util-linux"));
     assert!(SUPERVISOR.contains("flock --exclusive --nonblock"));
     assert!(SUPERVISOR.contains("-ge 100"));
     assert!(SESSION_WRAPPER.contains("flock --shared"));
     assert!(SESSION_WRAPPER.contains("reservation_file"));
     assert!(SESSION_RESERVER.contains("flock --shared"));
+    assert!(STATUS_HELPER.contains("count=$((count + 1))"));
+    assert!(STOP_GUARD.contains("flock --exclusive --nonblock"));
     assert!(SESSION_WRAPPER.contains("exec \"$@\""));
+}
+
+#[test]
+fn inventory_metadata_requires_a_matching_project_path_digest() {
+    let project = test_project("/tmp/project");
+    let identity = shared_identity(&project);
+    let mut inspection = shared_inspection(&project, &identity);
+
+    let metadata = silo_metadata(&inspection).expect("current labels are inventory-safe");
+    assert_eq!(metadata.0, ContainerLifecycle::Shared);
+    assert_eq!(metadata.1, project.root);
+    assert_eq!(metadata.2, identity.spec);
+
+    inspection
+        .labels
+        .insert(LABEL_PROJECT_ROOT.to_string(), "/tmp/different".to_string());
+    assert!(silo_metadata(&inspection).is_none());
+}
+
+fn inventory_item(id: &str, project: &str, lifecycle: ContainerLifecycle) -> ContainerInfo {
+    ContainerInfo {
+        id: id.to_string(),
+        lifecycle,
+        state: ContainerState::Stopped,
+        sessions: Some(0),
+        project: PathBuf::from(project),
+        spec: "a".repeat(64),
+        image: IMAGE_TAG.to_string(),
+    }
+}
+
+#[test]
+fn selectors_support_ids_prefixes_paths_and_unique_project_names() {
+    let items = [
+        inventory_item(
+            "silo-111111111111111111111111",
+            "/work/alpha",
+            ContainerLifecycle::Shared,
+        ),
+        inventory_item(
+            "silo-222222222222222222222222",
+            "/work/beta",
+            ContainerLifecycle::Isolated,
+        ),
+    ];
+    assert_eq!(
+        select_container(&items, "silo-1111")
+            .expect("unique prefix")
+            .id,
+        items[0].id
+    );
+    assert_eq!(
+        select_container(&items, "/work/beta")
+            .expect("exact path")
+            .id,
+        items[1].id
+    );
+    assert_eq!(
+        select_container(&items, "alpha")
+            .expect("unique project name")
+            .id,
+        items[0].id
+    );
+}
+
+#[test]
+fn selectors_report_ambiguous_project_matches() {
+    let items = [
+        inventory_item("silo-111", "/one/project", ContainerLifecycle::Shared),
+        inventory_item("silo-222", "/two/project", ContainerLifecycle::Shared),
+    ];
+    let error = select_container(&items, "project").expect_err("name is ambiguous");
+    let message = error.to_string();
+    assert!(message.contains("silo-111"), "{message}");
+    assert!(message.contains("silo-222"), "{message}");
+}
+
+#[test]
+fn exact_project_name_precedes_an_unrelated_id_prefix() {
+    let items = [
+        inventory_item(
+            "silo-123abcdef",
+            "/work/unrelated",
+            ContainerLifecycle::Shared,
+        ),
+        inventory_item(
+            "silo-999abcdef",
+            "/work/silo-123",
+            ContainerLifecycle::Shared,
+        ),
+    ];
+    let selected = select_container(&items, "silo-123").expect("project name takes precedence");
+    assert_eq!(selected.id, "silo-999abcdef");
+}
+
+#[test]
+fn selected_ownership_rejects_a_replacement_with_different_labels() {
+    let project = test_project("/tmp/project");
+    let identity = shared_identity(&project);
+    let inspection = shared_inspection(&project, &identity);
+    let selected = ContainerInfo {
+        id: project.id.clone(),
+        lifecycle: ContainerLifecycle::Shared,
+        state: ContainerState::Stopped,
+        sessions: Some(0),
+        project: project.root.clone(),
+        spec: identity.spec.clone(),
+        image: IMAGE_TAG.to_string(),
+    };
+    validate_selected_ownership(&selected, &inspection).expect("selected identity matches");
+
+    let mut replacement = inspection;
+    replacement
+        .labels
+        .insert(LABEL_SPEC.to_string(), "b".repeat(64));
+    let error = validate_selected_ownership(&selected, &replacement)
+        .expect_err("replacement must not be managed");
+    assert!(error.to_string().contains("no longer matches"));
+}
+
+#[test]
+fn normal_stop_policy_refuses_active_and_unknown_sessions() {
+    let mut item = inventory_item("silo-111", "/work/project", ContainerLifecycle::Shared);
+    item.state = ContainerState::Running;
+    item.sessions = Some(2);
+    let active = require_inactive_sessions(&item.id, item.sessions)
+        .expect_err("active sessions are protected");
+    assert!(active.to_string().contains("2 active sessions"));
+    assert!(active.to_string().contains("--force"));
+
+    item.sessions = None;
+    let unknown = require_inactive_sessions(&item.id, item.sessions)
+        .expect_err("unknown sessions are protected");
+    assert!(unknown.to_string().contains("unknown session state"));
+
+    item.sessions = Some(0);
+    require_inactive_sessions(&item.id, item.sessions).expect("an idle container can stop");
+}
+
+#[test]
+fn container_table_shows_the_agreed_snapshot_fields() {
+    let item = inventory_item(
+        "silo-1234567890abcdef12345678",
+        "/work/project",
+        ContainerLifecycle::Shared,
+    );
+    let table = render_container_table(&[item]);
+    for expected in [
+        "CONTAINER",
+        "TYPE",
+        "STATE",
+        "SESSIONS",
+        "PROJECT",
+        "IMAGE",
+        "silo-1234567890a",
+        "silo:latest",
+    ] {
+        assert!(table.contains(expected), "missing {expected} in:\n{table}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guest_status_counts_live_leases_and_stop_guard_refuses_them() {
+    let dir = TestDir::new("guest-status");
+    let runtime = dir.path().join("runtime");
+    fs::create_dir_all(runtime.join("reservations")).expect("reservations create");
+    fs::create_dir(runtime.join("sessions")).expect("sessions create");
+    let reserve = dir.path().join("reserve");
+    let session = dir.path().join("session");
+    let status = dir.path().join("status");
+    let guard = dir.path().join("guard");
+    fs::write(&reserve, SESSION_RESERVER).expect("reserve writes");
+    fs::write(&session, SESSION_WRAPPER).expect("session writes");
+    fs::write(&status, STATUS_HELPER).expect("status writes");
+    fs::write(&guard, STOP_GUARD).expect("guard writes");
+
+    run_guest_script(&reserve, &runtime, &["aa11"]).expect("session reserves");
+    let mut active = Command::new("sh")
+        .arg(&session)
+        .args(["aa11", "sleep", "0.4"])
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .spawn()
+        .expect("session starts");
+    wait_for_path(&runtime.join("sessions/aa11"));
+
+    let count = Command::new("sh")
+        .arg(&status)
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("status runs");
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+    let blocked = Command::new("sh")
+        .arg(&guard)
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("guard runs");
+    assert_eq!(blocked.status.code(), Some(75));
+
+    assert!(active.wait().expect("session waits").success());
+    let ready = Command::new("sh")
+        .arg(&guard)
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("guard runs after idle");
+    assert!(ready.status.success());
+    assert_eq!(String::from_utf8_lossy(&ready.stdout).trim(), "ready");
+    let count = Command::new("sh")
+        .arg(&status)
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("status prunes stale marker");
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "0");
 }
 
 #[test]

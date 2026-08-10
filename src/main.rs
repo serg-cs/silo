@@ -1,67 +1,33 @@
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser};
 use std::ffi::OsString;
 use std::process::ExitCode;
 
 use anyhow::anyhow;
 
+mod cli;
 mod config;
 mod container;
 
-/// A tiny wrapper around Apple's `container` CLI for macOS.
-#[derive(Parser)]
-#[command(name = "silo", version, about)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Manage the image.
-    Image {
-        #[command(subcommand)]
-        command: ImageCommand,
-    },
-    /// Run a session in the shared container for the current project.
-    ///
-    /// Executes COMMAND inside it instead of the default shell, passed
-    /// after `--`: `silo run -- <command>`. A `[quick]` config entry runs
-    /// as `silo <name>`.
-    Run {
-        /// Use a separate one-shot container removed when the session ends.
-        #[arg(long)]
-        isolated: bool,
-        /// Command to run inside the container; empty runs the default shell.
-        #[arg(value_name = "COMMAND", last = true)]
-        command: Vec<OsString>,
-    },
-    /// Stop and delete the shared container for the current project.
-    Stop,
-    /// Run a configured quick command: `silo <name> [args...]`, where `name`
-    /// is a key in the `[quick]` section of the config file; extra arguments
-    /// are appended.
-    #[command(external_subcommand)]
-    Quick(Vec<OsString>),
-}
-
-#[derive(Subcommand)]
-enum ImageCommand {
-    /// Build the image: the embedded Dockerfile by default, or the one
-    /// configured in the config file.
-    Build,
-}
+use cli::{Cli, Command, ContainersCommand, ImageCommand};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Command::Containers { command } = &cli.command {
+        let result = match command {
+            None | Some(ContainersCommand::List) => container::print_containers(),
+            Some(ContainersCommand::Stop { selector, force }) => {
+                container::stop_container(selector, *force)
+            }
+            Some(ContainersCommand::Delete { selector, force }) => {
+                container::delete_selected_container(selector, *force)
+            }
+        };
+        return result.unwrap_or_else(|err| fail(&err));
+    }
     let project = match container::Project::current() {
         Ok(project) => project,
         Err(err) => return fail(&err),
     };
-    // Stopping is intentionally independent of configuration validity: it
-    // only needs the project identity to clean up the shared container.
-    if matches!(&cli.command, Command::Stop) {
-        return container::stop_image(&project).unwrap_or_else(|err| fail(&err));
-    }
     // Loaded once for every config-consuming command. Precedence is built-in
     // defaults < global config < project config < future CLI flags.
     let config = match config::Config::load_for_project(&project.root) {
@@ -81,7 +47,7 @@ fn main() -> ExitCode {
         Command::Run { isolated, command } => {
             container::run_image(&config, &project, &command, isolated)
         }
-        Command::Stop => unreachable!("stop returned before loading configuration"),
+        Command::Containers { .. } => unreachable!("container commands returned before config"),
         Command::Quick(args) => quick_command(&config, &args)
             .and_then(|command| container::run_image(&config, &project, &command, false)),
     };
@@ -272,17 +238,66 @@ mod tests {
             parse(&["silo", "image", "build"]),
             Command::Image { .. }
         ));
-        assert!(matches!(parse(&["silo", "stop"]), Command::Stop));
+        assert!(matches!(
+            parse(&["silo", "containers"]),
+            Command::Containers { command: None }
+        ));
+        assert!(matches!(
+            parse(&["silo", "containers", "list"]),
+            Command::Containers {
+                command: Some(ContainersCommand::List)
+            }
+        ));
+        assert!(matches!(
+            parse(&["silo", "containers", "ls"]),
+            Command::Containers {
+                command: Some(ContainersCommand::List)
+            }
+        ));
     }
 
     #[test]
     fn builtin_commands_covers_the_project_command_set() {
         let names = builtin_commands();
-        for expected in ["run", "stop", "image", "help"] {
+        for expected in ["run", "containers", "image", "help"] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "missing {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn containers_stop_requires_an_explicit_selector() {
+        let err = Cli::try_parse_from(["silo", "containers", "stop"])
+            .err()
+            .expect("selector is required");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn containers_stop_parses_force() {
+        let Command::Containers {
+            command: Some(ContainersCommand::Stop { selector, force }),
+        } = parse(&["silo", "containers", "stop", "silo-abcd", "--force"])
+        else {
+            panic!("expected containers stop");
+        };
+        assert_eq!(selector, "silo-abcd");
+        assert!(force);
+    }
+
+    #[test]
+    fn containers_delete_and_rm_parse_force() {
+        for command in ["delete", "rm"] {
+            let Command::Containers {
+                command: Some(ContainersCommand::Delete { selector, force }),
+            } = parse(&["silo", "containers", command, "project", "--force"])
+            else {
+                panic!("expected containers delete");
+            };
+            assert_eq!(selector, "project");
+            assert!(force);
         }
     }
 

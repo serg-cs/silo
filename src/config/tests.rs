@@ -208,13 +208,13 @@ fn quick_rejects_names_shadowed_by_builtins() {
 }
 
 #[test]
-fn quick_rejects_stop_after_it_becomes_a_builtin() {
-    let config = Config::parse("[quick]\nstop = [\"bash\"]\n").expect("config parses");
+fn quick_rejects_containers_after_it_becomes_a_builtin() {
+    let config = Config::parse("[quick]\ncontainers = [\"bash\"]\n").expect("config parses");
     let msg = config
-        .check_quick_names(&["run", "stop", "image", "help"])
-        .expect_err("`stop` collides with the built-in command")
+        .check_quick_names(&["run", "containers", "image", "help"])
+        .expect_err("`containers` collides with the built-in command")
         .to_string();
-    assert!(msg.contains("`stop`"), "names the offender: {msg}");
+    assert!(msg.contains("`containers`"), "names the offender: {msg}");
 }
 
 #[test]
