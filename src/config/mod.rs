@@ -126,7 +126,7 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error when the config file exists but cannot be read or
-    /// parsed.
+    /// parsed. Unknown keys produce warnings and are otherwise ignored.
     pub fn load() -> Result<Self> {
         let Some(path) = config_path() else {
             // No home directory to read from; run on defaults.
@@ -157,7 +157,7 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error when the config file exists but cannot be read or
-    /// parsed.
+    /// parsed. Unknown keys produce warnings and are otherwise ignored.
     pub fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
             write_default(path);
@@ -165,7 +165,10 @@ impl Config {
         }
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file `{}`", path.display()))?;
-        Self::parse(&text).with_context(|| format!("invalid config in `{}`", path.display()))
+        let (config, unknown_keys) = Self::parse_with_unknown_keys(&text)
+            .with_context(|| format!("invalid config in `{}`", path.display()))?;
+        warn_unknown_keys(path, &unknown_keys);
+        Ok(config)
     }
 
     /// Applies the project file to an already loaded global configuration.
@@ -176,13 +179,14 @@ impl Config {
         }
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read project config file `{}`", path.display()))?;
-        let mut project: ProjectConfig = toml::from_str(&text)
+        let (mut project, unknown_keys) = deserialize_toml::<ProjectConfig>(&text)
             .with_context(|| format!("invalid project config in `{}`", path.display()))?;
         project.resolve_paths(project_root);
         config.apply_project(project);
         config
             .validate()
             .with_context(|| format!("invalid project config in `{}`", path.display()))?;
+        warn_unknown_keys(&path, &unknown_keys);
         Ok(config)
     }
 
@@ -208,10 +212,18 @@ impl Config {
     ///
     /// Returns an error when the text is not valid TOML or does not match the
     /// config schema; the error includes the offending line and column.
+    #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self> {
-        let config: Self = toml::from_str(text)?;
-        config.validate()?;
+        let (config, _) = Self::parse_with_unknown_keys(text)?;
         Ok(config)
+    }
+
+    /// Parses and validates config text while retaining the paths of fields
+    /// ignored by Serde so file-loading callers can warn about likely typos.
+    fn parse_with_unknown_keys(text: &str) -> Result<(Self, Vec<String>)> {
+        let (config, unknown_keys) = deserialize_toml::<Self>(text)?;
+        config.validate()?;
+        Ok((config, unknown_keys))
     }
 
     /// Returns an error when a quick command name can never be reached: a
@@ -304,6 +316,39 @@ impl Config {
             problems.join("; ")
         ))
     }
+}
+
+/// Deserializes one TOML document and records every key ignored by the target
+/// schema. Paths are sorted so multiple warnings have deterministic order.
+fn deserialize_toml<'de, T>(
+    text: &'de str,
+) -> std::result::Result<(T, Vec<String>), toml::de::Error>
+where
+    T: Deserialize<'de>,
+{
+    let deserializer = toml::Deserializer::parse(text)?;
+    let mut unknown_keys = Vec::new();
+    let value = serde_ignored::deserialize(deserializer, |path| {
+        unknown_keys.push(path.to_string());
+    })?;
+    unknown_keys.sort();
+    Ok((value, unknown_keys))
+}
+
+/// Warns once for each schema key ignored while reading `path`.
+fn warn_unknown_keys(path: &Path, unknown_keys: &[String]) {
+    for key in unknown_keys {
+        eprintln!("{}", unknown_key_warning(path, key));
+    }
+}
+
+/// Formats unknown-key warnings separately from stderr emission so their
+/// safety-relevant file and key context can be tested exactly.
+fn unknown_key_warning(path: &Path, key: &str) -> String {
+    format!(
+        "warning: unknown config key `{key}` in `{}`; it will be ignored",
+        path.display()
+    )
 }
 
 impl ProjectConfig {

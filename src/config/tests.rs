@@ -72,10 +72,22 @@ fn default_config_file_matches_builtin_defaults() {
 }
 
 #[test]
-fn unknown_keys_are_ignored() {
-    let config = Config::parse("[image]\nfuture_key = 42\n[future]\nsome_setting = \"bar\"")
-        .expect("config with unknown keys parses");
+fn unknown_keys_are_reported_and_ignored() {
+    let (config, unknown_keys) = Config::parse_with_unknown_keys(
+        "[image]\nfuture_key = 42\n[future]\nsome_setting = \"bar\"",
+    )
+    .expect("config with unknown keys parses");
     assert!(config.image.dockerfile.is_none());
+    assert_eq!(unknown_keys, ["future", "image.future_key"]);
+}
+
+#[test]
+fn unknown_key_warning_names_the_key_and_source_file() {
+    let path = Path::new("/project/.silo.toml");
+    assert_eq!(
+        unknown_key_warning(path, "image.dockerfiel"),
+        "warning: unknown config key `image.dockerfiel` in `/project/.silo.toml`; it will be ignored"
+    );
 }
 
 #[test]
@@ -197,6 +209,16 @@ fn quick_parses_names_to_commands() {
 }
 
 #[test]
+fn quick_command_names_are_not_unknown_config_keys() {
+    let (config, unknown_keys) = deserialize_toml::<Config>(
+        "[quick]\ncodex = [\"codex\"]\ncx = [\"codex\", \"--model\", \"compact\"]\n",
+    )
+    .expect("config parses");
+    assert!(unknown_keys.is_empty());
+    assert_eq!(config.quick.len(), 2);
+}
+
+#[test]
 fn quick_rejects_names_shadowed_by_builtins() {
     let config = Config::parse("[quick]\nrun = [\"bash\"]\n").expect("config parses");
     let msg = config
@@ -309,6 +331,15 @@ fn project_omitted_shared_inherits_global_list() {
     assert_eq!(merged.shared.len(), 1);
     assert_eq!(merged.shared[0].target, PathBuf::from("/home/silo/notes"));
     assert!(!merged.read_only_git);
+}
+
+#[test]
+fn project_schema_reports_unknown_nested_keys() {
+    let (_, unknown_keys) = deserialize_toml::<ProjectConfig>(
+        "read_only_git = true\n[image]\ndockerfiel = \"Dockerfile\"\n",
+    )
+    .expect("project config parses");
+    assert_eq!(unknown_keys, ["image.dockerfiel"]);
 }
 
 #[test]
@@ -501,10 +532,8 @@ fn shared_accepts_tilde_sources() {
 }
 
 #[test]
-fn shared_ignores_unknown_keys() {
-    // A config written for a future silo still works: unknown keys in a
-    // shared entry are ignored.
-    let config = Config::parse(
+fn shared_reports_and_ignores_unknown_keys() {
+    let (config, unknown_keys) = Config::parse_with_unknown_keys(
         "[[shared]]\n\
          source = \"~/notes\"\n\
          target = \"/home/silo/notes\"\n\
@@ -512,6 +541,7 @@ fn shared_ignores_unknown_keys() {
     )
     .expect("unknown key is ignored");
     assert_eq!(config.shared[0].permission, Permission::ReadOnly);
+    assert_eq!(unknown_keys, ["shared.0.future_key"]);
 }
 
 #[test]
