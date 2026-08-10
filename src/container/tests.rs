@@ -2118,7 +2118,7 @@ fn specification_digest_tracks_resource_limits() {
 }
 
 #[test]
-fn shell_image_revision_invalidates_pre_shell_shared_containers() {
+fn developer_image_revision_invalidates_previous_shared_containers() {
     let project = test_project("/tmp/project");
     let ids = HostIds {
         uid: "501".into(),
@@ -2134,17 +2134,17 @@ fn shell_image_revision_invalidates_pre_shell_shared_containers() {
         LABEL_SHARED_VALUE,
         &command,
     );
-    let before_zsh_and_fish = container_identity_for_protocol(
+    let previous_image = container_identity_for_protocol(
         &project,
         &ids,
         &mounts,
         &Container::default(),
         LABEL_SHARED_VALUE,
         &command,
-        "3",
+        "4",
     );
 
-    assert_ne!(current.spec, before_zsh_and_fish.spec);
+    assert_ne!(current.spec, previous_image.spec);
 }
 
 #[test]
@@ -2186,6 +2186,37 @@ fn embedded_image_installs_and_registers_supported_shells() {
     assert_eq!(Shell::Nu.path(), NU_PATH);
     assert!(DOCKERFILE.contains("CMD [\"zsh\"]"));
     assert!(DOCKERFILE.contains("usermod --shell \"${BREW_PREFIX}/bin/zsh\" silo"));
+}
+
+#[test]
+fn embedded_image_installs_developer_tooling_and_yazi_dependencies() {
+    for package in [
+        "antigravity-cli",
+        "claude-code",
+        "copilot-cli",
+        "fzf",
+        "gh",
+        "helix",
+        "jq",
+        "just",
+        "lazygit",
+        "qwen-code",
+        "tmux",
+        "vim",
+    ] {
+        assert!(
+            DOCKERFILE
+                .lines()
+                .any(|line| line.trim().trim_end_matches(" \\").trim() == package),
+            "missing Homebrew package {package}"
+        );
+    }
+    assert!(
+        DOCKERFILE
+            .lines()
+            .any(|line| line.trim().trim_end_matches(" \\").trim() == "file"),
+        "missing system package file"
+    );
 }
 
 #[test]

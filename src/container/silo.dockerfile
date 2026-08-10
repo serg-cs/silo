@@ -23,6 +23,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         build-essential \
         ca-certificates \
         curl \
+        file \
         git \
         libssl-dev \
         pkg-config \
@@ -45,19 +46,31 @@ RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.co
 
 # ---- Homebrew packages (formulae & casks) ----------------------------------
 RUN brew install \
+        antigravity-cli \
         bat \
+        claude-code \
         codex \
+        copilot-cli \
         esengine/reasonix/reasonix \
         fd \
         fish \
+        fzf \
+        gh \
+        helix \
         jj \
+        jq \
+        just \
+        lazygit \
         node \
         nushell \
         opencode \
         pi-coding-agent \
+        qwen-code \
         ripgrep \
         rust \
         rust-analyzer \
+        tmux \
+        vim \
         yazi \
         zoxide \
         zsh

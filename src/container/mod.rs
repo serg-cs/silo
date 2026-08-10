@@ -80,9 +80,10 @@ const LABEL_SCHEMA_VALUE: &str = "1";
 const LABEL_SHARED_VALUE: &str = "shared";
 const LABEL_ISOLATED_VALUE: &str = "isolated";
 /// Increment when the built-in image or guest lifecycle contract changes in
-/// a way that makes an existing shared container unsafe to reuse. Version 4
-/// adds Zsh and Fish to the built-in image.
-const LIFECYCLE_PROTOCOL_VERSION: &str = "4";
+/// a way that makes an existing shared container unsafe to reuse. Version 5
+/// expands the built-in editor, developer-tool, and AI-agent set and restores
+/// Yazi's required MIME detection support.
+const LIFECYCLE_PROTOCOL_VERSION: &str = "5";
 
 /// Runtime races are retried only for this bounded interval.
 const CONFLICT_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
