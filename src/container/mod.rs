@@ -64,7 +64,6 @@ const SHARED_INIT_COMMAND: &str = "/usr/local/bin/silo-supervisor";
 const SESSION_WRAPPER_COMMAND: &str = "/usr/local/bin/silo-session";
 const SESSION_RESERVE_COMMAND: &str = "/usr/local/bin/silo-reserve";
 const STATUS_COMMAND: &str = "/usr/local/bin/silo-status";
-const STOP_GUARD_COMMAND: &str = "/usr/local/bin/silo-stop-guard";
 const GUEST_READY_PATH: &str = "/run/silo/ready";
 
 const LABEL_OWNER: &str = "dev.silo.owner";
@@ -1006,8 +1005,7 @@ fn expand_selector_home(selector: &str) -> PathBuf {
 
 fn guarded_stop(container: &ContainerInfo) -> Result<()> {
     let id = &container.id;
-    let mut guard = Command::new(CONTAINER_BIN)
-        .args(["exec", "--user", "silo", id, STOP_GUARD_COMMAND])
+    let mut guard = stop_guard_command(id)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1038,6 +1036,17 @@ fn guarded_stop(container: &ContainerInfo) -> Result<()> {
                 "container `{id}` became active while stopping; retry after its sessions finish or use `--force`"
             ));
         }
+        if status.code() == Some(76) {
+            let reservations = stderr.trim().parse::<usize>().unwrap_or(1);
+            let noun = if reservations == 1 {
+                "session is"
+            } else {
+                "sessions are"
+            };
+            return Err(anyhow!(
+                "container `{id}` has {reservations} {noun} starting; retry after the session handoff finishes or use `--force`"
+            ));
+        }
         return Err(anyhow!(
             "could not guard container `{id}`: {}",
             stderr.trim()
@@ -1064,6 +1073,17 @@ fn guarded_stop(container: &ContainerInfo) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+/// Runs the guard embedded in this host binary rather than the copy in the
+/// existing container. This keeps replacement safe while upgrading a stale
+/// container whose image predates the current reservation checks.
+fn stop_guard_command(id: &str) -> Command {
+    let mut command = Command::new(CONTAINER_BIN);
+    command
+        .args(["exec", "--user", "silo", id, "sh", "-c"])
+        .arg(STOP_GUARD);
+    command
 }
 
 fn delete_stopped_container(container: &ContainerInfo) -> Result<()> {
@@ -1457,21 +1477,38 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
                 }
             }
             ContainerState::Running => {
-                validate_shared_container(&inspection, project, &identity)?;
-                return Ok(());
+                if shared_container_matches(&inspection, project, &identity)? {
+                    return Ok(());
+                }
+                match replace_outdated_shared_container(project, &inspection)? {
+                    ReplacementOutcome::Replaced => {
+                        checked_image = true;
+                        continue;
+                    }
+                    ReplacementOutcome::Conflict(err) => last_conflict = Some(err),
+                }
             }
             ContainerState::Stopped => {
-                validate_shared_container(&inspection, project, &identity)?;
-                let output = Command::new(CONTAINER_BIN)
-                    .args(["start", &project.id])
-                    .output()
-                    .map_err(spawn_error)?;
-                if !output.status.success() {
-                    last_conflict = Some(anyhow!(
-                        "failed to start shared container '{}': {}",
-                        project.id,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ));
+                if shared_container_matches(&inspection, project, &identity)? {
+                    let output = Command::new(CONTAINER_BIN)
+                        .args(["start", &project.id])
+                        .output()
+                        .map_err(spawn_error)?;
+                    if !output.status.success() {
+                        last_conflict = Some(anyhow!(
+                            "failed to start shared container '{}': {}",
+                            project.id,
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        ));
+                    }
+                } else {
+                    match replace_outdated_shared_container(project, &inspection)? {
+                        ReplacementOutcome::Replaced => {
+                            checked_image = true;
+                            continue;
+                        }
+                        ReplacementOutcome::Conflict(err) => last_conflict = Some(err),
+                    }
                 }
             }
             ContainerState::Stopping => {}
@@ -1585,9 +1622,7 @@ fn validate_shared_container(
     project: &Project,
     identity: &ContainerIdentity,
 ) -> Result<()> {
-    validate_shared_ownership(inspection, project)?;
-    let actual = inspection.labels.get(LABEL_SPEC).map(String::as_str);
-    if actual != Some(identity.spec.as_str()) {
+    if !shared_container_matches(inspection, project, identity)? {
         return Err(anyhow!(
             "container '{}' was created from a different Silo specification; run 'silo containers delete {}' and retry",
             project.id,
@@ -1595,6 +1630,112 @@ fn validate_shared_container(
         ));
     }
     Ok(())
+}
+
+/// Checks ownership separately from the creation specification so an owned,
+/// outdated container can be replaced without relaxing the adoption rules.
+fn shared_container_matches(
+    inspection: &ContainerInspection,
+    project: &Project,
+    identity: &ContainerIdentity,
+) -> Result<bool> {
+    validate_shared_ownership(inspection, project)?;
+    Ok(inspection.labels.get(LABEL_SPEC) == Some(&identity.spec))
+}
+
+/// Replaces an owned shared container after its creation-time configuration
+/// changes. Running containers use the same guest-side lifecycle lock as a
+/// normal non-forced stop, closing the race with new session reservations.
+#[derive(Debug)]
+enum ReplacementOutcome {
+    Replaced,
+    Conflict(anyhow::Error),
+}
+
+fn replace_outdated_shared_container(
+    project: &Project,
+    inspection: &ContainerInspection,
+) -> Result<ReplacementOutcome> {
+    replace_outdated_shared_container_with(
+        project,
+        inspection,
+        inspect_session_count,
+        require_image,
+        guarded_stop,
+        delete_stopped_container,
+    )
+}
+
+fn replace_outdated_shared_container_with(
+    project: &Project,
+    inspection: &ContainerInspection,
+    session_count: impl FnOnce(&str) -> Result<usize>,
+    require_replacement_image: impl FnOnce() -> Result<()>,
+    stop: impl FnOnce(&ContainerInfo) -> Result<()>,
+    delete: impl FnOnce(&ContainerInfo) -> Result<()>,
+) -> Result<ReplacementOutcome> {
+    let spec = inspection.labels.get(LABEL_SPEC).cloned().ok_or_else(|| {
+        anyhow!(
+            "container '{}' has an outdated Silo configuration but no specification label; run 'silo containers delete {}' and retry",
+            project.id,
+            project.id
+        )
+    })?;
+    let container = ContainerInfo {
+        id: project.id.clone(),
+        lifecycle: ContainerLifecycle::Shared,
+        state: inspection.state,
+        sessions: None,
+        project: project.root.clone(),
+        spec,
+        image: inspection
+            .image
+            .clone()
+            .unwrap_or_else(|| IMAGE_TAG.to_string()),
+    };
+
+    match inspection.state {
+        ContainerState::Running => match session_count(&project.id) {
+            Ok(0) => {
+                require_replacement_image()?;
+                if let Err(err) = stop(&container) {
+                    return Ok(ReplacementOutcome::Conflict(err.context(format!(
+                        "configuration changed for container `{}`, but Silo could not safely stop the old container; it was not replaced",
+                        project.id
+                    ))));
+                }
+            }
+            Ok(sessions) => return Err(active_config_drift_error(&project.id, sessions)),
+            Err(err) => {
+                return Ok(ReplacementOutcome::Conflict(err.context(format!(
+                    "configuration changed for container `{}`, but Silo could not confirm that no other sessions are using it; it was not replaced",
+                    project.id
+                ))));
+            }
+        },
+        ContainerState::Stopped => require_replacement_image()?,
+        ContainerState::Absent => return Ok(ReplacementOutcome::Replaced),
+        ContainerState::Stopping | ContainerState::Unknown => {
+            return Ok(ReplacementOutcome::Conflict(anyhow!(
+                "container `{}` changed state while replacing its outdated configuration; retry",
+                project.id
+            )));
+        }
+    }
+    match delete(&container) {
+        Ok(()) => Ok(ReplacementOutcome::Replaced),
+        Err(err) => Ok(ReplacementOutcome::Conflict(err.context(format!(
+            "configuration changed for container `{}`, but Silo could not safely delete the old container; it was not replaced",
+            project.id
+        )))),
+    }
+}
+
+fn active_config_drift_error(id: &str, sessions: usize) -> anyhow::Error {
+    let noun = if sessions == 1 { "session" } else { "sessions" };
+    anyhow!(
+        "configuration changed for container `{id}`, but {sessions} other active {noun} are still using it; wait for them to finish, or run `silo containers delete {id} --force` to terminate them"
+    )
 }
 
 /// Inspects a container, booting the container system and retrying once when needed.

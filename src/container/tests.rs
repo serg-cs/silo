@@ -1357,6 +1357,19 @@ fn guest_readiness_probe_targets_the_explicit_marker() {
 }
 
 #[test]
+fn stop_guard_uses_the_current_embedded_protocol_for_stale_containers() {
+    let command = stop_guard_command("silo-old");
+    let args: Vec<&str> = command
+        .get_args()
+        .map(|arg| arg.to_str().expect("argument is UTF-8"))
+        .collect();
+    assert_eq!(
+        &args[..7],
+        ["exec", "--user", "silo", "silo-old", "sh", "-c", STOP_GUARD]
+    );
+}
+
+#[test]
 fn session_reservation_is_submitted_before_the_user_command() {
     let project = test_project("/tmp/project");
     let reserve = session_reserve_command(&project, "abc123");
@@ -1631,18 +1644,161 @@ fn inspect_identity_refuses_foreign_containers_including_buildkit() {
 }
 
 #[test]
-fn inspect_identity_requires_explicit_stop_for_spec_drift() {
+fn inspect_identity_distinguishes_owned_spec_drift() {
     let project = test_project("/tmp/project");
     let identity = shared_identity(&project);
     let mut inspection = shared_inspection(&project, &identity);
     inspection
         .labels
-        .insert(LABEL_SPEC.to_string(), "different".to_string());
+        .insert(LABEL_SPEC.to_string(), "b".repeat(64));
 
-    let error = validate_shared_container(&inspection, &project, &identity)
-        .expect_err("specification drift must be refused");
+    assert!(
+        !shared_container_matches(&inspection, &project, &identity)
+            .expect("the outdated container is still owned")
+    );
+}
 
-    assert!(error.to_string().contains("silo containers delete"));
+#[test]
+fn spec_drift_deletes_an_idle_running_container() {
+    let project = test_project("/tmp/project");
+    let identity = shared_identity(&project);
+    let mut inspection = shared_inspection(&project, &identity);
+    inspection
+        .labels
+        .insert(LABEL_SPEC.to_string(), "b".repeat(64));
+    let stopped = Cell::new(false);
+    let deleted = Cell::new(false);
+    let image_checked = Cell::new(false);
+
+    let outcome = replace_outdated_shared_container_with(
+        &project,
+        &inspection,
+        |_| Ok(0),
+        || {
+            image_checked.set(true);
+            Ok(())
+        },
+        |_| {
+            assert!(image_checked.get());
+            stopped.set(true);
+            Ok(())
+        },
+        |_| {
+            deleted.set(true);
+            Ok(())
+        },
+    )
+    .expect("an idle outdated container is replaced");
+
+    assert!(matches!(outcome, ReplacementOutcome::Replaced));
+    assert!(stopped.get());
+    assert!(deleted.get());
+}
+
+#[test]
+fn spec_drift_preserves_the_container_when_the_image_is_missing() {
+    let project = test_project("/tmp/project");
+    let identity = shared_identity(&project);
+    let mut inspection = shared_inspection(&project, &identity);
+    inspection
+        .labels
+        .insert(LABEL_SPEC.to_string(), "b".repeat(64));
+    let stopped = Cell::new(false);
+    let deleted = Cell::new(false);
+
+    let error = replace_outdated_shared_container_with(
+        &project,
+        &inspection,
+        |_| Ok(0),
+        || Err(anyhow!("replacement image is missing")),
+        |_| {
+            stopped.set(true);
+            Ok(())
+        },
+        |_| {
+            deleted.set(true);
+            Ok(())
+        },
+    )
+    .expect_err("the old container must survive without a replacement image");
+
+    assert!(error.to_string().contains("replacement image is missing"));
+    assert!(!stopped.get());
+    assert!(!deleted.get());
+}
+
+#[test]
+fn spec_drift_reports_other_active_sessions_explicitly() {
+    let id = "silo-4070dfe2dfb71225713e6507";
+    let project = test_project("/tmp/project");
+    let identity = shared_identity(&project);
+    let mut inspection = shared_inspection(&project, &identity);
+    inspection
+        .labels
+        .insert(LABEL_SPEC.to_string(), "b".repeat(64));
+    let stopped = Cell::new(false);
+    let deleted = Cell::new(false);
+    let one = replace_outdated_shared_container_with(
+        &project,
+        &inspection,
+        |_| Ok(1),
+        || Ok(()),
+        |_| {
+            stopped.set(true);
+            Ok(())
+        },
+        |_| {
+            deleted.set(true);
+            Ok(())
+        },
+    )
+    .expect_err("an active outdated container is preserved")
+    .to_string();
+    assert!(one.contains("1 other active session"), "{one}");
+    assert!(one.contains("configuration changed"), "{one}");
+    assert!(!stopped.get());
+    assert!(!deleted.get());
+
+    let several = active_config_drift_error(id, 3).to_string();
+    assert!(several.contains("3 other active sessions"), "{several}");
+    assert!(
+        several.contains(&format!("silo containers delete {id} --force")),
+        "{several}"
+    );
+}
+
+#[test]
+fn spec_drift_classifies_a_concurrent_stop_as_retryable() {
+    let project = test_project("/tmp/project");
+    let identity = shared_identity(&project);
+    let mut inspection = shared_inspection(&project, &identity);
+    inspection
+        .labels
+        .insert(LABEL_SPEC.to_string(), "b".repeat(64));
+    let deleted = Cell::new(false);
+
+    let outcome = replace_outdated_shared_container_with(
+        &project,
+        &inspection,
+        |_| Ok(0),
+        || Ok(()),
+        |_| Err(anyhow!("ownership changed")),
+        |_| {
+            deleted.set(true);
+            Ok(())
+        },
+    )
+    .expect("a concurrent replacement is not fatal");
+
+    let ReplacementOutcome::Conflict(error) = outcome else {
+        panic!("the ownership race must be retried");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("could not safely stop the old container")
+    );
+    assert!(!deleted.get());
 }
 
 #[test]
@@ -1930,6 +2086,14 @@ fn guest_status_counts_live_leases_and_stop_guard_refuses_them() {
     fs::write(&guard, STOP_GUARD).expect("guard writes");
 
     run_guest_script(&reserve, &runtime, &["aa11"]).expect("session reserves");
+    let reserved = Command::new("sh")
+        .arg(&guard)
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("guard checks the pending reservation");
+    assert_eq!(reserved.status.code(), Some(76));
+    assert_eq!(String::from_utf8_lossy(&reserved.stderr).trim(), "1");
+
     let mut active = Command::new("sh")
         .arg(&session)
         .args(["aa11", "sleep", "0.4"])
