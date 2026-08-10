@@ -34,6 +34,36 @@ fn empty_config_uses_builtin_image() {
 }
 
 #[test]
+fn shell_defaults_to_host_detection() {
+    let config = Config::parse("").expect("empty config parses");
+    assert_eq!(config.shell, None);
+    assert_eq!(Config::default().shell, None);
+}
+
+#[test]
+fn shell_accepts_every_builtin_choice() {
+    for (name, expected) in [
+        ("bash", Shell::Bash),
+        ("zsh", Shell::Zsh),
+        ("fish", Shell::Fish),
+        ("nu", Shell::Nu),
+    ] {
+        let config = Config::parse(&format!("shell = \"{name}\"")).expect("supported shell parses");
+        assert_eq!(config.shell, Some(expected));
+    }
+}
+
+#[test]
+fn shell_rejects_unknown_choices() {
+    let err = Config::parse("shell = \"powershell\"").expect_err("unknown shell is invalid");
+    let message = err.to_string();
+    assert!(message.contains("unknown variant"), "{message}");
+    for supported in ["bash", "zsh", "fish", "nu"] {
+        assert!(message.contains(supported), "{message}");
+    }
+}
+
+#[test]
 fn image_section_sets_dockerfile() {
     let config = Config::parse("[image]\ndockerfile = \"/tmp/Dockerfile\"").expect("config parses");
     assert_eq!(
@@ -65,6 +95,7 @@ fn read_only_git_can_be_enabled_explicitly() {
 fn default_config_file_matches_builtin_defaults() {
     let from_file = Config::parse(DEFAULT_CONFIG).expect("default file parses");
     let defaults = Config::default();
+    assert_eq!(from_file.shell, defaults.shell);
     assert_eq!(from_file.read_only_git, defaults.read_only_git);
     assert_eq!(from_file.image.dockerfile, defaults.image.dockerfile);
     assert!(from_file.shared.is_empty());
@@ -331,6 +362,29 @@ fn project_omitted_shared_inherits_global_list() {
     assert_eq!(merged.shared.len(), 1);
     assert_eq!(merged.shared[0].target, PathBuf::from("/home/silo/notes"));
     assert!(!merged.read_only_git);
+}
+
+#[test]
+fn project_shell_overrides_global_shell() {
+    let dir = TestDir::new("project-shell");
+    fs::write(dir.path().join(".silo.toml"), "shell = \"fish\"\n").expect("project config writes");
+    let global = Config::parse("shell = \"bash\"\n").expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+
+    assert_eq!(merged.shell, Some(Shell::Fish));
+}
+
+#[test]
+fn omitted_project_shell_inherits_global_shell() {
+    let dir = TestDir::new("project-inherits-shell");
+    fs::write(dir.path().join(".silo.toml"), "read_only_git = false\n")
+        .expect("project config writes");
+    let global = Config::parse("shell = \"nu\"\n").expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+
+    assert_eq!(merged.shell, Some(Shell::Nu));
 }
 
 #[test]

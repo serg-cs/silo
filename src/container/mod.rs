@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -16,7 +16,7 @@ use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets::NO
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, Permission, Shared};
+use crate::config::{Config, Permission, Shared, Shell};
 
 /// Name of the image this tool builds and runs.
 pub const IMAGE_TAG: &str = "silo:latest";
@@ -53,8 +53,11 @@ const CONTAINER_NAME_PREFIX: &str = "silo-";
 /// Amount of the SHA-256 digest used in a shared container ID.
 const PROJECT_DIGEST_HEX_LEN: usize = 24;
 
-/// Default command for a shared session when the user supplies none.
-const DEFAULT_SESSION_COMMAND: &str = "nu";
+const BASH_PATH: &str = "/bin/bash";
+const ZSH_PATH: &str = "/home/linuxbrew/.linuxbrew/bin/zsh";
+const FISH_PATH: &str = "/home/linuxbrew/.linuxbrew/bin/fish";
+const NU_PATH: &str = "/home/linuxbrew/.linuxbrew/bin/nu";
+const DEFAULT_SHELL: Shell = Shell::Zsh;
 
 /// PID 1 for shared containers; it exits when the final guest-side session
 /// lease closes.
@@ -76,7 +79,10 @@ const LABEL_OWNER_VALUE: &str = "silo";
 const LABEL_SCHEMA_VALUE: &str = "1";
 const LABEL_SHARED_VALUE: &str = "shared";
 const LABEL_ISOLATED_VALUE: &str = "isolated";
-const LIFECYCLE_PROTOCOL_VERSION: &str = "3";
+/// Increment when the built-in image or guest lifecycle contract changes in
+/// a way that makes an existing shared container unsafe to reuse. Version 4
+/// adds Zsh and Fish to the built-in image.
+const LIFECYCLE_PROTOCOL_VERSION: &str = "4";
 
 /// Runtime races are retried only for this bounded interval.
 const CONFLICT_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -462,11 +468,21 @@ pub fn run_image(
     command: &[OsString],
     isolated: bool,
 ) -> Result<ExitCode> {
+    let shell = config
+        .image
+        .dockerfile
+        .is_none()
+        .then(|| resolve_shell(config.shell, std::env::var_os("SHELL").as_deref()));
     if uses_isolated_lifecycle(config, isolated) {
         require_image()?;
-        return run_isolated(config, project, command);
+        return run_isolated(config, project, command, shell);
     }
-    run_shared(config, project, command)
+    run_shared(
+        config,
+        project,
+        command,
+        shell.expect("the shared lifecycle always uses the built-in image"),
+    )
 }
 
 /// Custom images cannot rely on the built-in image's shared-container user,
@@ -476,7 +492,12 @@ fn uses_isolated_lifecycle(config: &Config, isolated: bool) -> bool {
 }
 
 /// Runs the existing ephemeral `container run --rm` lifecycle.
-fn run_isolated(config: &Config, project: &Project, command: &[OsString]) -> Result<ExitCode> {
+fn run_isolated(
+    config: &Config,
+    project: &Project,
+    command: &[OsString],
+    shell: Option<Shell>,
+) -> Result<ExitCode> {
     let ids = host_ids()?;
     let shared = resolve_shared(
         &config.shared,
@@ -497,6 +518,7 @@ fn run_isolated(config: &Config, project: &Project, command: &[OsString]) -> Res
         &config_mounts,
         &id,
         command,
+        shell,
     )?;
     // Warn about shared mounts whose intent a later mount defeats, e.g. a
     // read-write shared mount overlapping the read-only `.git`.
@@ -522,7 +544,12 @@ fn run_isolated(config: &Config, project: &Project, command: &[OsString]) -> Res
 }
 
 /// Ensures the shared project container and attaches one exec session.
-fn run_shared(config: &Config, project: &Project, command: &[OsString]) -> Result<ExitCode> {
+fn run_shared(
+    config: &Config,
+    project: &Project,
+    command: &[OsString],
+    shell: Shell,
+) -> Result<ExitCode> {
     sweep_orphaned_isolated_containers(None);
     let deadline = Instant::now() + GUEST_READY_TIMEOUT + CONFLICT_RETRY_TIMEOUT;
     let reservation = loop {
@@ -548,6 +575,7 @@ fn run_shared(config: &Config, project: &Project, command: &[OsString]) -> Resul
         project,
         &reservation,
         command,
+        shell,
     );
     install_signal_handlers()?;
     let terminal = SavedTerminal::capture();
@@ -1269,12 +1297,26 @@ fn container_identity(
     lifecycle: &str,
     command: &[OsString],
 ) -> ContainerIdentity {
+    container_identity_for_protocol(
+        project,
+        host_ids,
+        config_mounts,
+        lifecycle,
+        command,
+        LIFECYCLE_PROTOCOL_VERSION,
+    )
+}
+
+fn container_identity_for_protocol(
+    project: &Project,
+    host_ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    lifecycle: &str,
+    command: &[OsString],
+    protocol: &str,
+) -> ContainerIdentity {
     let mut hasher = Sha256::new();
-    hash_spec_field(
-        &mut hasher,
-        b"protocol",
-        LIFECYCLE_PROTOCOL_VERSION.as_bytes(),
-    );
+    hash_spec_field(&mut hasher, b"protocol", protocol.as_bytes());
     hash_spec_field(&mut hasher, b"image", IMAGE_TAG.as_bytes());
     hash_spec_field(&mut hasher, b"lifecycle", lifecycle.as_bytes());
     hash_spec_field(&mut hasher, b"uid", host_ids.uid.as_bytes());
@@ -2220,6 +2262,7 @@ fn isolated_run_command(
     config_mounts: &ConfigMounts,
     id: &str,
     command: &[OsString],
+    shell: Option<Shell>,
 ) -> Result<Command> {
     let shared_dir = shared_dir_name(project_root)?;
     let project = Project {
@@ -2243,7 +2286,17 @@ fn isolated_run_command(
     append_identity_labels(&mut run, &identity, LABEL_ISOLATED_VALUE);
     append_creation_mounts(&mut run, project_root, &shared_dir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
-    run.arg(IMAGE_TAG).args(command);
+    if let Some(shell) = shell {
+        run.arg("--env").arg(format!("SHELL={}", shell.path()));
+    }
+    run.arg(IMAGE_TAG);
+    if command.is_empty() {
+        if let Some(shell) = shell {
+            run.arg(shell.path());
+        }
+    } else {
+        run.args(command);
+    }
     Ok(run)
 }
 
@@ -2322,6 +2375,7 @@ fn exec_command(
     project: &Project,
     reservation: &str,
     command: &[OsString],
+    shell: Shell,
 ) -> Command {
     let mut exec = Command::new(CONTAINER_BIN);
     exec.arg("exec").arg("-i");
@@ -2334,14 +2388,44 @@ fn exec_command(
         .arg(&project.workdir);
     exec.arg("--env")
         .arg(format!("HOME={CONTAINER_HOME}"))
+        .arg("--env")
+        .arg(format!("SHELL={}", shell.path()))
         .arg(&project.id);
     exec.arg(SESSION_WRAPPER_COMMAND).arg(reservation);
     if command.is_empty() {
-        exec.arg(DEFAULT_SESSION_COMMAND);
+        exec.arg(shell.path());
     } else {
         exec.args(command);
     }
     exec
+}
+
+impl Shell {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Bash => BASH_PATH,
+            Self::Zsh => ZSH_PATH,
+            Self::Fish => FISH_PATH,
+            Self::Nu => NU_PATH,
+        }
+    }
+}
+
+/// Selects the configured shell, otherwise mirrors a supported host shell by
+/// executable name. Unknown, missing, and non-UTF-8 host values use Zsh.
+fn resolve_shell(configured: Option<Shell>, host_shell: Option<&OsStr>) -> Shell {
+    configured.unwrap_or_else(|| {
+        let name = host_shell
+            .and_then(|shell| Path::new(shell).file_name())
+            .and_then(OsStr::to_str);
+        match name {
+            Some("bash") => Shell::Bash,
+            Some("zsh") => Shell::Zsh,
+            Some("fish") => Shell::Fish,
+            Some("nu") => Shell::Nu,
+            _ => DEFAULT_SHELL,
+        }
+    })
 }
 
 /// Returns the host side of the shared-directory volume spec, rejecting

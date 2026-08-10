@@ -1,7 +1,7 @@
 use super::*;
-use crate::config::{Permission, Shared};
+use crate::config::{Permission, Shared, Shell};
 use std::cell::Cell;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -61,6 +61,47 @@ fn built_in_images_remain_shared_by_default() {
 }
 
 #[test]
+fn configured_shell_precedes_the_host_shell() {
+    assert_eq!(
+        resolve_shell(Some(Shell::Fish), Some(OsStr::new("/bin/bash"))),
+        Shell::Fish
+    );
+}
+
+#[test]
+fn supported_host_shells_resolve_by_executable_name() {
+    for (path, expected) in [
+        ("/bin/bash", Shell::Bash),
+        ("/home/user/bin/zsh", Shell::Zsh),
+        ("fish", Shell::Fish),
+        ("/opt/homebrew/bin/nu", Shell::Nu),
+    ] {
+        assert_eq!(resolve_shell(None, Some(OsStr::new(path))), expected);
+    }
+}
+
+#[test]
+fn missing_or_unsupported_host_shell_falls_back_to_zsh() {
+    assert_eq!(resolve_shell(None, None), Shell::Zsh);
+    assert_eq!(
+        resolve_shell(None, Some(OsStr::new("/bin/tcsh"))),
+        Shell::Zsh
+    );
+    assert_eq!(resolve_shell(None, Some(OsStr::new(""))), Shell::Zsh);
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_host_shell_falls_back_to_zsh() {
+    use std::os::unix::ffi::OsStrExt;
+
+    assert_eq!(
+        resolve_shell(None, Some(OsStr::from_bytes(b"/bin/bad\xFFshell"))),
+        Shell::Zsh
+    );
+}
+
+#[test]
 fn build_command_targets_embedded_dockerfile() {
     let command = build_command(Path::new("/tmp/Dockerfile"), Path::new("/tmp/context"));
     let program = command.get_program().to_str().expect("program is UTF-8");
@@ -93,6 +134,7 @@ fn run_command_starts_interactive_shell() {
         &ConfigMounts::default(),
         "silo-123",
         &[],
+        Some(Shell::Zsh),
     )
     .expect("command builds");
     let args = args_without_labels(&command);
@@ -113,7 +155,10 @@ fn run_command_starts_interactive_shell() {
             "SILO_UID=501",
             "--env",
             "SILO_GID=20",
+            "--env",
+            "SHELL=/home/linuxbrew/.linuxbrew/bin/zsh",
             "silo:latest",
+            "/home/linuxbrew/.linuxbrew/bin/zsh",
         ]
     );
     assert_eq!(
@@ -135,6 +180,7 @@ fn run_command_omits_pty_when_not_interactive() {
         &ConfigMounts::default(),
         "silo-123",
         &[],
+        Some(Shell::Zsh),
     )
     .expect("command builds");
     let args = args_without_labels(&command);
@@ -154,9 +200,34 @@ fn run_command_omits_pty_when_not_interactive() {
             "SILO_UID=501",
             "--env",
             "SILO_GID=20",
+            "--env",
+            "SHELL=/home/linuxbrew/.linuxbrew/bin/zsh",
             "silo:latest",
+            "/home/linuxbrew/.linuxbrew/bin/zsh",
         ]
     );
+}
+
+#[test]
+fn custom_image_run_keeps_its_default_command_and_environment() {
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let command = isolated_run_command(
+        false,
+        Path::new("/tmp/project"),
+        &ids,
+        &ConfigMounts::default(),
+        "silo-123",
+        &[],
+        None,
+    )
+    .expect("command builds");
+    let args = args_without_labels(&command);
+
+    assert_eq!(args.last(), Some(&IMAGE_TAG));
+    assert!(!args.iter().any(|argument| argument.starts_with("SHELL=")));
 }
 
 #[test]
@@ -172,6 +243,7 @@ fn run_command_places_shared_dir_in_container_home() {
         &ConfigMounts::default(),
         "silo-123",
         &[],
+        None,
     )
     .expect("command builds");
     let args: Vec<&str> = command
@@ -209,6 +281,7 @@ fn run_command_rejects_sharing_root() {
         &ConfigMounts::default(),
         "silo-123",
         &[],
+        None,
     )
     .expect_err("root has no name");
     assert!(err.to_string().contains("cannot share the root directory"));
@@ -227,6 +300,7 @@ fn run_command_rejects_paths_with_colons() {
         &ConfigMounts::default(),
         "silo-123",
         &[],
+        None,
     )
     .expect_err("colon is a separator");
     assert!(err.to_string().contains("cannot share"));
@@ -244,8 +318,16 @@ fn run_command_rejects_non_utf8_paths() {
         gid: "20".into(),
     };
     let path = Path::new(OsStr::from_bytes(b"/tmp/bad\xFFdir"));
-    let err = isolated_run_command(true, path, &ids, &ConfigMounts::default(), "silo-123", &[])
-        .expect_err("name is not valid UTF-8");
+    let err = isolated_run_command(
+        true,
+        path,
+        &ids,
+        &ConfigMounts::default(),
+        "silo-123",
+        &[],
+        None,
+    )
+    .expect_err("name is not valid UTF-8");
     assert!(err.to_string().contains("cannot share"));
     assert!(err.to_string().contains("valid UTF-8"));
 }
@@ -634,6 +716,7 @@ fn run_command_appends_the_passed_command() {
             OsString::from("--model"),
             OsString::from("compact"),
         ],
+        Some(Shell::Fish),
     )
     .expect("command builds");
     let args = args_without_labels(&command);
@@ -653,6 +736,8 @@ fn run_command_appends_the_passed_command() {
             "SILO_UID=501",
             "--env",
             "SILO_GID=20",
+            "--env",
+            "SHELL=/home/linuxbrew/.linuxbrew/bin/fish",
             "silo:latest",
             "codex",
             "--model",
@@ -696,6 +781,7 @@ fn run_command_mounts_git_read_only() {
         },
         "silo-123",
         &[],
+        None,
     )
     .expect("command builds");
     assert_eq!(
@@ -720,6 +806,7 @@ fn run_command_omits_git_mount_when_absent() {
         &ConfigMounts::default(),
         "silo-123",
         &[],
+        None,
     )
     .expect("command builds");
     assert_eq!(volume_specs(&command), ["/tmp/project:/home/silo/project"]);
@@ -750,6 +837,7 @@ fn run_command_mounts_configured_shared() {
         &ConfigMounts { git: None, shared },
         "silo-123",
         &[],
+        None,
     )
     .expect("command builds");
     assert_eq!(
@@ -783,6 +871,7 @@ fn run_command_orders_git_then_shared_mounts() {
         },
         "silo-123",
         &[],
+        None,
     )
     .expect("command builds");
     assert_eq!(
@@ -1199,7 +1288,7 @@ fn discovered_project_root_drives_shared_and_isolated_mounts() {
     let mounts = ConfigMounts::default();
     let expected = format!("{}:/home/silo/workspace", project.root.display());
 
-    let isolated = isolated_run_command(false, &project.root, &ids, &mounts, "silo-123", &[])
+    let isolated = isolated_run_command(false, &project.root, &ids, &mounts, "silo-123", &[], None)
         .expect("isolated command builds");
     let shared = create_command(&project, &ids, &mounts, Path::new("/tmp/project.cid"))
         .expect("shared command builds");
@@ -1294,6 +1383,7 @@ fn exec_command_attaches_as_silo_with_home() {
         &project,
         "abc123",
         &[OsString::from("codex"), OsString::from("--compact")],
+        Shell::Fish,
     );
     let args: Vec<&str> = command
         .get_args()
@@ -1311,6 +1401,8 @@ fn exec_command_attaches_as_silo_with_home() {
             "/home/silo/project",
             "--env",
             "HOME=/home/silo",
+            "--env",
+            "SHELL=/home/linuxbrew/.linuxbrew/bin/fish",
             project.id.as_str(),
             "/usr/local/bin/silo-session",
             "abc123",
@@ -1321,16 +1413,17 @@ fn exec_command_attaches_as_silo_with_home() {
 }
 
 #[test]
-fn exec_command_uses_nu_and_omits_tty_without_a_terminal() {
+fn exec_command_uses_selected_shell_and_omits_tty_without_a_terminal() {
     let project = test_project("/tmp/project");
-    let command = exec_command(false, &project, "abc123", &[]);
+    let command = exec_command(false, &project, "abc123", &[], Shell::Nu);
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
         .collect();
     assert_eq!(args[0..2], ["exec", "-i"]);
     assert!(!args.contains(&"-t"));
-    assert_eq!(args.last(), Some(&DEFAULT_SESSION_COMMAND));
+    assert!(args.contains(&"SHELL=/home/linuxbrew/.linuxbrew/bin/nu"));
+    assert_eq!(args.last(), Some(&NU_PATH));
 }
 
 #[test]
@@ -1389,7 +1482,13 @@ fn session_reservation_is_submitted_before_the_user_command() {
         ]
     );
 
-    let session = exec_command(false, &project, "abc123", &[OsString::from("true")]);
+    let session = exec_command(
+        false,
+        &project,
+        "abc123",
+        &[OsString::from("true")],
+        Shell::Zsh,
+    );
     let session_args: Vec<&str> = session
         .get_args()
         .map(|arg| arg.to_str().expect("argument is UTF-8"))
@@ -1893,6 +1992,22 @@ fn specification_digest_is_deterministic_and_creation_sensitive() {
 }
 
 #[test]
+fn shell_image_revision_invalidates_pre_shell_shared_containers() {
+    let project = test_project("/tmp/project");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let mounts = ConfigMounts::default();
+    let command = [OsString::from(SHARED_INIT_COMMAND)];
+    let current = container_identity(&project, &ids, &mounts, LABEL_SHARED_VALUE, &command);
+    let before_zsh_and_fish =
+        container_identity_for_protocol(&project, &ids, &mounts, LABEL_SHARED_VALUE, &command, "3");
+
+    assert_ne!(current.spec, before_zsh_and_fish.spec);
+}
+
+#[test]
 fn embedded_image_contains_guest_lifecycle_programs() {
     assert!(DOCKERFILE.contains("COPY silo-supervisor.sh"));
     assert!(DOCKERFILE.contains("COPY silo-session.sh"));
@@ -1908,6 +2023,29 @@ fn embedded_image_contains_guest_lifecycle_programs() {
     assert!(STATUS_HELPER.contains("count=$((count + 1))"));
     assert!(STOP_GUARD.contains("flock --exclusive --nonblock"));
     assert!(SESSION_WRAPPER.contains("exec \"$@\""));
+}
+
+#[test]
+fn embedded_image_installs_and_registers_supported_shells() {
+    for package in ["fish", "nushell", "zsh"] {
+        assert!(
+            DOCKERFILE
+                .lines()
+                .any(|line| line.trim().trim_end_matches(" \\").trim() == package),
+            "missing Homebrew package {package}"
+        );
+    }
+    assert!(DOCKERFILE.contains(BASH_PATH));
+    for name in ["zsh", "fish", "nu"] {
+        let path = format!("${{BREW_PREFIX}}/bin/{name}");
+        assert!(DOCKERFILE.contains(&path), "missing shell path {path}");
+    }
+    assert_eq!(Shell::Bash.path(), BASH_PATH);
+    assert_eq!(Shell::Zsh.path(), ZSH_PATH);
+    assert_eq!(Shell::Fish.path(), FISH_PATH);
+    assert_eq!(Shell::Nu.path(), NU_PATH);
+    assert!(DOCKERFILE.contains("CMD [\"zsh\"]"));
+    assert!(DOCKERFILE.contains("usermod --shell \"${BREW_PREFIX}/bin/zsh\" silo"));
 }
 
 #[test]

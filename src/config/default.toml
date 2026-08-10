@@ -4,6 +4,10 @@
 ### Use a custom Dockerfile instead of the built-in image.
 # image.dockerfile = "/path/to/Dockerfile"
 
+### Shell for the built-in image: "bash", "zsh", "fish", or "nu".
+### When omitted, use a supported host $SHELL and fall back to Zsh.
+# shell = "zsh"
+
 ### Prevent the container from modifying the project's Git metadata.
 read_only_git = true
 

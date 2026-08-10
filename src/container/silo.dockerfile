@@ -49,6 +49,7 @@ RUN brew install \
         codex \
         esengine/reasonix/reasonix \
         fd \
+        fish \
         jj \
         node \
         nushell \
@@ -58,14 +59,21 @@ RUN brew install \
         rust \
         rust-analyzer \
         yazi \
-        zoxide
+        zoxide \
+        zsh
 
 # ---- Entrypoint / shell ------------------------------------------------------
 # Starts as root only to remap silo; drops to silo and execs the command
-# (nushell by default) as PID 1.
+# (Zsh by default) as PID 1.
 USER root
-RUN usermod --shell "${BREW_PREFIX}/bin/nu" silo \
-    && printf '%s\n' "${BREW_PREFIX}/bin/nu" >> /etc/shells
+RUN usermod --shell "${BREW_PREFIX}/bin/zsh" silo \
+    && for shell in \
+        /bin/bash \
+        "${BREW_PREFIX}/bin/zsh" \
+        "${BREW_PREFIX}/bin/fish" \
+        "${BREW_PREFIX}/bin/nu"; do \
+        grep -qxF "$shell" /etc/shells || printf '%s\n' "$shell" >> /etc/shells; \
+    done
 
 COPY silo-supervisor.sh /usr/local/bin/silo-supervisor
 COPY silo-session.sh /usr/local/bin/silo-session
@@ -113,4 +121,4 @@ RUN chmod +x /usr/local/bin/silo-entrypoint
 WORKDIR /home/silo
 
 ENTRYPOINT ["/usr/local/bin/silo-entrypoint"]
-CMD ["nu"]
+CMD ["zsh"]

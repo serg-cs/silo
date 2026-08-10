@@ -28,6 +28,9 @@ const DEFAULT_CONFIG: &str = include_str!("default.toml");
 #[serde(default)]
 pub struct Config {
     pub image: Image,
+    /// Interactive shell used by the built-in image. When omitted, Silo
+    /// mirrors a supported host `$SHELL` and falls back to Zsh.
+    pub shell: Option<Shell>,
     /// Whether the project's `.git` directory is mounted read-only in the
     /// container, so tools inside it cannot modify version control state.
     pub read_only_git: bool,
@@ -50,6 +53,7 @@ pub struct Config {
 #[serde(default)]
 struct ProjectConfig {
     image: ProjectImage,
+    shell: Option<Shell>,
     read_only_git: Option<bool>,
     shared: Option<Vec<Shared>>,
     quick: Option<BTreeMap<String, Vec<String>>>,
@@ -67,6 +71,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             image: Image::default(),
+            shell: None,
             // Protection on by default; disable it in the config file.
             read_only_git: true,
             shared: Vec::new(),
@@ -82,6 +87,16 @@ pub struct Image {
     /// Path to a Dockerfile defining a custom image; `None` uses the
     /// built-in image.
     pub dockerfile: Option<PathBuf>,
+}
+
+/// Shells guaranteed to be available in Silo's built-in image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Shell {
+    Bash,
+    Zsh,
+    Fish,
+    Nu,
 }
 
 /// One configurable shared mount: `source` on the host is mounted into the
@@ -194,6 +209,9 @@ impl Config {
     fn apply_project(&mut self, project: ProjectConfig) {
         if let Some(dockerfile) = project.image.dockerfile {
             self.image.dockerfile = Some(dockerfile);
+        }
+        if let Some(shell) = project.shell {
+            self.shell = Some(shell);
         }
         if let Some(read_only_git) = project.read_only_git {
             self.read_only_git = read_only_git;
