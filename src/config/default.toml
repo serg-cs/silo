@@ -1,65 +1,15 @@
-# silo configuration.
-#
-# All keys are optional; when a key is absent, the built-in default applies.
-#
-# Every container shares the discovered project directory (mounted read-write
-# at /home/silo/<project-name>). Silo uses the nearest ancestor containing a
-# `.silo.toml` file, otherwise the nearest ancestor containing a `.git`
-# directory, otherwise the current directory. Settings in `.silo.toml`
-# override options from this global file. An omitted project option inherits
-# its global value; collection options (`shared` and `quick`) replace the
-# complete global collection when present.
-#
-# The optional read-only `.git` and configured shared mounts are applied on top
-# of the project directory. A project container stops after its last session
-# but remains available for the next run. Use `silo containers` to find it and
-# `silo containers delete <container-or-project>` to delete it. Image rebuilds
-# and changes to mount entries or read_only_git take effect after deletion and
-# the next run recreates the container.
+### Silo configuration. All settings are optional; omitted settings use defaults.
+### Project settings in `.silo.toml` override this file.
 
-# Dockerfile that defines the image `silo image build` builds and `silo run`
-# runs. When unset, the built-in silo image is used.
-# image.dockerfile = "/path/to/your/Dockerfile"
+### Use a custom Dockerfile instead of the built-in image.
+# image.dockerfile = "/path/to/Dockerfile"
 
-# Mount this project's `.git` directory read-only in the container, so tools
-# inside it cannot modify version control state (history, refs, staging
-# area, config). The directory stays readable; only writes are blocked. Set
-# to false to let tools in the container manage the repository.
+### Prevent the container from modifying the project's Git metadata.
 read_only_git = true
 
-# Shared mounts applied when a project container is created, on top of the
-# project directory. Each entry mounts a path on this machine (`source`)
-# into the container at `target`, with a `permission` of `read-only` (the
-# default) or `read-write`. Define every mount in one array:
-#
-# shared = [
-#   { source = "~/.ssh", target = "/home/silo/.ssh", permission = "read-only" },
-#   { source = "~/notes", target = "/home/silo/notes", permission = "read-write" },
-# ]
-#
-# The source must be an absolute path or a `~`-prefixed path like `~/notes`
-# in this global file. Project sources may also be relative to the discovered
-# project root. A bare `~` is your home directory; `~user` paths are not
-# supported. The source must exist when a container is created (for shared
-# runs: after `silo containers delete` + the next `silo run`), or the run fails.
-# Mounts are
-# passed to the container CLI in this order: project directory, `.git`
-# (read-only), shared mounts — when two mounts share a target, the last one
-# passed wins.
-# In `.silo.toml`, omit `shared` to inherit this list, use `shared = []` to
-# remove every global mount, or provide a new array to replace it completely.
+### Mount additional host paths (`permission` defaults to "read-only").
+# shared = [{ source = "/path/on/host", target = "/path/in/container", permission = "read-write" }]
 
+### Run shortcuts as `silo <name> [args...]`.
 [quick]
-# Quick commands: `silo <name>` runs the command inside the container, like
-# `silo run -- <command>` without the boilerplate. The key is what you type;
-# the value is the command (and any fixed arguments) executed inside the
-# container. Arguments you pass on the command line are appended to it.
-#
-#   codex = ["codex"]
-#   cx    = ["codex", "--model", "compact"]
-#
-# A name must not collide with a built-in command (`run`, `containers`, `image`,
-# `help`) and must not start with `-`: the
-# built-in command always wins, and flag-
-# shaped tokens are reserved for silo's own options, so such a quick command
-# could never run. Unusable names are reported as a warning when silo runs.
+# name = ["command"]

@@ -20,8 +20,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-/// Contents of a freshly created config file; every key is documented there,
-/// since the file doubles as the user-facing reference.
+/// Contents of the concise starter config file created on first use.
 const DEFAULT_CONFIG: &str = include_str!("default.toml");
 
 /// User configuration, loaded once at startup and passed to commands.
