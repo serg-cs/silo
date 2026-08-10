@@ -5,18 +5,19 @@
 # Every container shares the discovered project directory (mounted read-write
 # at /home/silo/<project-name>). Silo uses the nearest ancestor containing a
 # `.silo.toml` file, otherwise the nearest ancestor containing a `.git`
-# directory, otherwise the current directory. The `.silo.toml` file is only a
-# project marker; settings continue to come from this config file.
+# directory, otherwise the current directory. Settings in `.silo.toml`
+# override options from this global file. An omitted project option inherits
+# its global value; collection options (`shared` and `quick`) replace the
+# complete global collection when present.
 #
-# The optional read-only `.git` and the `[[shared]]` mounts are applied on top
+# The optional read-only `.git` and configured shared mounts are applied on top
 # of the project directory. A project container stays running after its last
 # session. Run `silo stop` to stop and delete it. Image rebuilds and changes to
 # mount entries or read_only_git take effect after `silo stop` and the next run.
 
-[image]
 # Dockerfile that defines the image `silo image build` builds and `silo run`
 # runs. When unset, the built-in silo image is used.
-# dockerfile = "/path/to/your/Dockerfile"
+# image.dockerfile = "/path/to/your/Dockerfile"
 
 # Mount this project's `.git` directory read-only in the container, so tools
 # inside it cannot modify version control state (history, refs, staging
@@ -24,22 +25,26 @@
 # to false to let tools in the container manage the repository.
 read_only_git = true
 
-# [[shared]]
 # Shared mounts applied when a project container is created, on top of the
 # project directory. Each entry mounts a path on this machine (`source`)
 # into the container at `target`, with a `permission` of `read-only` (the
-# default) or `read-write`:
+# default) or `read-write`. Define every mount in one array:
 #
-#   source = "~/.ssh"             # host path; `~` means your home directory
-#   target = "/home/silo/.ssh"    # absolute path inside the container
-#   permission = "read-only"      # or "read-write" to let tools write through
+# shared = [
+#   { source = "~/.ssh", target = "/home/silo/.ssh", permission = "read-only" },
+#   { source = "~/notes", target = "/home/silo/notes", permission = "read-write" },
+# ]
 #
 # The source must be an absolute path or a `~`-prefixed path like `~/notes`
-# (a bare `~` is your home directory; `~user` paths are not supported), and
-# must exist when a container is created (for shared runs: at `silo stop` +
-# the next `silo run`), or the run fails. Mounts are passed to
-# the container CLI in this order: project directory, `.git` (read-only),
-# shared mounts — when two mounts share a target, the last one passed wins.
+# in this global file. Project sources may also be relative to the discovered
+# project root. A bare `~` is your home directory; `~user` paths are not
+# supported. The source must exist when a container is created (for shared
+# runs: at `silo stop` + the next `silo run`), or the run fails. Mounts are
+# passed to the container CLI in this order: project directory, `.git`
+# (read-only), shared mounts — when two mounts share a target, the last one
+# passed wins.
+# In `.silo.toml`, omit `shared` to inherit this list, use `shared = []` to
+# remove every global mount, or provide a new array to replace it completely.
 
 [quick]
 # Quick commands: `silo <name>` runs the command inside the container, like

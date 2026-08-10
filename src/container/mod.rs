@@ -97,15 +97,15 @@ struct ConfigMounts {
 
 /// Stable identity and container path for the current project.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Project {
-    root: PathBuf,
+pub(crate) struct Project {
+    pub(crate) root: PathBuf,
     workdir: PathBuf,
     id: String,
 }
 
 impl Project {
     /// Discovers the current project through symlinks before deriving its ID.
-    fn current() -> Result<Self> {
+    pub(crate) fn current() -> Result<Self> {
         let cwd = std::env::current_dir().context("failed to determine current directory")?;
         Self::from_path(&cwd)
     }
@@ -388,12 +388,17 @@ struct HostIds {
 ///
 /// Returns an error when setup, state inspection, container creation, or the
 /// attached process fails.
-pub fn run_image(config: &Config, command: &[OsString], isolated: bool) -> Result<ExitCode> {
+pub fn run_image(
+    config: &Config,
+    project: &Project,
+    command: &[OsString],
+    isolated: bool,
+) -> Result<ExitCode> {
     if uses_isolated_lifecycle(config, isolated) {
         require_image()?;
-        return run_isolated(config, command);
+        return run_isolated(config, project, command);
     }
-    run_shared(config, command)
+    run_shared(config, project, command)
 }
 
 /// Custom images cannot rely on the built-in image's shared-container user,
@@ -403,8 +408,7 @@ fn uses_isolated_lifecycle(config: &Config, isolated: bool) -> bool {
 }
 
 /// Runs the existing ephemeral `container run --rm` lifecycle.
-fn run_isolated(config: &Config, command: &[OsString]) -> Result<ExitCode> {
-    let project = Project::current()?;
+fn run_isolated(config: &Config, project: &Project, command: &[OsString]) -> Result<ExitCode> {
     let ids = host_ids()?;
     let shared = resolve_shared(
         &config.shared,
@@ -450,8 +454,7 @@ fn run_isolated(config: &Config, command: &[OsString]) -> Result<ExitCode> {
 }
 
 /// Ensures the shared project container and attaches one exec session.
-fn run_shared(config: &Config, command: &[OsString]) -> Result<ExitCode> {
-    let project = Project::current()?;
+fn run_shared(config: &Config, project: &Project, command: &[OsString]) -> Result<ExitCode> {
     sweep_orphaned_isolated_containers(None);
     let deadline = Instant::now() + GUEST_READY_TIMEOUT + CONFLICT_RETRY_TIMEOUT;
     let reservation = loop {
@@ -461,12 +464,12 @@ fn run_shared(config: &Config, command: &[OsString]) -> Result<ExitCode> {
                 project.id
             ));
         }
-        ensure_shared_container(&project, config)?;
-        if !wait_for_guest_ready(&project)? {
+        ensure_shared_container(project, config)?;
+        if !wait_for_guest_ready(project)? {
             continue;
         }
-        let reservation = session_reservation_token(&project);
-        if reserve_shared_session(&project, &reservation)? {
+        let reservation = session_reservation_token(project);
+        if reserve_shared_session(project, &reservation)? {
             break reservation;
         }
     };
@@ -474,7 +477,7 @@ fn run_shared(config: &Config, command: &[OsString]) -> Result<ExitCode> {
     // The attached process owns the terminal, but not the shared container.
     let mut exec = exec_command(
         std::io::stdin().is_terminal(),
-        &project,
+        project,
         &reservation,
         command,
     );
@@ -514,9 +517,8 @@ fn warn_mount_conflicts(project: &Project, config_mounts: &ConfigMounts) {
 /// Stops and deletes the shared container for the current project.
 ///
 /// An absent container is an idempotent success.
-pub fn stop_image() -> Result<ExitCode> {
-    let project = Project::current()?;
-    stop_shared_container(&project)?;
+pub fn stop_image(project: &Project) -> Result<ExitCode> {
+    stop_shared_container(project)?;
     Ok(ExitCode::SUCCESS)
 }
 

@@ -1,17 +1,16 @@
 //! User configuration, read from `~/.config/silo/config.toml` (or
-//! `$XDG_CONFIG_HOME/silo/config.toml` when that variable is set).
+//! `$XDG_CONFIG_HOME/silo/config.toml` when that variable is set), then
+//! overridden by the discovered project's `.silo.toml` file.
 //!
-//! The file is optional: a default one is written on first use and every key
-//! has a default, so a missing or partial file always yields a usable
-//! [`Config`]. Precedence is `defaults < config file < CLI flags`; there are
-//! no config-mirroring flags yet, but `load` is called once at startup and the
-//! resulting [`Config`] is passed down, so flags can override later without a
-//! refactor.
+//! The global file is optional: a default one is written on first use and
+//! every key has a default, so a missing or partial file always yields a
+//! usable [`Config`]. Project settings are partial and replace explicitly
+//! present global options. Precedence is `defaults < global config < project
+//! config < CLI flags`.
 //!
 //! On top of the built-in mounts (the shared project directory and the
-//! optional read-only `.git`), the `[[shared]]` section mounts additional
-//! host paths into the container, each read-only or read-write (see
-//! [`Shared`]).
+//! optional read-only `.git`), the `shared` option mounts additional host
+//! paths into the container, each read-only or read-write (see [`Shared`]).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -42,6 +41,27 @@ pub struct Config {
     /// the value is the command (and any fixed arguments) executed inside
     /// the container. Extra arguments from the invocation are appended.
     pub quick: BTreeMap<String, Vec<String>>,
+}
+
+/// Partial configuration read from a project's `.silo.toml`.
+///
+/// Collection fields are optional so omission can inherit the global value,
+/// while an explicitly empty collection can clear it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ProjectConfig {
+    image: ProjectImage,
+    read_only_git: Option<bool>,
+    shared: Option<Vec<Shared>>,
+    quick: Option<BTreeMap<String, Vec<String>>>,
+}
+
+/// Image overrides supplied by a project. An omitted Dockerfile inherits the
+/// global setting; project configuration intentionally has no reset sentinel.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ProjectImage {
+    dockerfile: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -116,6 +136,22 @@ impl Config {
         Self::load_from(&path)
     }
 
+    /// Loads the global configuration and applies `.silo.toml` from
+    /// `project_root` when it exists.
+    ///
+    /// Relative project Dockerfile and shared-source paths are resolved from
+    /// the project root. Project collection options replace their global
+    /// counterparts completely, including when explicitly empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either configuration file cannot be read,
+    /// parsed, or validated.
+    pub fn load_for_project(project_root: &Path) -> Result<Self> {
+        let config = Self::load()?;
+        Self::apply_project_file(config, project_root)
+    }
+
     /// Loads the config from `path`, creating a default file there on first
     /// use.
     ///
@@ -131,6 +167,40 @@ impl Config {
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file `{}`", path.display()))?;
         Self::parse(&text).with_context(|| format!("invalid config in `{}`", path.display()))
+    }
+
+    /// Applies the project file to an already loaded global configuration.
+    fn apply_project_file(mut config: Self, project_root: &Path) -> Result<Self> {
+        let path = project_root.join(".silo.toml");
+        if !path.is_file() {
+            return Ok(config);
+        }
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read project config file `{}`", path.display()))?;
+        let mut project: ProjectConfig = toml::from_str(&text)
+            .with_context(|| format!("invalid project config in `{}`", path.display()))?;
+        project.resolve_paths(project_root);
+        config.apply_project(project);
+        config
+            .validate()
+            .with_context(|| format!("invalid project config in `{}`", path.display()))?;
+        Ok(config)
+    }
+
+    /// Replaces every global option explicitly supplied by the project.
+    fn apply_project(&mut self, project: ProjectConfig) {
+        if let Some(dockerfile) = project.image.dockerfile {
+            self.image.dockerfile = Some(dockerfile);
+        }
+        if let Some(read_only_git) = project.read_only_git {
+            self.read_only_git = read_only_git;
+        }
+        if let Some(shared) = project.shared {
+            self.shared = shared;
+        }
+        if let Some(quick) = project.quick {
+            self.quick = quick;
+        }
     }
 
     /// Parses the config from TOML text, filling missing keys with defaults.
@@ -186,14 +256,12 @@ impl Config {
     }
 
     /// Rejects shared mounts that can never be mounted: an empty source or
-    /// target, a source that is neither absolute nor `~`-prefixed (a
-    /// relative path would resolve against the invocation's working
-    /// directory, and `~user` paths are unsupported, so neither must be
-    /// mounted silently), a target that is
-    /// not an absolute container path, or a path the container CLI cannot
-    /// parse (valid UTF-8 without `:`). Whether the source actually exists
-    /// is checked later at `silo run`, when the entry is resolved against
-    /// the file system, since the file system can change between commands.
+    /// target, an unresolved source that is neither absolute nor
+    /// `~`-prefixed (`~user` paths are unsupported), a target that is not an
+    /// absolute container path, or a path the container CLI cannot parse
+    /// (valid UTF-8 without `:`). Whether the source actually exists is
+    /// checked later at `silo run`, when the entry is resolved against the
+    /// file system, since the file system can change between commands.
     ///
     /// # Errors
     ///
@@ -233,9 +301,33 @@ impl Config {
             "entries"
         };
         Err(anyhow!(
-            "invalid shared {noun} in the `[[shared]]` section of the config file: {}",
+            "invalid shared {noun} in the `shared` config option: {}",
             problems.join("; ")
         ))
+    }
+}
+
+impl ProjectConfig {
+    /// Makes relative project-owned paths independent of the invocation's
+    /// current working directory. Empty paths remain empty so validation can
+    /// report the intended error instead of resolving them to the root.
+    fn resolve_paths(&mut self, project_root: &Path) {
+        if let Some(dockerfile) = &mut self.image.dockerfile
+            && !dockerfile.as_os_str().is_empty()
+            && dockerfile.is_relative()
+        {
+            *dockerfile = project_root.join(&*dockerfile);
+        }
+        if let Some(shared) = &mut self.shared {
+            for entry in shared {
+                if !entry.source.as_os_str().is_empty()
+                    && entry.source.is_relative()
+                    && !entry.source.as_os_str().to_string_lossy().starts_with('~')
+                {
+                    entry.source = project_root.join(&entry.source);
+                }
+            }
+        }
     }
 }
 

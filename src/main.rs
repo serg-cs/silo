@@ -53,9 +53,18 @@ enum ImageCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    // Loaded once at startup and passed down, so config can be overridden by
-    // CLI flags later without restructuring (defaults < config < flags).
-    let config = match config::Config::load() {
+    let project = match container::Project::current() {
+        Ok(project) => project,
+        Err(err) => return fail(&err),
+    };
+    // Stopping is intentionally independent of configuration validity: it
+    // only needs the project identity to clean up the shared container.
+    if matches!(&cli.command, Command::Stop) {
+        return container::stop_image(&project).unwrap_or_else(|err| fail(&err));
+    }
+    // Loaded once for every config-consuming command. Precedence is built-in
+    // defaults < global config < project config < future CLI flags.
+    let config = match config::Config::load_for_project(&project.root) {
         Ok(config) => config,
         Err(err) => return fail(&err),
     };
@@ -69,10 +78,12 @@ fn main() -> ExitCode {
         Command::Image {
             command: ImageCommand::Build,
         } => container::build_image(&config),
-        Command::Run { isolated, command } => container::run_image(&config, &command, isolated),
-        Command::Stop => container::stop_image(),
+        Command::Run { isolated, command } => {
+            container::run_image(&config, &project, &command, isolated)
+        }
+        Command::Stop => unreachable!("stop returned before loading configuration"),
         Command::Quick(args) => quick_command(&config, &args)
-            .and_then(|command| container::run_image(&config, &command, false)),
+            .and_then(|command| container::run_image(&config, &project, &command, false)),
     };
     result.unwrap_or_else(|err| fail(&err))
 }

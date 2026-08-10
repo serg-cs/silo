@@ -64,7 +64,11 @@ fn read_only_git_can_be_enabled_explicitly() {
 #[test]
 fn default_config_file_matches_builtin_defaults() {
     let from_file = Config::parse(DEFAULT_CONFIG).expect("default file parses");
-    assert_eq!(from_file.read_only_git, Config::default().read_only_git);
+    let defaults = Config::default();
+    assert_eq!(from_file.read_only_git, defaults.read_only_git);
+    assert_eq!(from_file.image.dockerfile, defaults.image.dockerfile);
+    assert!(from_file.shared.is_empty());
+    assert!(from_file.quick.is_empty());
 }
 
 #[test]
@@ -273,6 +277,159 @@ fn shared_parse_source_target_and_permission() {
     assert_eq!(config.shared[1].source, PathBuf::from("~/.ssh"));
     assert_eq!(config.shared[1].target, PathBuf::from("/home/silo/.ssh"));
     assert_eq!(config.shared[1].permission, Permission::ReadOnly);
+}
+
+#[test]
+fn shared_parse_compact_array() {
+    let config = Config::parse(
+        "shared = [\n\
+         { source = \"~/notes\", target = \"/home/silo/notes\", permission = \"read-write\" },\n\
+         { source = \"~/.ssh\", target = \"/home/silo/.ssh\" },\n\
+         ]\n",
+    )
+    .expect("compact shared array parses");
+    assert_eq!(config.shared.len(), 2);
+    assert_eq!(config.shared[0].source, PathBuf::from("~/notes"));
+    assert_eq!(config.shared[0].permission, Permission::ReadWrite);
+    assert_eq!(config.shared[1].target, PathBuf::from("/home/silo/.ssh"));
+    assert_eq!(config.shared[1].permission, Permission::ReadOnly);
+}
+
+#[test]
+fn project_omitted_shared_inherits_global_list() {
+    let dir = TestDir::new("project-inherits-shared");
+    fs::write(dir.path().join(".silo.toml"), "read_only_git = false\n")
+        .expect("project config writes");
+    let global =
+        Config::parse("shared = [{ source = \"~/notes\", target = \"/home/silo/notes\" }]\n")
+            .expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+
+    assert_eq!(merged.shared.len(), 1);
+    assert_eq!(merged.shared[0].target, PathBuf::from("/home/silo/notes"));
+    assert!(!merged.read_only_git);
+}
+
+#[test]
+fn project_empty_shared_clears_global_list() {
+    let dir = TestDir::new("project-clears-shared");
+    fs::write(dir.path().join(".silo.toml"), "shared = []\n").expect("project config writes");
+    let global =
+        Config::parse("shared = [{ source = \"~/notes\", target = \"/home/silo/notes\" }]\n")
+            .expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+
+    assert!(merged.shared.is_empty());
+}
+
+#[test]
+fn project_shared_replaces_global_and_resolves_relative_sources() {
+    let dir = TestDir::new("project-replaces-shared");
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "shared = [{ source = \"project-cache\", target = \"/cache\" }]\n",
+    )
+    .expect("project config writes");
+    let global =
+        Config::parse("shared = [{ source = \"~/notes\", target = \"/home/silo/notes\" }]\n")
+            .expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+
+    assert_eq!(merged.shared.len(), 1);
+    assert_eq!(merged.shared[0].source, dir.path().join("project-cache"));
+    assert_eq!(merged.shared[0].target, PathBuf::from("/cache"));
+}
+
+#[test]
+fn project_shared_still_rejects_named_user_tilde_sources() {
+    let dir = TestDir::new("project-rejects-user-tilde");
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "shared = [{ source = \"~user/notes\", target = \"/notes\" }]\n",
+    )
+    .expect("project config writes");
+
+    let err = Config::apply_project_file(Config::default(), dir.path())
+        .expect_err("named-user tilde remains invalid");
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains("`~user` paths are not supported"), "{msg}");
+}
+
+#[test]
+fn project_quick_table_replaces_global_table() {
+    let dir = TestDir::new("project-replaces-quick");
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "[quick]\nproject = [\"project-command\"]\n",
+    )
+    .expect("project config writes");
+    let global =
+        Config::parse("[quick]\nglobal = [\"global-command\"]\n").expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+
+    assert!(!merged.quick.contains_key("global"));
+    assert_eq!(merged.quick["project"], ["project-command"]);
+}
+
+#[test]
+fn empty_project_quick_table_clears_global_table() {
+    let dir = TestDir::new("project-clears-quick");
+    fs::write(dir.path().join(".silo.toml"), "[quick]\n").expect("project config writes");
+    let global =
+        Config::parse("[quick]\nglobal = [\"global-command\"]\n").expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+
+    assert!(merged.quick.is_empty());
+}
+
+#[test]
+fn project_dockerfile_overrides_and_resolves_from_project_root() {
+    let dir = TestDir::new("project-dockerfile");
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "[image]\ndockerfile = \"containers/Dockerfile\"\n",
+    )
+    .expect("project config writes");
+    let global = Config::parse("[image]\ndockerfile = \"/global/Dockerfile\"\n")
+        .expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let expected = dir.path().join("containers/Dockerfile");
+
+    assert_eq!(merged.image.dockerfile.as_deref(), Some(expected.as_path()));
+}
+
+#[test]
+fn empty_project_file_keeps_global_configuration() {
+    let dir = TestDir::new("empty-project-config");
+    fs::write(dir.path().join(".silo.toml"), "").expect("project config writes");
+    let global = Config::parse("read_only_git = false\n[quick]\nglobal = [\"global-command\"]\n")
+        .expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+
+    assert!(!merged.read_only_git);
+    assert_eq!(merged.quick["global"], ["global-command"]);
+}
+
+#[test]
+fn invalid_project_config_reports_its_path_and_location() {
+    let dir = TestDir::new("invalid-project-config");
+    let path = dir.path().join(".silo.toml");
+    fs::write(&path, "shared = [").expect("project config writes");
+
+    let err = Config::apply_project_file(Config::default(), dir.path())
+        .expect_err("invalid project config errors");
+    let msg = format!("{err:#}");
+
+    assert!(msg.contains(&path.display().to_string()), "{msg}");
+    assert!(msg.contains("line 1"), "{msg}");
 }
 
 #[test]
