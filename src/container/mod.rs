@@ -16,7 +16,7 @@ use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets::NO
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, Permission, Shared, Shell};
+use crate::config::{Config, Container, Permission, Shared, Shell};
 
 /// Name of the image this tool builds and runs.
 pub const IMAGE_TAG: &str = "silo:latest";
@@ -516,6 +516,7 @@ fn run_isolated(
         &project.root,
         &ids,
         &config_mounts,
+        &config.container,
         &id,
         command,
         shell,
@@ -1294,6 +1295,7 @@ fn container_identity(
     project: &Project,
     host_ids: &HostIds,
     config_mounts: &ConfigMounts,
+    resources: &Container,
     lifecycle: &str,
     command: &[OsString],
 ) -> ContainerIdentity {
@@ -1301,6 +1303,7 @@ fn container_identity(
         project,
         host_ids,
         config_mounts,
+        resources,
         lifecycle,
         command,
         LIFECYCLE_PROTOCOL_VERSION,
@@ -1311,6 +1314,7 @@ fn container_identity_for_protocol(
     project: &Project,
     host_ids: &HostIds,
     config_mounts: &ConfigMounts,
+    resources: &Container,
     lifecycle: &str,
     command: &[OsString],
     protocol: &str,
@@ -1351,6 +1355,12 @@ fn container_identity_for_protocol(
                 Permission::ReadWrite => b"rw",
             },
         );
+    }
+    if let Some(cpus) = resources.cpus {
+        hash_spec_field(&mut hasher, b"cpus", cpus.to_string().as_bytes());
+    }
+    if let Some(memory) = &resources.memory {
+        hash_spec_field(&mut hasher, b"memory", memory.as_bytes());
     }
     for argument in command {
         hash_spec_field(&mut hasher, b"command", argument.as_os_str().as_bytes());
@@ -1498,6 +1508,7 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
         project,
         &ids,
         &config_mounts,
+        &config.container,
         LABEL_SHARED_VALUE,
         &[OsString::from(SHARED_INIT_COMMAND)],
     );
@@ -1513,7 +1524,13 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
                     require_image()?;
                     checked_image = true;
                 }
-                match create_shared_container(project, &ids, &config_mounts, &identity) {
+                match create_shared_container(
+                    project,
+                    &ids,
+                    &config_mounts,
+                    &config.container,
+                    &identity,
+                ) {
                     Ok(()) => {}
                     Err(err) => last_conflict = Some(err),
                 }
@@ -1581,6 +1598,7 @@ fn create_shared_container(
     project: &Project,
     ids: &HostIds,
     config_mounts: &ConfigMounts,
+    resources: &Container,
     identity: &ContainerIdentity,
 ) -> Result<()> {
     let cid_dir = tempfile::Builder::new()
@@ -1588,7 +1606,7 @@ fn create_shared_container(
         .tempdir_in(std::env::temp_dir())
         .context("failed to create temporary cid directory")?;
     let cidfile = cid_dir.path().join("container.cid");
-    let output = create_command(project, ids, config_mounts, &cidfile)?
+    let output = create_command(project, ids, config_mounts, resources, &cidfile)?
         .output()
         .map_err(spawn_error)?;
 
@@ -2255,11 +2273,13 @@ fn id_of(flag: &str) -> Result<String> {
 ///
 /// Returns an error when the project root has no name (e.g. `/`), or its path
 /// or a mount's path cannot be expressed in a volume spec.
+#[allow(clippy::too_many_arguments)]
 fn isolated_run_command(
     interactive: bool,
     project_root: &Path,
     host_ids: &HostIds,
     config_mounts: &ConfigMounts,
+    resources: &Container,
     id: &str,
     command: &[OsString],
     shell: Option<Shell>,
@@ -2274,6 +2294,7 @@ fn isolated_run_command(
         &project,
         host_ids,
         config_mounts,
+        resources,
         LABEL_ISOLATED_VALUE,
         command,
     );
@@ -2283,6 +2304,7 @@ fn isolated_run_command(
         // Allocating a pty without a terminal fails with ENOTTY.
         run.arg("-t");
     }
+    append_resources(&mut run, resources);
     append_identity_labels(&mut run, &identity, LABEL_ISOLATED_VALUE);
     append_creation_mounts(&mut run, project_root, &shared_dir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
@@ -2305,12 +2327,14 @@ fn create_command(
     project: &Project,
     host_ids: &HostIds,
     config_mounts: &ConfigMounts,
+    resources: &Container,
     cidfile: &Path,
 ) -> Result<Command> {
     let identity = container_identity(
         project,
         host_ids,
         config_mounts,
+        resources,
         LABEL_SHARED_VALUE,
         &[OsString::from(SHARED_INIT_COMMAND)],
     );
@@ -2321,11 +2345,23 @@ fn create_command(
         .arg("--cidfile")
         .arg(cidfile)
         .arg("-d");
+    append_resources(&mut run, resources);
     append_identity_labels(&mut run, &identity, LABEL_SHARED_VALUE);
     append_creation_mounts(&mut run, &project.root, &project.workdir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
     run.arg(IMAGE_TAG).arg(SHARED_INIT_COMMAND);
     Ok(run)
+}
+
+/// Adds only explicitly configured limits, preserving Apple container's
+/// configured defaults when either setting is omitted.
+fn append_resources(run: &mut Command, resources: &Container) {
+    if let Some(cpus) = resources.cpus {
+        run.arg("--cpus").arg(cpus.to_string());
+    }
+    if let Some(memory) = &resources.memory {
+        run.arg("--memory").arg(memory);
+    }
 }
 
 /// Adds mounts in their established override order and selects the workdir.

@@ -132,6 +132,7 @@ fn run_command_starts_interactive_shell() {
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts::default(),
+        &Container::default(),
         "silo-123",
         &[],
         Some(Shell::Zsh),
@@ -178,6 +179,7 @@ fn run_command_omits_pty_when_not_interactive() {
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts::default(),
+        &Container::default(),
         "silo-123",
         &[],
         Some(Shell::Zsh),
@@ -209,6 +211,32 @@ fn run_command_omits_pty_when_not_interactive() {
 }
 
 #[test]
+fn run_command_applies_configured_resources() {
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let resources = Container {
+        cpus: Some(8),
+        memory: Some("32G".to_string()),
+    };
+    let command = isolated_run_command(
+        false,
+        Path::new("/tmp/project"),
+        &ids,
+        &ConfigMounts::default(),
+        &resources,
+        "silo-123",
+        &[],
+        None,
+    )
+    .expect("command builds");
+    let args = args_without_labels(&command);
+
+    assert_eq!(&args[5..9], ["--cpus", "8", "--memory", "32G"],);
+}
+
+#[test]
 fn custom_image_run_keeps_its_default_command_and_environment() {
     let ids = HostIds {
         uid: "501".into(),
@@ -219,6 +247,7 @@ fn custom_image_run_keeps_its_default_command_and_environment() {
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts::default(),
+        &Container::default(),
         "silo-123",
         &[],
         None,
@@ -241,6 +270,7 @@ fn run_command_places_shared_dir_in_container_home() {
         Path::new("/home/user/src/silo"),
         &ids,
         &ConfigMounts::default(),
+        &Container::default(),
         "silo-123",
         &[],
         None,
@@ -279,6 +309,7 @@ fn run_command_rejects_sharing_root() {
         Path::new("/"),
         &ids,
         &ConfigMounts::default(),
+        &Container::default(),
         "silo-123",
         &[],
         None,
@@ -298,6 +329,7 @@ fn run_command_rejects_paths_with_colons() {
         Path::new("/tmp/foo:bar"),
         &ids,
         &ConfigMounts::default(),
+        &Container::default(),
         "silo-123",
         &[],
         None,
@@ -323,6 +355,7 @@ fn run_command_rejects_non_utf8_paths() {
         path,
         &ids,
         &ConfigMounts::default(),
+        &Container::default(),
         "silo-123",
         &[],
         None,
@@ -710,6 +743,7 @@ fn run_command_appends_the_passed_command() {
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts::default(),
+        &Container::default(),
         "silo-123",
         &[
             OsString::from("codex"),
@@ -779,6 +813,7 @@ fn run_command_mounts_git_read_only() {
             git: Some(PathBuf::from("/tmp/project/.git")),
             shared: vec![],
         },
+        &Container::default(),
         "silo-123",
         &[],
         None,
@@ -804,6 +839,7 @@ fn run_command_omits_git_mount_when_absent() {
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts::default(),
+        &Container::default(),
         "silo-123",
         &[],
         None,
@@ -835,6 +871,7 @@ fn run_command_mounts_configured_shared() {
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts { git: None, shared },
+        &Container::default(),
         "silo-123",
         &[],
         None,
@@ -869,6 +906,7 @@ fn run_command_orders_git_then_shared_mounts() {
             git: Some(PathBuf::from("/tmp/project/.git")),
             shared,
         },
+        &Container::default(),
         "silo-123",
         &[],
         None,
@@ -1288,10 +1326,25 @@ fn discovered_project_root_drives_shared_and_isolated_mounts() {
     let mounts = ConfigMounts::default();
     let expected = format!("{}:/home/silo/workspace", project.root.display());
 
-    let isolated = isolated_run_command(false, &project.root, &ids, &mounts, "silo-123", &[], None)
-        .expect("isolated command builds");
-    let shared = create_command(&project, &ids, &mounts, Path::new("/tmp/project.cid"))
-        .expect("shared command builds");
+    let isolated = isolated_run_command(
+        false,
+        &project.root,
+        &ids,
+        &mounts,
+        &Container::default(),
+        "silo-123",
+        &[],
+        None,
+    )
+    .expect("isolated command builds");
+    let shared = create_command(
+        &project,
+        &ids,
+        &mounts,
+        &Container::default(),
+        Path::new("/tmp/project.cid"),
+    )
+    .expect("shared command builds");
 
     assert_eq!(volume_specs(&isolated), std::slice::from_ref(&expected));
     assert_eq!(volume_specs(&shared), [expected]);
@@ -1341,6 +1394,7 @@ fn create_command_starts_the_detached_supervisor() {
         &project,
         &ids,
         &ConfigMounts::default(),
+        &Container::default(),
         Path::new("/tmp/project.cid"),
     )
     .expect("command builds");
@@ -1373,6 +1427,30 @@ fn create_command_starts_the_detached_supervisor() {
     assert_eq!(labels.get(LABEL_PROJECT).map(|value| value.len()), Some(64));
     assert_eq!(labels.get(LABEL_PROJECT_ROOT), Some(&"/tmp/project"));
     assert_eq!(labels.get(LABEL_SPEC).map(|value| value.len()), Some(64));
+}
+
+#[test]
+fn shared_create_command_applies_configured_resources() {
+    let project = test_project("/tmp/project");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let resources = Container {
+        cpus: Some(6),
+        memory: Some("12G".to_string()),
+    };
+    let command = create_command(
+        &project,
+        &ids,
+        &ConfigMounts::default(),
+        &resources,
+        Path::new("/tmp/project.cid"),
+    )
+    .expect("command builds");
+    let args = args_without_labels(&command);
+
+    assert_eq!(&args[6..10], ["--cpus", "6", "--memory", "12G"],);
 }
 
 #[test]
@@ -1693,6 +1771,7 @@ fn shared_identity(project: &Project) -> ContainerIdentity {
             gid: "20".into(),
         },
         &ConfigMounts::default(),
+        &Container::default(),
         LABEL_SHARED_VALUE,
         &[OsString::from(SHARED_INIT_COMMAND)],
     )
@@ -1925,6 +2004,7 @@ fn isolated_orphan_cleanup_requires_complete_runtime_ownership_labels() {
             gid: "20".into(),
         },
         &ConfigMounts::default(),
+        &Container::default(),
         LABEL_ISOLATED_VALUE,
         &[],
     );
@@ -1982,6 +2062,7 @@ fn specification_digest_is_deterministic_and_creation_sensitive() {
             gid: "20".into(),
         },
         &mounts,
+        &Container::default(),
         LABEL_SHARED_VALUE,
         &[OsString::from(SHARED_INIT_COMMAND)],
     );
@@ -1989,6 +2070,51 @@ fn specification_digest_is_deterministic_and_creation_sensitive() {
     assert_eq!(base, shared_identity(&project));
     assert_ne!(base.spec, changed.spec);
     assert_eq!(base.project.len(), 64);
+}
+
+#[test]
+fn specification_digest_tracks_resource_limits() {
+    let project = test_project("/tmp/project");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let mounts = ConfigMounts::default();
+    let command = [OsString::from(SHARED_INIT_COMMAND)];
+    let defaults = container_identity(
+        &project,
+        &ids,
+        &mounts,
+        &Container::default(),
+        LABEL_SHARED_VALUE,
+        &command,
+    );
+    let with_cpus = container_identity(
+        &project,
+        &ids,
+        &mounts,
+        &Container {
+            cpus: Some(8),
+            memory: None,
+        },
+        LABEL_SHARED_VALUE,
+        &command,
+    );
+    let with_memory = container_identity(
+        &project,
+        &ids,
+        &mounts,
+        &Container {
+            cpus: None,
+            memory: Some("8G".to_string()),
+        },
+        LABEL_SHARED_VALUE,
+        &command,
+    );
+
+    assert_ne!(defaults.spec, with_cpus.spec);
+    assert_ne!(defaults.spec, with_memory.spec);
+    assert_ne!(with_cpus.spec, with_memory.spec);
 }
 
 #[test]
@@ -2000,9 +2126,23 @@ fn shell_image_revision_invalidates_pre_shell_shared_containers() {
     };
     let mounts = ConfigMounts::default();
     let command = [OsString::from(SHARED_INIT_COMMAND)];
-    let current = container_identity(&project, &ids, &mounts, LABEL_SHARED_VALUE, &command);
-    let before_zsh_and_fish =
-        container_identity_for_protocol(&project, &ids, &mounts, LABEL_SHARED_VALUE, &command, "3");
+    let current = container_identity(
+        &project,
+        &ids,
+        &mounts,
+        &Container::default(),
+        LABEL_SHARED_VALUE,
+        &command,
+    );
+    let before_zsh_and_fish = container_identity_for_protocol(
+        &project,
+        &ids,
+        &mounts,
+        &Container::default(),
+        LABEL_SHARED_VALUE,
+        &command,
+        "3",
+    );
 
     assert_ne!(current.spec, before_zsh_and_fish.spec);
 }

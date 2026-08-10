@@ -28,6 +28,9 @@ const DEFAULT_CONFIG: &str = include_str!("default.toml");
 #[serde(default)]
 pub struct Config {
     pub image: Image,
+    /// Resource limits for containers created by Silo. Omitted limits are
+    /// left to Apple container's configured defaults.
+    pub container: Container,
     /// Interactive shell used by the built-in image. When omitted, Silo
     /// mirrors a supported host `$SHELL` and falls back to Zsh.
     pub shell: Option<Shell>,
@@ -53,6 +56,7 @@ pub struct Config {
 #[serde(default)]
 struct ProjectConfig {
     image: ProjectImage,
+    container: ProjectContainer,
     shell: Option<Shell>,
     read_only_git: Option<bool>,
     shared: Option<Vec<Shared>>,
@@ -67,10 +71,20 @@ struct ProjectImage {
     dockerfile: Option<PathBuf>,
 }
 
+/// Container resource overrides supplied by a project. Each omitted limit
+/// inherits the corresponding global setting.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ProjectContainer {
+    cpus: Option<usize>,
+    memory: Option<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             image: Image::default(),
+            container: Container::default(),
             shell: None,
             // Protection on by default; disable it in the config file.
             read_only_git: true,
@@ -87,6 +101,18 @@ pub struct Image {
     /// Path to a Dockerfile defining a custom image; `None` uses the
     /// built-in image.
     pub dockerfile: Option<PathBuf>,
+}
+
+/// Resource limits passed to Apple container when creating a container.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Container {
+    /// Number of CPUs allocated to the container. `None` uses Apple
+    /// container's configured default.
+    pub cpus: Option<usize>,
+    /// Memory allocated to the container, using Apple container's accepted
+    /// syntax (for example `4G`). `None` uses its configured default.
+    pub memory: Option<String>,
 }
 
 /// Shells guaranteed to be available in Silo's built-in image.
@@ -210,6 +236,12 @@ impl Config {
         if let Some(dockerfile) = project.image.dockerfile {
             self.image.dockerfile = Some(dockerfile);
         }
+        if let Some(cpus) = project.container.cpus {
+            self.container.cpus = Some(cpus);
+        }
+        if let Some(memory) = project.container.memory {
+            self.container.memory = Some(memory);
+        }
         if let Some(shell) = project.shell {
             self.shell = Some(shell);
         }
@@ -284,18 +316,34 @@ impl Config {
         ))
     }
 
-    /// Rejects shared mounts that can never be mounted: an empty source or
-    /// target, an unresolved source that is neither absolute nor
-    /// `~`-prefixed (`~user` paths are unsupported), a target that is not an
-    /// absolute container path, or a path the container CLI cannot parse
-    /// (valid UTF-8 without `:`). Whether the source actually exists is
-    /// checked later at `silo run`, when the entry is resolved against the
-    /// file system, since the file system can change between commands.
+    /// Rejects impossible resource limits, plus shared mounts that can never
+    /// be mounted: an empty source or target, an unresolved source that is
+    /// neither absolute nor `~`-prefixed (`~user` paths are unsupported), a
+    /// target that is not an absolute container path, or a path the container
+    /// CLI cannot parse (valid UTF-8 without `:`). Whether a shared source
+    /// actually exists is checked later at `silo run`, since the file system
+    /// can change between commands.
     ///
     /// # Errors
     ///
-    /// Returns an error describing every invalid entry.
+    /// Returns an error describing an invalid resource or every invalid
+    /// shared entry.
     fn validate(&self) -> Result<()> {
+        if self.container.cpus == Some(0) {
+            return Err(anyhow!(
+                "invalid `container.cpus` config option: CPU count must be greater than zero"
+            ));
+        }
+        if self
+            .container
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.trim().is_empty())
+        {
+            return Err(anyhow!(
+                "invalid `container.memory` config option: memory must not be empty"
+            ));
+        }
         let mut problems: Vec<String> = Vec::new();
         for (index, entry) in self.shared.iter().enumerate() {
             let label = format!(

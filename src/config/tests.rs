@@ -34,6 +34,35 @@ fn empty_config_uses_builtin_image() {
 }
 
 #[test]
+fn container_resources_default_to_apple_container_settings() {
+    let config = Config::parse("").expect("empty config parses");
+    assert_eq!(config.container, Container::default());
+    assert_eq!(config.container.cpus, None);
+    assert_eq!(config.container.memory, None);
+}
+
+#[test]
+fn container_resources_are_configurable() {
+    let config = Config::parse("[container]\ncpus = 8\nmemory = \"32G\"\n")
+        .expect("container resources parse");
+    assert_eq!(config.container.cpus, Some(8));
+    assert_eq!(config.container.memory.as_deref(), Some("32G"));
+}
+
+#[test]
+fn container_resources_reject_impossible_values() {
+    let cpu = Config::parse("[container]\ncpus = 0\n")
+        .expect_err("zero CPUs cannot run a container")
+        .to_string();
+    assert!(cpu.contains("container.cpus"), "{cpu}");
+
+    let memory = Config::parse("[container]\nmemory = \"  \"\n")
+        .expect_err("empty memory cannot configure a container")
+        .to_string();
+    assert!(memory.contains("container.memory"), "{memory}");
+}
+
+#[test]
 fn shell_defaults_to_host_detection() {
     let config = Config::parse("").expect("empty config parses");
     assert_eq!(config.shell, None);
@@ -98,8 +127,27 @@ fn default_config_file_matches_builtin_defaults() {
     assert_eq!(from_file.shell, defaults.shell);
     assert_eq!(from_file.read_only_git, defaults.read_only_git);
     assert_eq!(from_file.image.dockerfile, defaults.image.dockerfile);
+    assert_eq!(from_file.container, defaults.container);
     assert!(from_file.shared.is_empty());
     assert!(from_file.quick.is_empty());
+}
+
+#[test]
+fn dotted_container_resources_keep_later_settings_at_the_root() {
+    let config = Config::parse(
+        "container.cpus = 8\n\
+         container.memory = \"16G\"\n\
+         shell = \"fish\"\n\
+         read_only_git = false\n\
+         shared = [{ source = \"~/notes\", target = \"/home/silo/notes\" }]\n",
+    )
+    .expect("dotted resources and later root settings parse");
+
+    assert_eq!(config.container.cpus, Some(8));
+    assert_eq!(config.container.memory.as_deref(), Some("16G"));
+    assert_eq!(config.shell, Some(Shell::Fish));
+    assert!(!config.read_only_git);
+    assert_eq!(config.shared.len(), 1);
 }
 
 #[test]
@@ -385,6 +433,23 @@ fn omitted_project_shell_inherits_global_shell() {
     let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
 
     assert_eq!(merged.shell, Some(Shell::Nu));
+}
+
+#[test]
+fn project_container_resources_override_independently() {
+    let dir = TestDir::new("project-container-resources");
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "[container]\nmemory = \"16G\"\n",
+    )
+    .expect("project config writes");
+    let global =
+        Config::parse("[container]\ncpus = 6\nmemory = \"8G\"\n").expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+
+    assert_eq!(merged.container.cpus, Some(6));
+    assert_eq!(merged.container.memory.as_deref(), Some("16G"));
 }
 
 #[test]
