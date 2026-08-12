@@ -35,6 +35,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: Option<ContainersCommand>,
     },
+    /// List and manage Silo-owned persistent mounts.
+    Mounts {
+        #[command(subcommand)]
+        command: Option<MountsCommand>,
+    },
     /// Run a configured quick command: `silo <name> [args...]`, where `name`
     /// is a key in the `[quick]` section of the config file; extra arguments
     /// are appended.
@@ -69,5 +74,18 @@ pub(crate) enum ContainersCommand {
         /// Terminate active sessions before deleting the container.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MountsCommand {
+    /// List all Silo-owned persistent mounts.
+    #[command(alias = "ls")]
+    List,
+    /// Permanently delete one unused persistent mount.
+    #[command(alias = "rm")]
+    Delete {
+        /// Exact mount ID, unique ID prefix, project, or logical mount name.
+        selector: String,
     },
 }

@@ -1,9 +1,27 @@
 use super::*;
-use crate::config::{Permission, Shared, Shell};
+use crate::config::{Mount, MountKind, Permission, Shell};
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+fn resolved_host(name: &str, host: &str, dest: &str, access: Permission) -> ResolvedMount {
+    ResolvedMount {
+        name: name.to_string(),
+        source: ResolvedMountSource::Host(PathBuf::from(host)),
+        dest: PathBuf::from(dest),
+        access,
+    }
+}
+
+fn test_managed_mount(scope: StateScope, name: &str, project: Option<&Path>) -> ManagedMount {
+    managed_mount_at_root(
+        scope,
+        name,
+        project,
+        Path::new("/home/user/.local/state/silo/mounts"),
+    )
+}
 
 fn args_without_labels(command: &Command) -> Vec<&str> {
     let mut arguments = command
@@ -127,7 +145,7 @@ fn run_command_starts_interactive_shell() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = isolated_run_command(
+    let command = isolated_create_command(
         true,
         Path::new("/tmp/project"),
         &ids,
@@ -142,7 +160,7 @@ fn run_command_starts_interactive_shell() {
     assert_eq!(
         args,
         [
-            "run",
+            "create",
             "--name",
             "silo-123",
             "--rm",
@@ -174,7 +192,7 @@ fn run_command_omits_pty_when_not_interactive() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = isolated_run_command(
+    let command = isolated_create_command(
         false,
         Path::new("/tmp/project"),
         &ids,
@@ -189,7 +207,7 @@ fn run_command_omits_pty_when_not_interactive() {
     assert_eq!(
         args,
         [
-            "run",
+            "create",
             "--name",
             "silo-123",
             "--rm",
@@ -220,7 +238,7 @@ fn run_command_applies_configured_resources() {
         cpus: Some(8),
         memory: Some("32G".to_string()),
     };
-    let command = isolated_run_command(
+    let command = isolated_create_command(
         false,
         Path::new("/tmp/project"),
         &ids,
@@ -242,7 +260,7 @@ fn custom_image_run_keeps_its_default_command_and_environment() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = isolated_run_command(
+    let command = isolated_create_command(
         false,
         Path::new("/tmp/project"),
         &ids,
@@ -265,7 +283,7 @@ fn run_command_places_shared_dir_in_container_home() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = isolated_run_command(
+    let command = isolated_create_command(
         true,
         Path::new("/home/user/src/silo"),
         &ids,
@@ -281,11 +299,7 @@ fn run_command_places_shared_dir_in_container_home() {
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
         .collect();
     assert_eq!(
-        args[args
-            .iter()
-            .position(|arg| *arg == "-v")
-            .expect("volume flag")
-            + 1],
+        args[args.iter().position(|arg| *arg == "-v").expect("bind flag") + 1],
         "/home/user/src/silo:/home/silo/silo"
     );
     assert_eq!(
@@ -304,7 +318,7 @@ fn run_command_rejects_sharing_root() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let err = isolated_run_command(
+    let err = isolated_create_command(
         true,
         Path::new("/"),
         &ids,
@@ -324,7 +338,7 @@ fn run_command_rejects_paths_with_colons() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let err = isolated_run_command(
+    let err = isolated_create_command(
         true,
         Path::new("/tmp/foo:bar"),
         &ids,
@@ -339,6 +353,16 @@ fn run_command_rejects_paths_with_colons() {
     assert!(err.to_string().contains("without `:`"));
 }
 
+#[test]
+fn mount_argument_rejects_equals_and_commas() {
+    for path in ["/tmp/with=equals", "/tmp/with,comma"] {
+        let message = mount_argument_path(Path::new(path))
+            .expect_err("ambiguous mount syntax is rejected")
+            .to_string();
+        assert!(message.contains("without `,` or `=`"), "{message}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn run_command_rejects_non_utf8_paths() {
@@ -350,7 +374,7 @@ fn run_command_rejects_non_utf8_paths() {
         gid: "20".into(),
     };
     let path = Path::new(OsStr::from_bytes(b"/tmp/bad\xFFdir"));
-    let err = isolated_run_command(
+    let err = isolated_create_command(
         true,
         path,
         &ids,
@@ -738,7 +762,7 @@ fn run_command_appends_the_passed_command() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = isolated_run_command(
+    let command = isolated_create_command(
         false,
         Path::new("/tmp/project"),
         &ids,
@@ -757,7 +781,7 @@ fn run_command_appends_the_passed_command() {
     assert_eq!(
         args,
         [
-            "run",
+            "create",
             "--name",
             "silo-123",
             "--rm",
@@ -780,14 +804,25 @@ fn run_command_appends_the_passed_command() {
     );
 }
 
-/// Returns the `-v` volume specs of the command, in order.
-fn volume_specs(command: &Command) -> Vec<String> {
+/// Returns the `-v` bind specifications of the command, in order.
+fn bind_specs(command: &Command) -> Vec<String> {
     let args: Vec<&str> = command
         .get_args()
         .map(|arg| arg.to_str().expect("arg is UTF-8"))
         .collect();
     args.windows(2)
         .filter(|pair| pair[0] == "-v")
+        .map(|pair| pair[1].to_string())
+        .collect()
+}
+
+fn mount_specs(command: &Command) -> Vec<String> {
+    let args: Vec<&str> = command
+        .get_args()
+        .map(|arg| arg.to_str().expect("arg is UTF-8"))
+        .collect();
+    args.windows(2)
+        .filter(|pair| pair[0] == "--mount")
         .map(|pair| pair[1].to_string())
         .collect()
 }
@@ -805,13 +840,13 @@ fn run_command_mounts_git_read_only() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = isolated_run_command(
+    let command = isolated_create_command(
         true,
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts {
             git: Some(PathBuf::from("/tmp/project/.git")),
-            shared: vec![],
+            named: vec![],
         },
         &Container::default(),
         "silo-123",
@@ -820,7 +855,7 @@ fn run_command_mounts_git_read_only() {
     )
     .expect("command builds");
     assert_eq!(
-        volume_specs(&command),
+        bind_specs(&command),
         [
             "/tmp/project:/home/silo/project",
             "/tmp/project/.git:/home/silo/project/.git:ro",
@@ -834,7 +869,7 @@ fn run_command_omits_git_mount_when_absent() {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = isolated_run_command(
+    let command = isolated_create_command(
         true,
         Path::new("/tmp/project"),
         &ids,
@@ -845,66 +880,69 @@ fn run_command_omits_git_mount_when_absent() {
         None,
     )
     .expect("command builds");
-    assert_eq!(volume_specs(&command), ["/tmp/project:/home/silo/project"]);
+    assert_eq!(bind_specs(&command), ["/tmp/project:/home/silo/project"]);
 }
 
 #[test]
-fn run_command_mounts_configured_shared() {
+fn run_command_mounts_configured_named_mounts() {
     let ids = HostIds {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let shared = vec![
-        ResolvedShared {
-            host: PathBuf::from("/home/user/.ssh"),
-            dest: PathBuf::from("/home/silo/.ssh"),
-            permission: Permission::ReadOnly,
-        },
-        ResolvedShared {
-            host: PathBuf::from("/home/user/Downloads"),
-            dest: PathBuf::from("/home/silo/Downloads"),
-            permission: Permission::ReadWrite,
-        },
+    let named = vec![
+        resolved_host(
+            "ssh",
+            "/home/user/.ssh",
+            "/home/silo/.ssh",
+            Permission::ReadOnly,
+        ),
+        resolved_host(
+            "downloads",
+            "/home/user/Downloads",
+            "/home/silo/Downloads",
+            Permission::ReadWrite,
+        ),
     ];
-    let command = isolated_run_command(
+    let command = isolated_create_command(
         true,
         Path::new("/tmp/project"),
         &ids,
-        &ConfigMounts { git: None, shared },
+        &ConfigMounts { git: None, named },
         &Container::default(),
         "silo-123",
         &[],
         None,
     )
     .expect("command builds");
+    assert_eq!(bind_specs(&command), ["/tmp/project:/home/silo/project"]);
     assert_eq!(
-        volume_specs(&command),
+        mount_specs(&command),
         [
-            "/tmp/project:/home/silo/project",
-            "/home/user/.ssh:/home/silo/.ssh:ro",
-            "/home/user/Downloads:/home/silo/Downloads",
+            "type=bind,source=/home/user/.ssh,target=/home/silo/.ssh,readonly",
+            "type=bind,source=/home/user/Downloads,target=/home/silo/Downloads",
         ]
     );
 }
 
 #[test]
-fn run_command_orders_git_then_shared_mounts() {
+fn run_command_orders_git_then_named_mounts() {
     let ids = HostIds {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let shared = vec![ResolvedShared {
-        host: PathBuf::from("/home/user/data"),
-        dest: PathBuf::from("/data"),
-        permission: Permission::ReadWrite,
-    }];
-    let command = isolated_run_command(
+    let named = vec![resolved_host(
+        "data",
+        "/home/user/data",
+        "/data",
+        Permission::ReadWrite,
+    )];
+    let command = isolated_create_command(
         true,
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts {
             git: Some(PathBuf::from("/tmp/project/.git")),
-            shared,
+            named,
         },
         &Container::default(),
         "silo-123",
@@ -913,12 +951,250 @@ fn run_command_orders_git_then_shared_mounts() {
     )
     .expect("command builds");
     assert_eq!(
-        volume_specs(&command),
+        bind_specs(&command),
         [
             "/tmp/project:/home/silo/project",
             "/tmp/project/.git:/home/silo/project/.git:ro",
-            "/home/user/data:/data",
         ]
+    );
+    assert_eq!(
+        mount_specs(&command),
+        ["type=bind,source=/home/user/data,target=/data"]
+    );
+}
+
+#[test]
+fn shared_create_bind_mounts_all_managed_storage() {
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let project = Path::new("/tmp/project");
+    let writable = test_managed_mount(StateScope::Project, "cargo", Some(project));
+    let readonly = test_managed_mount(StateScope::Shared, "codex", None);
+    let mounts = ConfigMounts {
+        git: None,
+        named: vec![
+            ResolvedMount {
+                name: "cargo".into(),
+                source: ResolvedMountSource::Managed(writable.clone()),
+                dest: PathBuf::from("/home/silo/.cargo"),
+                access: Permission::ReadWrite,
+            },
+            ResolvedMount {
+                name: "codex".into(),
+                source: ResolvedMountSource::Managed(readonly.clone()),
+                dest: PathBuf::from("/home/silo/.codex"),
+                access: Permission::ReadOnly,
+            },
+        ],
+    };
+    let command = create_command(
+        &test_project("/tmp/project"),
+        &ids,
+        &mounts,
+        &Container::default(),
+        Path::new("/tmp/cidfile"),
+    )
+    .expect("command builds");
+
+    assert_eq!(
+        mount_specs(&command),
+        [
+            format!(
+                "type=bind,source={},target=/home/silo/.cargo",
+                writable.path.display()
+            ),
+            format!(
+                "type=bind,source={},target=/home/silo/.codex,readonly",
+                readonly.path.display()
+            ),
+        ]
+    );
+    assert!(
+        !command
+            .get_args()
+            .any(|arg| arg.to_string_lossy().starts_with("SILO_STATE_TARGETS="))
+    );
+}
+
+#[test]
+fn built_in_isolated_mount_filter_keeps_all_managed_mounts() {
+    let project = Path::new("/tmp/project");
+    let mounts = vec![
+        ResolvedMount {
+            name: "cargo".into(),
+            source: ResolvedMountSource::Managed(test_managed_mount(
+                StateScope::Project,
+                "cargo",
+                Some(project),
+            )),
+            dest: PathBuf::from("/home/silo/.cargo"),
+            access: Permission::ReadWrite,
+        },
+        ResolvedMount {
+            name: "codex".into(),
+            source: ResolvedMountSource::Managed(test_managed_mount(
+                StateScope::Shared,
+                "codex",
+                None,
+            )),
+            dest: PathBuf::from("/home/silo/.codex"),
+            access: Permission::ReadWrite,
+        },
+        resolved_host("docs", "/home/user/docs", "/docs", Permission::ReadOnly),
+    ];
+
+    assert_eq!(
+        mounts
+            .iter()
+            .map(|mount| mount.name.as_str())
+            .collect::<Vec<_>>(),
+        ["cargo", "codex", "docs"]
+    );
+    assert!(needs_mount_lock(&mounts));
+
+    let command = isolated_create_command(
+        false,
+        project,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts {
+            git: None,
+            named: mounts,
+        },
+        &Container::default(),
+        "silo-123",
+        &[],
+        None,
+    )
+    .expect("built-in isolated command accepts managed mounts");
+    assert!(mount_specs(&command).iter().any(
+        |spec| spec.contains("/mounts/projects/") && spec.ends_with("target=/home/silo/.cargo")
+    ));
+}
+
+#[test]
+fn custom_image_mount_filter_skips_all_managed_mounts() {
+    let dir = TestDir::new("custom-image-mount-filter");
+    let mounts = BTreeMap::from([
+        (
+            "cargo".into(),
+            Mount {
+                kind: Some(MountKind::ProjectState),
+                target: Some(PathBuf::from("~/.cargo")),
+                ..Mount::default()
+            },
+        ),
+        (
+            "codex".into(),
+            Mount {
+                kind: Some(MountKind::SharedState),
+                target: Some(PathBuf::from("~/.codex")),
+                ..Mount::default()
+            },
+        ),
+        (
+            "tools".into(),
+            Mount {
+                kind: Some(MountKind::SharedState),
+                target: Some(PathBuf::from("/tools")),
+                ..Mount::default()
+            },
+        ),
+        (
+            "docs".into(),
+            Mount {
+                kind: Some(MountKind::Host),
+                source: Some(dir.path().to_path_buf()),
+                target: Some(PathBuf::from("/docs")),
+                ..Mount::default()
+            },
+        ),
+    ]);
+
+    let ResolvedIsolatedMounts {
+        named: mounts,
+        skipped,
+    } = resolve_isolated_named_mounts(&mounts, dir.path(), None, None, true)
+        .expect("custom-image mounts resolve without a managed state root");
+    assert_eq!(
+        skipped,
+        [
+            ("project", "cargo".into()),
+            ("shared", "codex".into()),
+            ("shared", "tools".into()),
+        ]
+    );
+    assert_eq!(
+        mounts
+            .iter()
+            .map(|mount| mount.name.as_str())
+            .collect::<Vec<_>>(),
+        ["docs"]
+    );
+    assert!(!needs_mount_lock(&mounts));
+}
+
+#[test]
+fn custom_image_mount_filter_rejects_home_relative_host_targets() {
+    let dir = TestDir::new("custom-image-home-target");
+    let mounts = BTreeMap::from([(
+        "docs".into(),
+        Mount {
+            kind: Some(MountKind::Host),
+            source: Some(dir.path().to_path_buf()),
+            target: Some(PathBuf::from("~/docs")),
+            ..Mount::default()
+        },
+    )]);
+
+    let message = resolve_isolated_named_mounts(&mounts, dir.path(), None, None, true)
+        .err()
+        .expect("custom images have no defined home for a home-relative target")
+        .to_string();
+
+    assert!(message.contains("host mount `docs`"), "{message}");
+    assert!(
+        message.contains("custom images have no Silo-defined home"),
+        "{message}"
+    );
+    assert!(message.contains("project-relative `./...`"), "{message}");
+}
+
+#[test]
+fn custom_image_mount_filter_keeps_project_relative_host_targets() {
+    let dir = TestDir::new("custom-image-project-target");
+    let mounts = BTreeMap::from([(
+        "docs".into(),
+        Mount {
+            kind: Some(MountKind::Host),
+            source: Some(dir.path().to_path_buf()),
+            target: Some(PathBuf::from("./docs")),
+            ..Mount::default()
+        },
+    )]);
+
+    let resolved = resolve_isolated_named_mounts(&mounts, dir.path(), None, None, true)
+        .expect("the project location is defined for custom images");
+
+    assert_eq!(resolved.named.len(), 1);
+    assert_eq!(
+        resolved.named[0].dest,
+        Path::new(CONTAINER_HOME)
+            .join(dir.path().file_name().expect("test project has a name"))
+            .join("docs")
+    );
+}
+
+#[test]
+fn isolated_start_attaches_input_and_output() {
+    let command = isolated_start_command("silo-123");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        ["start", "--attach", "--interactive", "silo-123"]
     );
 }
 
@@ -927,15 +1203,16 @@ fn mount_conflicts_reports_read_write_shared_over_git() {
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
         true,
-        &[ResolvedShared {
-            host: PathBuf::from("/home/user/git"),
-            dest: PathBuf::from("/home/silo/project/.git"),
-            permission: Permission::ReadWrite,
-        }],
+        &[resolved_host(
+            "git-state",
+            "/home/user/git",
+            "/home/silo/project/.git",
+            Permission::ReadWrite,
+        )],
     );
     assert_eq!(conflicts.len(), 1);
     let msg = &conflicts[0];
-    assert!(msg.contains("read-write shared mount"), "{msg}");
+    assert!(msg.contains("read-write mount"), "{msg}");
     assert!(msg.contains("`.git`"), "{msg}");
 }
 
@@ -946,15 +1223,16 @@ fn mount_conflicts_reports_read_write_shared_under_git() {
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
         true,
-        &[ResolvedShared {
-            host: PathBuf::from("/home/user/git"),
-            dest: PathBuf::from("/home/silo/project/.git/objects"),
-            permission: Permission::ReadWrite,
-        }],
+        &[resolved_host(
+            "git-objects",
+            "/home/user/git",
+            "/home/silo/project/.git/objects",
+            Permission::ReadWrite,
+        )],
     );
     assert_eq!(conflicts.len(), 1);
     assert!(
-        conflicts[0].contains("read-write shared mount"),
+        conflicts[0].contains("read-write mount"),
         "{}",
         conflicts[0]
     );
@@ -968,11 +1246,12 @@ fn mount_conflicts_keeps_gitignore_silent() {
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
         true,
-        &[ResolvedShared {
-            host: PathBuf::from("/home/user/gitignore"),
-            dest: PathBuf::from("/home/silo/project/.gitignore"),
-            permission: Permission::ReadWrite,
-        }],
+        &[resolved_host(
+            "gitignore",
+            "/home/user/gitignore",
+            "/home/silo/project/.gitignore",
+            Permission::ReadWrite,
+        )],
     );
     assert!(conflicts.is_empty());
 }
@@ -984,11 +1263,12 @@ fn mount_conflicts_keeps_ancestor_shared_silent() {
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
         true,
-        &[ResolvedShared {
-            host: PathBuf::from("/home/user/project"),
-            dest: PathBuf::from("/home/silo/project"),
-            permission: Permission::ReadWrite,
-        }],
+        &[resolved_host(
+            "project",
+            "/home/user/project",
+            "/home/silo/project",
+            Permission::ReadWrite,
+        )],
     );
     assert!(conflicts.is_empty());
 }
@@ -1000,11 +1280,12 @@ fn mount_conflicts_keeps_read_only_shared_over_git_silent() {
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
         true,
-        &[ResolvedShared {
-            host: PathBuf::from("/home/user/git"),
-            dest: PathBuf::from("/home/silo/project/.git"),
-            permission: Permission::ReadOnly,
-        }],
+        &[resolved_host(
+            "git",
+            "/home/user/git",
+            "/home/silo/project/.git",
+            Permission::ReadOnly,
+        )],
     );
     assert!(conflicts.is_empty());
 }
@@ -1014,13 +1295,36 @@ fn mount_conflicts_is_silent_without_overlaps() {
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
         true,
-        &[ResolvedShared {
-            host: PathBuf::from("/home/user/data"),
-            dest: PathBuf::from("/data"),
-            permission: Permission::ReadWrite,
-        }],
+        &[resolved_host(
+            "data",
+            "/home/user/data",
+            "/data",
+            Permission::ReadWrite,
+        )],
     );
     assert!(conflicts.is_empty());
+}
+
+#[test]
+fn mount_conflicts_reports_duplicate_target_and_deterministic_winner() {
+    let mounts = [
+        resolved_host("alpha", "/a", "/target", Permission::ReadOnly),
+        resolved_host("beta", "/b", "/target", Permission::ReadWrite),
+    ];
+    let conflicts = mount_conflicts(Path::new("/home/silo/project"), false, &mounts);
+    assert_eq!(conflicts.len(), 1);
+    assert!(conflicts[0].contains("`alpha`"), "{}", conflicts[0]);
+    assert!(
+        conflicts[0].contains("`beta` is applied later"),
+        "{}",
+        conflicts[0]
+    );
+    assert_eq!(
+        effective_mounts(&mounts)
+            .map(|mount| mount.name.as_str())
+            .collect::<Vec<_>>(),
+        ["beta"]
+    );
 }
 
 #[test]
@@ -1064,96 +1368,195 @@ fn git_mount_host_skips_git_escaping_the_project() {
 }
 
 #[test]
-fn resolve_shared_returns_empty_without_shared_mounts() {
-    let dir = TestDir::new("shared-empty");
-    let resolved = resolve_shared(&[], Some(dir.path())).expect("no shared mounts resolve");
+fn resolve_named_returns_empty_without_mounts() {
+    let dir = TestDir::new("mount-empty");
+    let resolved = resolve_named_mounts(&BTreeMap::new(), dir.path(), Some(dir.path()), None)
+        .expect("no named mounts resolve");
     assert!(resolved.is_empty());
 }
 
 #[cfg(unix)]
 #[test]
-fn resolve_shared_expands_tilde_and_canonicalizes_symlinks() {
+fn resolve_named_expands_tilde_and_canonicalizes_symlinks() {
     use std::os::unix::fs::symlink;
 
-    let dir = TestDir::new("shared-tilde");
+    let dir = TestDir::new("mount-tilde");
     let real = dir.path().join("real-agents");
     fs::create_dir_all(&real).expect("mkdir succeeds");
     symlink(&real, dir.path().join("agents")).expect("symlink succeeds");
-    let shared = [Shared {
-        source: PathBuf::from("~/agents"),
-        target: PathBuf::from("/home/silo/.agents"),
-        permission: Permission::ReadOnly,
-    }];
-    let resolved = resolve_shared(&shared, Some(dir.path())).expect("shared mount resolves");
+    let mounts = BTreeMap::from([(
+        "agents".to_string(),
+        Mount {
+            kind: Some(MountKind::Host),
+            source: Some(PathBuf::from("~/agents")),
+            target: Some(PathBuf::from("/home/silo/.agents")),
+            ..Mount::default()
+        },
+    )]);
+    let resolved =
+        resolve_named_mounts(&mounts, dir.path(), Some(dir.path()), None).expect("mount resolves");
     assert_eq!(
         resolved,
-        vec![ResolvedShared {
-            host: canonical(&real),
-            dest: PathBuf::from("/home/silo/.agents"),
-            permission: Permission::ReadOnly,
-        }]
+        vec![resolved_host(
+            "agents",
+            canonical(&real).to_str().expect("UTF-8"),
+            "/home/silo/.agents",
+            Permission::ReadOnly,
+        )]
     );
 }
 
 #[test]
-fn resolve_shared_keeps_absolute_sources() {
-    let dir = TestDir::new("shared-abs");
-    let source = dir.path().join("data");
-    fs::create_dir_all(&source).expect("mkdir succeeds");
-    let shared = [Shared {
-        source: source.clone(),
-        target: PathBuf::from("/data"),
-        permission: Permission::ReadWrite,
-    }];
-    let resolved = resolve_shared(&shared, Some(dir.path())).expect("shared mount resolves");
+fn resolve_named_builds_stable_host_backed_managed_mounts() {
+    let mounts = BTreeMap::from([
+        (
+            "cargo".to_string(),
+            Mount {
+                kind: Some(MountKind::ProjectState),
+                target: Some(PathBuf::from("~/.cargo")),
+                ..Mount::default()
+            },
+        ),
+        (
+            "codex".to_string(),
+            Mount {
+                kind: Some(MountKind::SharedState),
+                target: Some(PathBuf::from("~/.codex")),
+                ..Mount::default()
+            },
+        ),
+        (
+            "cargo-target".to_string(),
+            Mount {
+                kind: Some(MountKind::ProjectState),
+                target: Some(PathBuf::from("./target")),
+                ..Mount::default()
+            },
+        ),
+    ]);
+    let project = Path::new("/tmp/project");
+    let home = Path::new("/home/user");
+    let resolved =
+        resolve_named_mounts(&mounts, project, Some(home), None).expect("state resolves");
+    let cargo = resolved.iter().find(|mount| mount.name == "cargo").unwrap();
+    let codex = resolved.iter().find(|mount| mount.name == "codex").unwrap();
+    let target = resolved
+        .iter()
+        .find(|mount| mount.name == "cargo-target")
+        .unwrap();
+    let ResolvedMountSource::Managed(cargo_mount) = &cargo.source else {
+        panic!("project state becomes a managed mount");
+    };
+    let ResolvedMountSource::Managed(codex_mount) = &codex.source else {
+        panic!("shared state becomes a managed mount");
+    };
+    assert_eq!(cargo_mount.scope, StateScope::Project);
+    assert_eq!(cargo_mount.project.as_deref(), Some(project));
+    assert_eq!(codex_mount.scope, StateScope::Shared);
+    assert_eq!(codex_mount.project, None);
+    assert_eq!(target.dest, PathBuf::from("/home/silo/project/target"));
     assert_eq!(
-        resolved,
-        vec![ResolvedShared {
-            host: canonical(&source),
-            dest: PathBuf::from("/data"),
-            permission: Permission::ReadWrite,
-        }]
+        cargo_mount.path,
+        PathBuf::from(format!(
+            "/home/user/.local/state/silo/mounts/projects/{}/mounts/cargo",
+            project_digest(project)
+        ))
+    );
+    assert_eq!(
+        codex_mount.path,
+        PathBuf::from("/home/user/.local/state/silo/mounts/shared/codex")
+    );
+    assert_eq!(cargo.access, Permission::ReadWrite);
+    assert_eq!(codex.access, Permission::ReadWrite);
+    assert_eq!(
+        test_managed_mount(StateScope::Shared, "codex", None).id,
+        codex_mount.id
     );
 }
 
 #[test]
-fn resolve_shared_errors_on_missing_sources() {
-    let dir = TestDir::new("shared-missing");
-    let shared = [Shared {
-        source: PathBuf::from("~/nope"),
-        target: PathBuf::from("/home/silo/nope"),
-        permission: Permission::ReadOnly,
-    }];
-    let err = resolve_shared(&shared, Some(dir.path())).expect_err("missing source errors");
+fn resolve_named_errors_on_missing_host_source() {
+    let dir = TestDir::new("mount-missing");
+    let mounts = BTreeMap::from([(
+        "nope".to_string(),
+        Mount {
+            kind: Some(MountKind::Host),
+            source: Some(PathBuf::from("~/nope")),
+            target: Some(PathBuf::from("/home/silo/nope")),
+            ..Mount::default()
+        },
+    )]);
+    let err = resolve_named_mounts(&mounts, dir.path(), Some(dir.path()), None)
+        .expect_err("missing source errors");
     let msg = err.to_string();
     assert!(msg.contains("cannot resolve source"), "{msg}");
-    assert!(msg.contains("`~/nope`"), "{msg}");
-    assert!(msg.contains("/home/silo/nope"), "{msg}");
+    assert!(msg.contains("host mount `nope`"), "{msg}");
 }
 
 #[test]
-fn resolve_shared_keeps_config_order() {
-    let dir = TestDir::new("shared-order");
-    let first = dir.path().join("a");
-    let second = dir.path().join("b");
-    fs::create_dir_all(&first).expect("mkdir succeeds");
-    fs::create_dir_all(&second).expect("mkdir succeeds");
-    let shared = [
-        Shared {
-            source: PathBuf::from("~/a"),
-            target: PathBuf::from("/mnt/shared"),
-            permission: Permission::ReadOnly,
+fn resolve_named_rejects_regular_file_host_sources() {
+    let dir = TestDir::new("mount-file");
+    let file = dir.path().join("settings.toml");
+    fs::write(&file, "setting = true").expect("file writes");
+    let mounts = BTreeMap::from([(
+        "settings".to_string(),
+        Mount {
+            kind: Some(MountKind::Host),
+            source: Some(file),
+            target: Some(PathBuf::from("/home/silo/settings.toml")),
+            ..Mount::default()
         },
-        Shared {
-            source: PathBuf::from("~/b"),
-            target: PathBuf::from("/mnt/shared"),
-            permission: Permission::ReadWrite,
-        },
-    ];
-    let resolved = resolve_shared(&shared, Some(dir.path())).expect("shared mounts resolve");
-    assert_eq!(resolved.len(), 2);
-    assert_eq!(resolved[0].host, canonical(&first));
-    assert_eq!(resolved[1].host, canonical(&second));
+    )]);
+
+    let message = resolve_named_mounts(&mounts, dir.path(), Some(dir.path()), None)
+        .expect_err("regular files are not supported host mounts")
+        .to_string();
+    assert!(message.contains("host mount `settings`"), "{message}");
+    assert!(message.contains("must be a directory"), "{message}");
+}
+
+#[test]
+fn resolve_named_orders_parents_before_children_then_names() {
+    let mounts = BTreeMap::from([
+        (
+            "later".to_string(),
+            Mount {
+                kind: Some(MountKind::SharedState),
+                target: Some(PathBuf::from("/same")),
+                ..Mount::default()
+            },
+        ),
+        (
+            "earlier".to_string(),
+            Mount {
+                kind: Some(MountKind::SharedState),
+                target: Some(PathBuf::from("/same")),
+                ..Mount::default()
+            },
+        ),
+        (
+            "child".to_string(),
+            Mount {
+                kind: Some(MountKind::ProjectState),
+                target: Some(PathBuf::from("/same/child")),
+                ..Mount::default()
+            },
+        ),
+    ]);
+    let resolved = resolve_named_mounts(
+        &mounts,
+        Path::new("/tmp/project"),
+        Some(Path::new("/home/user")),
+        None,
+    )
+    .expect("mounts resolve");
+    assert_eq!(
+        resolved
+            .iter()
+            .map(|mount| mount.name.as_str())
+            .collect::<Vec<_>>(),
+        ["earlier", "later", "child"]
+    );
 }
 
 #[test]
@@ -1202,6 +1605,176 @@ fn expand_tilde_with_empty_home_keeps_tilde_paths() {
         expand_tilde(Path::new("~/notes"), Some(Path::new(""))),
         PathBuf::from("~/notes")
     );
+}
+
+#[test]
+fn managed_mount_root_prefers_absolute_xdg_and_falls_back_to_home() {
+    assert_eq!(
+        managed_mount_root(Some(Path::new("/var/state")), Some(Path::new("/home/user")))
+            .expect("absolute XDG state home works"),
+        PathBuf::from("/var/state/silo/mounts")
+    );
+    assert_eq!(
+        managed_mount_root(Some(Path::new("relative")), Some(Path::new("/home/user")))
+            .expect("relative XDG state home is ignored"),
+        PathBuf::from("/home/user/.local/state/silo/mounts")
+    );
+    assert!(managed_mount_root(None, Some(Path::new("relative"))).is_err());
+    assert!(managed_mount_root(Some(Path::new("relative")), Some(Path::new("relative"))).is_err());
+    assert!(managed_mount_root(None, None).is_err());
+}
+
+#[test]
+fn mount_inventory_reports_an_unavailable_state_root() {
+    for (xdg_state_home, home) in [
+        (None, None),
+        (Some(Path::new("")), Some(Path::new(""))),
+        (
+            Some(Path::new("relative-state")),
+            Some(Path::new("relative-home")),
+        ),
+    ] {
+        let message = mount_inventory_for_env(xdg_state_home, home)
+            .err()
+            .expect("an unavailable managed-state root must be reported")
+            .to_string();
+        assert!(
+            message.contains("XDG_STATE_HOME or HOME to be absolute"),
+            "{message}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_mounts_are_created_private_and_reject_symlinks() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let dir = TestDir::new("managed-mount");
+    let mount = managed_mount_at_root(StateScope::Shared, "codex", None, dir.path());
+    ensure_managed_mount(&mount).expect("managed directory is created");
+    for path in [
+        dir.path().to_path_buf(),
+        dir.path().join("shared"),
+        mount.path.clone(),
+    ] {
+        assert_eq!(
+            fs::metadata(path)
+                .expect("metadata exists")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    let target = dir.path().join("target");
+    fs::create_dir(&target).expect("target exists");
+    let link = managed_mount_at_root(StateScope::Shared, "linked", None, dir.path());
+    symlink(&target, &link.path).expect("symlink exists");
+    assert!(ensure_managed_mount(&link).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn project_mount_metadata_round_trips_raw_paths_and_drives_inventory() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TestDir::new("project-mount-metadata");
+    let project = Path::new(OsStr::from_bytes(b"/work/non-utf8-\xFF"));
+    let mount = managed_mount_at_root(StateScope::Project, "cargo", Some(project), dir.path());
+    ensure_managed_mount(&mount).expect("project mount is created");
+
+    let project_dir = mount.path.parent().unwrap().parent().unwrap();
+    let metadata = project_dir.join(PROJECT_ROOT_METADATA);
+    assert_eq!(
+        fs::read(&metadata).expect("metadata reads"),
+        project.as_os_str().as_bytes()
+    );
+    for path in [
+        dir.path(),
+        &dir.path().join("projects"),
+        project_dir,
+        mount.path.parent().unwrap(),
+        &mount.path,
+    ] {
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "{} is private",
+            path.display()
+        );
+    }
+    assert_eq!(
+        fs::metadata(&metadata).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let inventory = mount_inventory_at(dir.path());
+    assert!(inventory.warnings.is_empty(), "{:?}", inventory.warnings);
+    assert_eq!(inventory.items, [MountInfo(mount)]);
+}
+
+#[test]
+fn project_mount_inventory_rejects_metadata_digest_mismatches() {
+    let dir = TestDir::new("project-mount-bad-metadata");
+    let project = Path::new("/work/project");
+    let mount = managed_mount_at_root(StateScope::Project, "cargo", Some(project), dir.path());
+    ensure_managed_mount(&mount).expect("project mount is created");
+    let project_dir = mount.path.parent().unwrap().parent().unwrap();
+    fs::write(
+        project_dir.join(PROJECT_ROOT_METADATA),
+        "/different/project",
+    )
+    .expect("metadata is corrupted");
+    assert!(ensure_managed_mount(&mount).is_err());
+
+    let inventory = mount_inventory_at(dir.path());
+    assert!(inventory.items.is_empty());
+    assert!(
+        inventory
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("does not match its digest")),
+        "{:?}",
+        inventory.warnings
+    );
+}
+
+#[test]
+fn final_project_mount_cleanup_removes_metadata_directory() {
+    let dir = TestDir::new("project-mount-cleanup");
+    let project = Path::new("/work/project");
+    let mount = managed_mount_at_root(StateScope::Project, "cargo", Some(project), dir.path());
+    ensure_managed_mount(&mount).expect("project mount is created");
+    let project_dir = mount.path.parent().unwrap().parent().unwrap().to_path_buf();
+    fs::remove_dir_all(&mount.path).expect("mount data is deleted");
+    prune_empty_project_mount_directory(&mount.path).expect("empty project metadata is pruned");
+    assert!(!project_dir.exists());
+}
+
+#[test]
+fn managed_mount_lock_serializes_competing_operations() {
+    let dir = TestDir::new("managed-mount-lock");
+    let first = MountLock::acquire_at(dir.path()).expect("first lock succeeds");
+    let root = dir.path().to_path_buf();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let contender = std::thread::spawn(move || {
+        let second = MountLock::acquire_at(&root).expect("second lock succeeds");
+        sender.send(()).expect("notification sends");
+        drop(second);
+    });
+
+    assert!(
+        receiver.recv_timeout(Duration::from_millis(100)).is_err(),
+        "the competing operation must wait while creation or deletion owns the lock"
+    );
+    drop(first);
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the competing operation resumes after unlock");
+    contender.join().expect("contender exits");
 }
 
 #[test]
@@ -1326,7 +1899,7 @@ fn discovered_project_root_drives_shared_and_isolated_mounts() {
     let mounts = ConfigMounts::default();
     let expected = format!("{}:/home/silo/workspace", project.root.display());
 
-    let isolated = isolated_run_command(
+    let isolated = isolated_create_command(
         false,
         &project.root,
         &ids,
@@ -1346,8 +1919,8 @@ fn discovered_project_root_drives_shared_and_isolated_mounts() {
     )
     .expect("shared command builds");
 
-    assert_eq!(volume_specs(&isolated), std::slice::from_ref(&expected));
-    assert_eq!(volume_specs(&shared), [expected]);
+    assert_eq!(bind_specs(&isolated), std::slice::from_ref(&expected));
+    assert_eq!(bind_specs(&shared), [expected]);
     assert_eq!(
         project_digest(&project.root),
         project_digest(&canonical(&root))
@@ -1528,7 +2101,7 @@ fn guest_readiness_probe_targets_the_explicit_marker() {
 }
 
 #[test]
-fn stop_guard_uses_the_current_embedded_protocol_for_stale_containers() {
+fn stop_guard_uses_the_current_embedded_script_for_stale_containers() {
     let command = stop_guard_command("silo-old");
     let args: Vec<&str> = command
         .get_args()
@@ -1683,6 +2256,26 @@ fn inspect_parser_accepts_current_nested_state() {
 }
 
 #[test]
+fn inspect_parser_reads_bind_sources_for_safe_mount_deletion() {
+    let json = br#"[{
+        "id":"silo-test",
+        "configuration":{"mounts":[
+            {"type":"bind","source":"/home/user/.local/state/silo/mounts/shared/codex","destination":"/home/silo/.codex"},
+            {"type":"bind","source":"/home/user/.local/state/silo/mounts/projects/abc/mounts/cache","destination":"/cache"}
+        ]},
+        "status":{"state":"running"}
+    }]"#;
+    let inspection = parse_container_inspection(json, "silo-test").expect("mounts parse");
+    assert_eq!(
+        inspection.mount_sources,
+        [
+            PathBuf::from("/home/user/.local/state/silo/mounts/shared/codex"),
+            PathBuf::from("/home/user/.local/state/silo/mounts/projects/abc/mounts/cache")
+        ]
+    );
+}
+
+#[test]
 fn inspect_parser_accepts_legacy_flat_state() {
     let json = br#"[{"configuration":{"id":"silo-test"},"status":"stopped"}]"#;
     assert_eq!(
@@ -1763,6 +2356,87 @@ fn inspect_parser_accepts_label_array_shape() {
     );
 }
 
+#[test]
+fn mount_selectors_support_ids_names_paths_and_report_ambiguity() {
+    let first = MountInfo(test_managed_mount(
+        StateScope::Project,
+        "cargo",
+        Some(Path::new("/one/project")),
+    ));
+    let second = MountInfo(test_managed_mount(
+        StateScope::Project,
+        "cargo",
+        Some(Path::new("/two/project")),
+    ));
+    let shared = MountInfo(test_managed_mount(StateScope::Shared, "codex", None));
+    let items = [first, second, shared];
+
+    assert_eq!(
+        select_mount(&items, "codex").expect("logical name resolves"),
+        &items[2]
+    );
+    assert_eq!(
+        select_mount(&items, "/one/project").expect("project path resolves"),
+        &items[0]
+    );
+    assert_eq!(
+        select_mount(&items, &items[0].0.id).expect("exact ID resolves"),
+        &items[0]
+    );
+    let message = select_mount(&items, "cargo")
+        .expect_err("duplicate logical names are ambiguous")
+        .to_string();
+    assert!(message.contains(&items[0].0.id), "{message}");
+    assert!(message.contains(&items[1].0.id), "{message}");
+}
+
+#[test]
+fn mount_selector_reports_project_and_logical_name_collisions() {
+    let project = MountInfo(test_managed_mount(
+        StateScope::Project,
+        "cargo",
+        Some(Path::new("/work/codex")),
+    ));
+    let shared = MountInfo(test_managed_mount(StateScope::Shared, "codex", None));
+    let items = [project, shared];
+
+    let message = select_mount(&items, "codex")
+        .expect_err("cross-category collision must be ambiguous")
+        .to_string();
+    assert!(message.contains(&items[0].0.id), "{message}");
+    assert!(message.contains(&items[1].0.id), "{message}");
+    assert_eq!(
+        select_mount(&items, "/work/codex").expect("exact project path is unambiguous"),
+        &items[0]
+    );
+}
+
+#[test]
+fn mount_table_shows_identity_scope_name_project_and_source() {
+    let item = MountInfo(test_managed_mount(
+        StateScope::Project,
+        "cargo",
+        Some(Path::new("/work/project")),
+    ));
+    let rendered = render_mount_table(std::slice::from_ref(&item));
+    for expected in [
+        "ID",
+        "SCOPE",
+        "NAME",
+        "PROJECT",
+        "SOURCE",
+        "project",
+        "cargo",
+        "silo/mounts",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}: {rendered}"
+        );
+    }
+    assert!(rendered.contains(&item.0.id), "{rendered}");
+}
+
 fn shared_identity(project: &Project) -> ContainerIdentity {
     container_identity(
         project,
@@ -1792,6 +2466,7 @@ fn shared_inspection(project: &Project, identity: &ContainerIdentity) -> Contain
             (LABEL_SPEC.to_string(), identity.spec.clone()),
         ]),
         image: Some(IMAGE_TAG.to_string()),
+        mount_sources: Vec::new(),
     }
 }
 
@@ -1813,6 +2488,7 @@ fn inspect_identity_refuses_foreign_containers_including_buildkit() {
         state: ContainerState::Running,
         labels: HashMap::new(),
         image: None,
+        mount_sources: Vec::new(),
     };
 
     let error = validate_shared_container(&foreign, &project, &identity)
@@ -2022,6 +2698,7 @@ fn isolated_orphan_cleanup_requires_complete_runtime_ownership_labels() {
             (LABEL_SPEC.to_string(), identity.spec),
         ]),
         image: Some(IMAGE_TAG.to_string()),
+        mount_sources: Vec::new(),
     };
     assert!(is_owned_isolated(&inspection));
 
@@ -2050,11 +2727,12 @@ fn specification_digest_is_deterministic_and_creation_sensitive() {
     let project = test_project("/tmp/project");
     let base = shared_identity(&project);
     let mut mounts = ConfigMounts::default();
-    mounts.shared.push(ResolvedShared {
-        host: PathBuf::from("/tmp/shared"),
-        dest: PathBuf::from("/home/silo/shared"),
-        permission: Permission::ReadOnly,
-    });
+    mounts.named.push(resolved_host(
+        "shared",
+        "/tmp/shared",
+        "/home/silo/shared",
+        Permission::ReadOnly,
+    ));
     let changed = container_identity(
         &project,
         &HostIds {
@@ -2118,36 +2796,6 @@ fn specification_digest_tracks_resource_limits() {
 }
 
 #[test]
-fn developer_image_revision_invalidates_previous_shared_containers() {
-    let project = test_project("/tmp/project");
-    let ids = HostIds {
-        uid: "501".into(),
-        gid: "20".into(),
-    };
-    let mounts = ConfigMounts::default();
-    let command = [OsString::from(SHARED_INIT_COMMAND)];
-    let current = container_identity(
-        &project,
-        &ids,
-        &mounts,
-        &Container::default(),
-        LABEL_SHARED_VALUE,
-        &command,
-    );
-    let previous_image = container_identity_for_protocol(
-        &project,
-        &ids,
-        &mounts,
-        &Container::default(),
-        LABEL_SHARED_VALUE,
-        &command,
-        "4",
-    );
-
-    assert_ne!(current.spec, previous_image.spec);
-}
-
-#[test]
 fn embedded_image_contains_guest_lifecycle_programs() {
     assert!(DOCKERFILE.contains("COPY silo-supervisor.sh"));
     assert!(DOCKERFILE.contains("COPY silo-session.sh"));
@@ -2163,6 +2811,9 @@ fn embedded_image_contains_guest_lifecycle_programs() {
     assert!(STATUS_HELPER.contains("count=$((count + 1))"));
     assert!(STOP_GUARD.contains("flock --exclusive --nonblock"));
     assert!(SESSION_WRAPPER.contains("exec \"$@\""));
+    assert!(!DOCKERFILE.contains("SILO_STATE_TARGETS"));
+    assert!(!DOCKERFILE.contains("silo-init-state"));
+    assert!(!DOCKERFILE.contains("os.lchown"));
 }
 
 #[test]

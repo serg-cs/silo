@@ -8,21 +8,33 @@ mod cli;
 mod config;
 mod container;
 
-use cli::{Cli, Command, ContainersCommand, ImageCommand};
+use cli::{Cli, Command, ContainersCommand, ImageCommand, MountsCommand};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Command::Containers { command } = &cli.command {
-        let result = match command {
-            None | Some(ContainersCommand::List) => container::print_containers(),
-            Some(ContainersCommand::Stop { selector, force }) => {
-                container::stop_container(selector, *force)
-            }
-            Some(ContainersCommand::Delete { selector, force }) => {
-                container::delete_selected_container(selector, *force)
-            }
-        };
-        return result.unwrap_or_else(|err| fail(&err));
+    match &cli.command {
+        Command::Containers { command } => {
+            let result = match command {
+                None | Some(ContainersCommand::List) => container::print_containers(),
+                Some(ContainersCommand::Stop { selector, force }) => {
+                    container::stop_container(selector, *force)
+                }
+                Some(ContainersCommand::Delete { selector, force }) => {
+                    container::delete_selected_container(selector, *force)
+                }
+            };
+            return result.unwrap_or_else(|err| fail(&err));
+        }
+        Command::Mounts { command } => {
+            let result = match command {
+                None | Some(MountsCommand::List) => container::print_mounts(),
+                Some(MountsCommand::Delete { selector }) => {
+                    container::delete_selected_mount(selector)
+                }
+            };
+            return result.unwrap_or_else(|err| fail(&err));
+        }
+        _ => {}
     }
     let project = match container::Project::current() {
         Ok(project) => project,
@@ -47,7 +59,9 @@ fn main() -> ExitCode {
         Command::Run { isolated, command } => {
             container::run_image(&config, &project, &command, isolated)
         }
-        Command::Containers { .. } => unreachable!("container commands returned before config"),
+        Command::Containers { .. } | Command::Mounts { .. } => {
+            unreachable!("management commands returned before config")
+        }
         Command::Quick(args) => quick_command(&config, &args)
             .and_then(|command| container::run_image(&config, &project, &command, false)),
     };
@@ -259,7 +273,7 @@ mod tests {
     #[test]
     fn builtin_commands_covers_the_project_command_set() {
         let names = builtin_commands();
-        for expected in ["run", "containers", "image", "help"] {
+        for expected in ["run", "containers", "mounts", "image", "help"] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "missing {expected}"
@@ -299,6 +313,37 @@ mod tests {
             assert_eq!(selector, "project");
             assert!(force);
         }
+    }
+
+    #[test]
+    fn mounts_defaults_to_list_and_parses_delete_alias() {
+        assert!(matches!(
+            parse(&["silo", "mounts"]),
+            Command::Mounts { command: None }
+        ));
+        assert!(matches!(
+            parse(&["silo", "mounts", "list"]),
+            Command::Mounts {
+                command: Some(MountsCommand::List)
+            }
+        ));
+        for command in ["delete", "rm"] {
+            let Command::Mounts {
+                command: Some(MountsCommand::Delete { selector }),
+            } = parse(&["silo", "mounts", command, "cargo"])
+            else {
+                panic!("expected mount delete");
+            };
+            assert_eq!(selector, "cargo");
+        }
+    }
+
+    #[test]
+    fn state_is_not_retained_as_a_management_alias() {
+        let Command::Quick(arguments) = parse(&["silo", "state"]) else {
+            panic!("state should no longer be a built-in command");
+        };
+        assert_eq!(arguments, ["state"]);
     }
 
     #[test]

@@ -6,11 +6,12 @@
 //! every key has a default, so a missing or partial file always yields a
 //! usable [`Config`]. Project settings are partial and replace explicitly
 //! present global options. Precedence is `defaults < global config < project
-//! config < CLI flags`.
+//! config < CLI flags`. Named mounts are the exception to whole-collection
+//! replacement: project entries overlay global entries by name and field.
 //!
 //! On top of the built-in mounts (the shared project directory and the
-//! optional read-only `.git`), the `shared` option mounts additional host
-//! paths into the container, each read-only or read-write (see [`Shared`]).
+//! optional read-only `.git`), the `mounts` table provides named host mounts
+//! and managed project- or user-scoped persistent state.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -18,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Error as _};
 
 /// Contents of the concise starter config file created on first use.
 const DEFAULT_CONFIG: &str = include_str!("default.toml");
@@ -37,10 +38,11 @@ pub struct Config {
     /// Whether the project's `.git` directory is mounted read-only in the
     /// container, so tools inside it cannot modify version control state.
     pub read_only_git: bool,
-    /// Configurable shared mounts, applied when a project's shared container
-    /// is created: each entry mounts a host `source` at container `target`,
-    /// read-only or read-write. `silo stop` and the next run recreate them.
-    pub shared: Vec<Shared>,
+    /// Named configurable mounts, grouped under `mounts.host`,
+    /// `mounts.project`, and `mounts.shared`. Project configuration overlays
+    /// these by name and field.
+    #[serde(default, deserialize_with = "deserialize_mounts")]
+    pub mounts: BTreeMap<String, Mount>,
     /// Quick commands: `silo <name>` runs this command inside the container
     /// without typing `silo run --` every time. The key is what you type;
     /// the value is the command (and any fixed arguments) executed inside
@@ -50,8 +52,8 @@ pub struct Config {
 
 /// Partial configuration read from a project's `.silo.toml`.
 ///
-/// Collection fields are optional so omission can inherit the global value,
-/// while an explicitly empty collection can clear it.
+/// Collection fields are optional so omission can inherit the global value.
+/// Quick commands replace as a collection; named mounts merge by entry.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ProjectConfig {
@@ -59,7 +61,8 @@ struct ProjectConfig {
     container: ProjectContainer,
     shell: Option<Shell>,
     read_only_git: Option<bool>,
-    shared: Option<Vec<Shared>>,
+    #[serde(default, deserialize_with = "deserialize_optional_mounts")]
+    mounts: Option<BTreeMap<String, Mount>>,
     quick: Option<BTreeMap<String, Vec<String>>>,
 }
 
@@ -88,7 +91,7 @@ impl Default for Config {
             shell: None,
             // Protection on by default; disable it in the config file.
             read_only_git: true,
-            shared: Vec::new(),
+            mounts: BTreeMap::new(),
             quick: BTreeMap::new(),
         }
     }
@@ -125,27 +128,151 @@ pub enum Shell {
     Nu,
 }
 
-/// One configurable shared mount: `source` on the host is mounted into the
-/// container at `target`, with the given [`Permission`].
-#[derive(Debug, Clone, Deserialize)]
-pub struct Shared {
-    /// Path on the host to mount: an absolute path, or a `~`-prefixed path
-    /// like `~/notes` (a bare `~` is the home directory itself; expanded when
-    /// the shared container is created; `~user` paths are not supported).
-    /// The path must exist at creation or the run fails.
-    pub source: PathBuf,
-    /// Absolute path inside the container where the source is mounted.
-    pub target: PathBuf,
-    /// How the mount may be used inside the container. Defaults to
-    /// [`Permission::ReadOnly`] — protection on by default, like
-    /// `read_only_git`.
-    #[serde(default = "default_permission")]
-    pub permission: Permission,
+/// One normalized layer of a named mount definition. The config-facing
+/// category selects `kind`; this representation keeps the container layer and
+/// global/project merging independent of TOML layout.
+#[derive(Debug, Clone, Default)]
+pub struct Mount {
+    pub enabled: Option<bool>,
+    pub kind: Option<MountKind>,
+    pub source: Option<PathBuf>,
+    pub target: Option<PathBuf>,
+    pub writable: Option<bool>,
 }
 
-/// How a shared mount may be used inside the container. An enum rather
-/// than a boolean, so new permissions can be added later without reshaping
-/// the config schema.
+impl Mount {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn kind(&self) -> Option<MountKind> {
+        self.kind
+    }
+
+    pub fn host_source(&self) -> Option<&Path> {
+        (self.kind == Some(MountKind::Host))
+            .then_some(self.source.as_deref())
+            .flatten()
+    }
+
+    pub fn effective_target(&self, project_dir: &Path) -> Option<PathBuf> {
+        let target = self.target.as_deref()?;
+        if target.is_absolute() {
+            Some(target.to_path_buf())
+        } else {
+            let text = target.to_str()?;
+            text.strip_prefix("~/")
+                .map(|relative| Path::new(CONTAINER_HOME).join(relative))
+                .or_else(|| {
+                    text.strip_prefix("./")
+                        .map(|relative| project_dir.join(relative))
+                })
+        }
+    }
+
+    pub fn effective_access(&self) -> Permission {
+        match self.kind() {
+            Some(MountKind::Host) | None if !self.writable.unwrap_or(false) => Permission::ReadOnly,
+            Some(MountKind::Host | MountKind::ProjectState | MountKind::SharedState) | None => {
+                Permission::ReadWrite
+            }
+        }
+    }
+}
+
+/// Config-facing mount categories. Keeping the category outside each entry
+/// makes `source` and `target` mean the same thing everywhere they appear.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct MountTables {
+    host: BTreeMap<String, HostMount>,
+    project: BTreeMap<String, ManagedMount>,
+    shared: BTreeMap<String, ManagedMount>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct HostMount {
+    enabled: Option<bool>,
+    source: Option<PathBuf>,
+    target: Option<PathBuf>,
+    writable: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ManagedMount {
+    enabled: Option<bool>,
+    target: Option<PathBuf>,
+}
+
+fn deserialize_mounts<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, Mount>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let tables = MountTables::deserialize(deserializer)?;
+    let mut mounts = BTreeMap::new();
+    for (name, entry) in tables.host {
+        mounts.insert(
+            name,
+            Mount {
+                enabled: entry.enabled,
+                kind: Some(MountKind::Host),
+                source: entry.source,
+                target: entry.target,
+                writable: entry.writable,
+            },
+        );
+    }
+    for (kind, entries) in [
+        (MountKind::ProjectState, tables.project),
+        (MountKind::SharedState, tables.shared),
+    ] {
+        for (name, entry) in entries {
+            if mounts.contains_key(&name) {
+                return Err(D::Error::custom(format!(
+                    "mount `{name}` is defined in more than one category"
+                )));
+            }
+            mounts.insert(
+                name,
+                Mount {
+                    enabled: entry.enabled,
+                    kind: Some(kind),
+                    source: None,
+                    target: entry.target,
+                    writable: None,
+                },
+            );
+        }
+    }
+    Ok(mounts)
+}
+
+fn deserialize_optional_mounts<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<BTreeMap<String, Mount>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_mounts(deserializer).map(Some)
+}
+
+/// The source and sharing lifetime of a named mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MountKind {
+    /// Existing host content, bind-mounted into the container.
+    Host,
+    /// Silo-managed storage private to one canonical project path.
+    ProjectState,
+    /// Silo-managed storage reused by every project with the same mount name.
+    SharedState,
+}
+
+/// Effective access passed to the container runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Permission {
@@ -153,11 +280,6 @@ pub enum Permission {
     ReadOnly,
     /// The container can read and modify the source.
     ReadWrite,
-}
-
-/// Shared mounts are read-only unless the config says otherwise.
-fn default_permission() -> Permission {
-    Permission::ReadOnly
 }
 
 impl Config {
@@ -179,9 +301,9 @@ impl Config {
     /// Loads the global configuration and applies `.silo.toml` from
     /// `project_root` when it exists.
     ///
-    /// Relative project Dockerfile and shared-source paths are resolved from
-    /// the project root. Project collection options replace their global
-    /// counterparts completely, including when explicitly empty.
+    /// Relative project Dockerfile and host-mount source paths are resolved
+    /// from the project root. Mounts merge by name and field; quick commands
+    /// still replace their global collection when explicitly supplied.
     ///
     /// # Errors
     ///
@@ -206,7 +328,11 @@ impl Config {
         }
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file `{}`", path.display()))?;
-        let (config, unknown_keys) = Self::parse_with_unknown_keys(&text)
+        let (mut config, unknown_keys) = Self::deserialize_with_unknown_keys(&text)
+            .with_context(|| format!("invalid config in `{}`", path.display()))?;
+        config.resolve_mount_sources(path.parent().unwrap_or(Path::new(".")));
+        config
+            .validate()
             .with_context(|| format!("invalid config in `{}`", path.display()))?;
         warn_unknown_keys(path, &unknown_keys);
         Ok(config)
@@ -248,8 +374,15 @@ impl Config {
         if let Some(read_only_git) = project.read_only_git {
             self.read_only_git = read_only_git;
         }
-        if let Some(shared) = project.shared {
-            self.shared = shared;
+        if let Some(mounts) = project.mounts {
+            for (name, overlay) in mounts {
+                match self.mounts.get_mut(&name) {
+                    Some(base) => merge_mount(base, overlay),
+                    None => {
+                        self.mounts.insert(name, overlay);
+                    }
+                }
+            }
         }
         if let Some(quick) = project.quick {
             self.quick = quick;
@@ -270,10 +403,19 @@ impl Config {
 
     /// Parses and validates config text while retaining the paths of fields
     /// ignored by Serde so file-loading callers can warn about likely typos.
+    #[cfg(test)]
     fn parse_with_unknown_keys(text: &str) -> Result<(Self, Vec<String>)> {
-        let (config, unknown_keys) = deserialize_toml::<Self>(text)?;
+        let (config, unknown_keys) = Self::deserialize_with_unknown_keys(text)?;
         config.validate()?;
         Ok((config, unknown_keys))
+    }
+
+    fn deserialize_with_unknown_keys(text: &str) -> Result<(Self, Vec<String>)> {
+        Ok(deserialize_toml::<Self>(text)?)
+    }
+
+    fn resolve_mount_sources(&mut self, base: &Path) {
+        resolve_mount_sources(&mut self.mounts, base);
     }
 
     /// Returns an error when a quick command name can never be reached: a
@@ -316,13 +458,9 @@ impl Config {
         ))
     }
 
-    /// Rejects impossible resource limits, plus shared mounts that can never
-    /// be mounted: an empty source or target, an unresolved source that is
-    /// neither absolute nor `~`-prefixed (`~user` paths are unsupported), a
-    /// target that is not an absolute container path, or a path the container
-    /// CLI cannot parse (valid UTF-8 without `:`). Whether a shared source
-    /// actually exists is checked later at `silo run`, since the file system
-    /// can change between commands.
+    /// Rejects impossible resource limits and incomplete or malformed enabled
+    /// mounts. Host source existence is checked later at `silo run`, since the
+    /// file system can change between commands.
     ///
     /// # Errors
     ///
@@ -345,28 +483,35 @@ impl Config {
             ));
         }
         let mut problems: Vec<String> = Vec::new();
-        for (index, entry) in self.shared.iter().enumerate() {
-            let label = format!(
-                "shared entry {} (`{}` -> `{}`)",
-                index + 1,
-                entry.source.display(),
-                entry.target.display()
-            );
-            if entry.source.as_os_str().is_empty() {
-                problems.push(format!("{label}: source path is empty"));
-            } else if !entry.source.is_absolute() && !entry.source.starts_with("~") {
+        for (name, entry) in &self.mounts {
+            let label = format!("mount `{name}`");
+            if !valid_mount_name(name) {
                 problems.push(format!(
-                    "{label}: source path is not absolute and does not start with a bare `~`; use an absolute path or a `~`-prefixed path like `~/notes` (expanded to your home directory; `~user` paths are not supported)"
+                    "{label}: name must start with an ASCII letter or number and contain only ASCII letters, numbers, `_`, or `-`"
                 ));
-            } else if let Err(reason) = spec_path(&entry.source) {
+            }
+            if let Some(source) = &entry.source
+                && let Err(reason) = config_path_reason(source, false)
+            {
                 problems.push(format!("{label}: source {reason}"));
             }
-            if entry.target.as_os_str().is_empty() {
-                problems.push(format!("{label}: target path is empty"));
-            } else if !entry.target.is_absolute() {
-                problems.push(format!("{label}: target path is not absolute"));
-            } else if let Err(reason) = spec_path(&entry.target) {
+            if let Some(target) = &entry.target
+                && let Err(reason) = container_path_reason(target)
+            {
                 problems.push(format!("{label}: target {reason}"));
+            }
+            if !entry.is_enabled() {
+                continue;
+            }
+            let Some(kind) = entry.kind else {
+                problems.push(format!("{label}: enabled entry has no mount category"));
+                continue;
+            };
+            if entry.target.is_none() {
+                problems.push(format!("{label}: enabled entry is missing `target`"));
+            }
+            if kind == MountKind::Host && entry.source.is_none() {
+                problems.push(format!("{label}: host entry is missing `source`"));
             }
         }
         if problems.is_empty() {
@@ -378,7 +523,7 @@ impl Config {
             "entries"
         };
         Err(anyhow!(
-            "invalid shared {noun} in the `shared` config option: {}",
+            "invalid mount {noun} in the `mounts` config option: {}",
             problems.join("; ")
         ))
     }
@@ -428,28 +573,112 @@ impl ProjectConfig {
         {
             *dockerfile = project_root.join(&*dockerfile);
         }
-        if let Some(shared) = &mut self.shared {
-            for entry in shared {
-                if !entry.source.as_os_str().is_empty()
-                    && entry.source.is_relative()
-                    && !entry.source.as_os_str().to_string_lossy().starts_with('~')
-                {
-                    entry.source = project_root.join(&entry.source);
-                }
-            }
+        if let Some(mounts) = &mut self.mounts {
+            resolve_mount_sources(mounts, project_root);
         }
     }
 }
 
-/// Returns `Ok` when `path` can appear in a container volume spec: valid
-/// UTF-8 without `:` (the `:` separates the host and container sides of the
-/// spec).
-fn spec_path(path: &Path) -> Result<()> {
+fn merge_mount(base: &mut Mount, overlay: Mount) {
+    let overlay_kind = overlay.kind();
+    if overlay_kind.is_some() && overlay_kind != base.kind() {
+        base.source = None;
+        base.target = None;
+        base.writable = None;
+    }
+    if overlay.enabled.is_some() {
+        base.enabled = overlay.enabled;
+    }
+    if overlay.kind.is_some() {
+        base.kind = overlay.kind;
+    }
+    if overlay.source.is_some() {
+        base.source = overlay.source;
+    }
+    if overlay.target.is_some() {
+        base.target = overlay.target;
+    }
+    if overlay.writable.is_some() {
+        base.writable = overlay.writable;
+    }
+}
+
+fn resolve_mount_sources(mounts: &mut BTreeMap<String, Mount>, base: &Path) {
+    for entry in mounts.values_mut() {
+        let Some(source) = &mut entry.source else {
+            continue;
+        };
+        if !source.as_os_str().is_empty()
+            && source.is_relative()
+            && !source.as_os_str().to_string_lossy().starts_with('~')
+        {
+            *source = base.join(&*source);
+        }
+    }
+}
+
+const CONTAINER_HOME: &str = "/home/silo";
+
+fn container_path_reason(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(anyhow!("path is empty"));
+    }
     let text = path
         .to_str()
         .ok_or_else(|| anyhow!("path is not valid UTF-8"))?;
-    if text.contains(':') {
-        return Err(anyhow!("path contains `:`"));
+    if text.contains([',', '=']) {
+        return Err(anyhow!("path contains `,` or `=`"));
+    }
+    if text.contains(['\n', '\r']) {
+        return Err(anyhow!("path contains a newline"));
+    }
+    if path.is_relative() {
+        let anchored = text
+            .strip_prefix("~/")
+            .or_else(|| text.strip_prefix("./"))
+            .ok_or_else(|| {
+                anyhow!(
+                    "path must start with `./` for the project, `~/` for the container home, or `/` for an absolute location"
+                )
+            })?;
+        if Path::new(anchored)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(anyhow!("path must not escape its target root with `..`"));
+        }
+    }
+    Ok(())
+}
+
+fn valid_mount_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn config_path_reason(path: &Path, require_absolute: bool) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(anyhow!("path is empty"));
+    }
+    if require_absolute && !path.is_absolute() {
+        return Err(anyhow!("path is not absolute"));
+    }
+    if !require_absolute && !path.is_absolute() && !path.starts_with("~") {
+        return Err(anyhow!(
+            "path is not absolute and does not start with a bare `~`"
+        ));
+    }
+    let text = path
+        .to_str()
+        .ok_or_else(|| anyhow!("path is not valid UTF-8"))?;
+    if text.contains([',', '=']) {
+        return Err(anyhow!("path contains `,` or `=`"));
+    }
+    if text.contains(['\n', '\r']) {
+        return Err(anyhow!("path contains a newline"));
     }
     Ok(())
 }

@@ -15,8 +15,21 @@
 ### Prevent the container from modifying the project's Git metadata.
 read_only_git = true
 
-### Mount additional host paths (`permission` defaults to "read-only").
-# shared = [{ source = "/path/on/host", target = "/path/in/container", permission = "read-write" }]
+### Targets use `./` for the project directory, `~/` for the container home,
+### or `/` for an absolute container path. Host mounts default to read-only.
+[mounts.host]
+# docs = { source = "~/docs", target = "~/docs" }
+# output = { source = "./output", target = "/output", writable = true }
+
+### Project mounts are writable Silo-managed state private to one project.
+[mounts.project]
+# cargo = { target = "~/.cargo" }
+# cargo-target = { target = "./target" }
+
+### Shared mounts are writable Silo-managed state reused by every project with
+### the same name. Managed mounts are skipped for custom images.
+[mounts.shared]
+# codex = { target = "~/.codex" }
 
 ### Run shortcuts as `silo <name> [args...]`.
 [quick]

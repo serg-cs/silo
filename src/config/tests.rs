@@ -128,7 +128,7 @@ fn default_config_file_matches_builtin_defaults() {
     assert_eq!(from_file.read_only_git, defaults.read_only_git);
     assert_eq!(from_file.image.dockerfile, defaults.image.dockerfile);
     assert_eq!(from_file.container, defaults.container);
-    assert!(from_file.shared.is_empty());
+    assert!(from_file.mounts.is_empty());
     assert!(from_file.quick.is_empty());
 }
 
@@ -139,7 +139,9 @@ fn dotted_container_resources_keep_later_settings_at_the_root() {
          container.memory = \"16G\"\n\
          shell = \"fish\"\n\
          read_only_git = false\n\
-         shared = [{ source = \"~/notes\", target = \"/home/silo/notes\" }]\n",
+         [mounts.host.notes]\n\
+         source = \"~/notes\"\n\
+         target = \"~/notes\"\n",
     )
     .expect("dotted resources and later root settings parse");
 
@@ -147,7 +149,7 @@ fn dotted_container_resources_keep_later_settings_at_the_root() {
     assert_eq!(config.container.memory.as_deref(), Some("16G"));
     assert_eq!(config.shell, Some(Shell::Fish));
     assert!(!config.read_only_git);
-    assert_eq!(config.shared.len(), 1);
+    assert_eq!(config.mounts.len(), 1);
 }
 
 #[test]
@@ -203,6 +205,23 @@ fn load_from_reads_existing_config() {
     assert_eq!(
         config.image.dockerfile.as_deref(),
         Some(Path::new("/tmp/Dockerfile"))
+    );
+}
+
+#[test]
+fn load_from_resolves_relative_host_sources_from_config_directory() {
+    let dir = TestDir::new("relative-global-mount");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[mounts.host.docs]\nsource = \"content\"\ntarget = \"/docs\"\n",
+    )
+    .expect("write succeeds");
+
+    let config = Config::load_from(&path).expect("config loads");
+    assert_eq!(
+        config.mounts["docs"].source.as_deref(),
+        Some(dir.path().join("content").as_path())
     );
 }
 
@@ -352,63 +371,76 @@ fn quick_rejects_flag_shaped_names() {
 }
 
 #[test]
-fn shared_default_to_empty() {
-    // A config written before `shared` existed has no shared mounts.
+fn mounts_default_to_empty() {
     let config = Config::parse("[image]\n").expect("config parses");
-    assert!(config.shared.is_empty());
+    assert!(config.mounts.is_empty());
 }
 
 #[test]
-fn shared_parse_source_target_and_permission() {
+fn mount_intents_and_access_defaults_parse() {
     let config = Config::parse(
-        "[[shared]]\n\
-         source = \"~/notes\"\n\
-         target = \"/home/silo/notes\"\n\
-         permission = \"read-write\"\n\
-         [[shared]]\n\
-         source = \"~/.ssh\"\n\
-         target = \"/home/silo/.ssh\"\n\
-         permission = \"read-only\"\n",
+        "[mounts.host]\n\
+         notes = { source = \"~/notes\", target = \"~/notes\" }\n\
+         output = { source = \"~/output\", target = \"~/output\", writable = true }\n\
+         [mounts.project]\n\
+         cargo = { target = \"~/.cargo\" }\n\
+         cargo-target = { target = \"./target\" }\n\
+         [mounts.shared]\n\
+         codex = { target = \"~/.codex\" }\n",
     )
-    .expect("config parses");
-    assert_eq!(config.shared.len(), 2);
-    assert_eq!(config.shared[0].source, PathBuf::from("~/notes"));
-    assert_eq!(config.shared[0].target, PathBuf::from("/home/silo/notes"));
-    assert_eq!(config.shared[0].permission, Permission::ReadWrite);
-    assert_eq!(config.shared[1].source, PathBuf::from("~/.ssh"));
-    assert_eq!(config.shared[1].target, PathBuf::from("/home/silo/.ssh"));
-    assert_eq!(config.shared[1].permission, Permission::ReadOnly);
+    .expect("named mounts parse");
+
+    assert_eq!(config.mounts.len(), 5);
+    assert_eq!(config.mounts["notes"].kind(), Some(MountKind::Host));
+    assert_eq!(
+        config.mounts["notes"].effective_target(Path::new("/home/silo/workspace")),
+        Some(PathBuf::from("/home/silo/notes"))
+    );
+    assert_eq!(
+        config.mounts["notes"].effective_access(),
+        Permission::ReadOnly
+    );
+    assert_eq!(
+        config.mounts["cargo"].effective_access(),
+        Permission::ReadWrite
+    );
+    assert_eq!(
+        config.mounts["cargo"].effective_target(Path::new("/home/silo/workspace")),
+        Some(PathBuf::from("/home/silo/.cargo"))
+    );
+    assert_eq!(
+        config.mounts["cargo-target"].effective_target(Path::new("/home/silo/workspace")),
+        Some(PathBuf::from("/home/silo/workspace/target"))
+    );
+    assert_eq!(
+        config.mounts["codex"].effective_access(),
+        Permission::ReadWrite
+    );
+    assert_eq!(
+        config.mounts["codex"].effective_target(Path::new("/home/silo/workspace")),
+        Some(PathBuf::from("/home/silo/.codex"))
+    );
+    assert_eq!(
+        config.mounts["output"].effective_access(),
+        Permission::ReadWrite
+    );
 }
 
 #[test]
-fn shared_parse_compact_array() {
-    let config = Config::parse(
-        "shared = [\n\
-         { source = \"~/notes\", target = \"/home/silo/notes\", permission = \"read-write\" },\n\
-         { source = \"~/.ssh\", target = \"/home/silo/.ssh\" },\n\
-         ]\n",
-    )
-    .expect("compact shared array parses");
-    assert_eq!(config.shared.len(), 2);
-    assert_eq!(config.shared[0].source, PathBuf::from("~/notes"));
-    assert_eq!(config.shared[0].permission, Permission::ReadWrite);
-    assert_eq!(config.shared[1].target, PathBuf::from("/home/silo/.ssh"));
-    assert_eq!(config.shared[1].permission, Permission::ReadOnly);
-}
-
-#[test]
-fn project_omitted_shared_inherits_global_list() {
-    let dir = TestDir::new("project-inherits-shared");
+fn omitted_project_mounts_inherit_global_entries() {
+    let dir = TestDir::new("project-inherits-mounts");
     fs::write(dir.path().join(".silo.toml"), "read_only_git = false\n")
         .expect("project config writes");
-    let global =
-        Config::parse("shared = [{ source = \"~/notes\", target = \"/home/silo/notes\" }]\n")
-            .expect("global config parses");
+    let global = Config::parse("[mounts.host.notes]\nsource = \"~/notes\"\ntarget = \"~/notes\"\n")
+        .expect("global config parses");
 
     let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
 
-    assert_eq!(merged.shared.len(), 1);
-    assert_eq!(merged.shared[0].target, PathBuf::from("/home/silo/notes"));
+    assert_eq!(merged.mounts.len(), 1);
+    assert_eq!(
+        merged.mounts["notes"].effective_target(Path::new("/home/silo/workspace")),
+        Some(PathBuf::from("/home/silo/notes"))
+    );
     assert!(!merged.read_only_git);
 }
 
@@ -462,51 +494,70 @@ fn project_schema_reports_unknown_nested_keys() {
 }
 
 #[test]
-fn project_empty_shared_clears_global_list() {
-    let dir = TestDir::new("project-clears-shared");
-    fs::write(dir.path().join(".silo.toml"), "shared = []\n").expect("project config writes");
-    let global =
-        Config::parse("shared = [{ source = \"~/notes\", target = \"/home/silo/notes\" }]\n")
-            .expect("global config parses");
+fn project_mount_overlay_changes_one_field_and_can_disable_another() {
+    let dir = TestDir::new("project-overlays-mounts");
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "[mounts.host.notes]\ntarget = \"/notes\"\n[mounts.shared.codex]\nenabled = false\n",
+    )
+    .expect("project config writes");
+    let global = Config::parse(
+        "[mounts.host.notes]\nsource = \"~/notes\"\ntarget = \"/old\"\n\
+         [mounts.shared.codex]\ntarget = \"~/.codex\"\n",
+    )
+    .expect("global config parses");
 
     let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
 
-    assert!(merged.shared.is_empty());
+    assert_eq!(merged.mounts["notes"].kind(), Some(MountKind::Host));
+    assert_eq!(
+        merged.mounts["notes"].source.as_deref(),
+        Some(Path::new("~/notes"))
+    );
+    assert_eq!(
+        merged.mounts["notes"].target.as_deref(),
+        Some(Path::new("/notes"))
+    );
+    assert!(!merged.mounts["codex"].is_enabled());
 }
 
 #[test]
-fn project_shared_replaces_global_and_resolves_relative_sources() {
-    let dir = TestDir::new("project-replaces-shared");
+fn project_mount_source_is_resolved_from_project_root() {
+    let dir = TestDir::new("project-relative-mount");
     fs::write(
         dir.path().join(".silo.toml"),
-        "shared = [{ source = \"project-cache\", target = \"/cache\" }]\n",
+        "[mounts.host.cache]\nsource = \"project-cache\"\ntarget = \"/cache\"\n",
     )
     .expect("project config writes");
-    let global =
-        Config::parse("shared = [{ source = \"~/notes\", target = \"/home/silo/notes\" }]\n")
-            .expect("global config parses");
+
+    let merged = Config::apply_project_file(Config::default(), dir.path()).expect("configs merge");
+
+    assert_eq!(
+        merged.mounts["cache"].source.as_deref(),
+        Some(dir.path().join("project-cache").as_path())
+    );
+}
+
+#[test]
+fn changing_mount_intent_resets_host_specific_fields() {
+    let dir = TestDir::new("project-changes-mount-kind");
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "[mounts.shared.tools]\ntarget = \"~/tools\"\n",
+    )
+    .expect("project config writes");
+    let global = Config::parse(
+        "[mounts.host.tools]\nsource = \"~/tools\"\ntarget = \"/tools\"\nwritable = true\n",
+    )
+    .expect("global config parses");
 
     let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
-
-    assert_eq!(merged.shared.len(), 1);
-    assert_eq!(merged.shared[0].source, dir.path().join("project-cache"));
-    assert_eq!(merged.shared[0].target, PathBuf::from("/cache"));
-}
-
-#[test]
-fn project_shared_still_rejects_named_user_tilde_sources() {
-    let dir = TestDir::new("project-rejects-user-tilde");
-    fs::write(
-        dir.path().join(".silo.toml"),
-        "shared = [{ source = \"~user/notes\", target = \"/notes\" }]\n",
-    )
-    .expect("project config writes");
-
-    let err = Config::apply_project_file(Config::default(), dir.path())
-        .expect_err("named-user tilde remains invalid");
-    let msg = format!("{err:#}");
-
-    assert!(msg.contains("`~user` paths are not supported"), "{msg}");
+    let mount = &merged.mounts["tools"];
+    assert_eq!(mount.kind(), Some(MountKind::SharedState));
+    assert_eq!(mount.source, None);
+    assert_eq!(mount.target.as_deref(), Some(Path::new("~/tools")));
+    assert_eq!(mount.writable, None);
+    assert_eq!(mount.effective_access(), Permission::ReadWrite);
 }
 
 #[test]
@@ -572,7 +623,7 @@ fn empty_project_file_keeps_global_configuration() {
 fn invalid_project_config_reports_its_path_and_location() {
     let dir = TestDir::new("invalid-project-config");
     let path = dir.path().join(".silo.toml");
-    fs::write(&path, "shared = [").expect("project config writes");
+    fs::write(&path, "mounts = {").expect("project config writes");
 
     let err = Config::apply_project_file(Config::default(), dir.path())
         .expect_err("invalid project config errors");
@@ -583,129 +634,104 @@ fn invalid_project_config_reports_its_path_and_location() {
 }
 
 #[test]
-fn shared_permission_defaults_to_read_only() {
-    let config = Config::parse("[[shared]]\nsource = \"~/notes\"\ntarget = \"/home/silo/notes\"\n")
-        .expect("config parses");
-    assert_eq!(config.shared[0].permission, Permission::ReadOnly);
+fn disabled_mount_tombstone_needs_no_other_fields() {
+    let config =
+        Config::parse("[mounts.shared.optional]\nenabled = false\n").expect("config parses");
+    assert!(!config.mounts["optional"].is_enabled());
 }
 
 #[test]
-fn shared_rejects_unknown_permissions() {
+fn enabled_mount_requires_category_fields_and_unique_name() {
     let config = Config::parse(
-        "[[shared]]\n\
-         source = \"~/notes\"\n\
-         target = \"/home/silo/notes\"\n\
-         permission = \"write\"\n",
+        "[mounts.host.missing]\ntarget = \"/somewhere\"\n\
+         [mounts.project.state]\n",
     )
-    .expect_err("unknown permission value is invalid");
+    .expect_err("incomplete enabled mounts are invalid");
     let msg = config.to_string();
-    assert!(msg.contains("unknown variant"), "{msg}");
-    assert!(msg.contains("read-only"), "{msg}");
-    assert!(msg.contains("read-write"), "{msg}");
-}
+    assert!(
+        msg.contains("mount `missing`: host entry is missing `source`"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("mount `state`: enabled entry is missing `target`"),
+        "{msg}"
+    );
 
-#[test]
-fn shared_rejects_boolean_permissions() {
-    let config = Config::parse(
-        "[[shared]]\n\
-         source = \"~/notes\"\n\
-         target = \"/home/silo/notes\"\n\
-         permission = false\n",
+    let duplicate = Config::parse(
+        "[mounts.host.same]\nsource = \"~/same\"\ntarget = \"~/same\"\n\
+         [mounts.shared.same]\ntarget = \"~/same\"\n",
     )
-    .expect_err("a boolean is not a permission");
-    // The error points at the offending line; the exact wording of the type
-    // error belongs to the TOML parser and is not asserted here.
-    assert!(config.to_string().contains("line 4"));
+    .expect_err("names must be unique across mount categories");
+    assert!(
+        duplicate
+            .to_string()
+            .contains("mount `same` is defined in more than one category")
+    );
 }
 
 #[test]
-fn shared_reject_relative_sources() {
-    let config = Config::parse("[[shared]]\nsource = \"notes\"\ntarget = \"/home/silo/notes\"\n")
+fn direct_parse_rejects_relative_host_sources() {
+    let config = Config::parse("[mounts.host.notes]\nsource = \"notes\"\ntarget = \"~/notes\"\n")
         .expect_err("relative source is invalid");
     let msg = config.to_string();
     assert!(msg.contains("does not start with a bare `~`"), "{msg}");
-    assert!(msg.contains("`~/notes`"), "{msg}");
 }
 
 #[test]
-fn shared_rejects_user_tilde_paths() {
-    // `~user/x` starts with `~` as text but not as a path component;
-    // only a bare `~` is expanded, so such sources must not be mounted
-    // against the working directory.
-    let config = Config::parse(
-        "[[shared]]\n\
-         source = \"~user/notes\"\n\
-         target = \"/home/silo/notes\"\n",
-    )
-    .expect_err("~user source is invalid");
+fn mount_rejects_named_user_tilde_paths() {
+    let config =
+        Config::parse("[mounts.host.notes]\nsource = \"~user/notes\"\ntarget = \"~/notes\"\n")
+            .expect_err("~user source is invalid");
     let msg = config.to_string();
     assert!(msg.contains("does not start with a bare `~`"), "{msg}");
-    assert!(msg.contains("`~user` paths are not supported"), "{msg}");
 }
 
 #[test]
-fn shared_accepts_tilde_sources() {
-    let config = Config::parse("[[shared]]\nsource = \"~/notes\"\ntarget = \"/home/silo/notes\"\n")
-        .expect("tilde source is valid");
-    assert_eq!(config.shared[0].source, PathBuf::from("~/notes"));
-}
-
-#[test]
-fn shared_reports_and_ignores_unknown_keys() {
+fn mounts_report_and_ignore_unknown_keys() {
     let (config, unknown_keys) = Config::parse_with_unknown_keys(
-        "[[shared]]\n\
-         source = \"~/notes\"\n\
-         target = \"/home/silo/notes\"\n\
-         future_key = 42\n",
+        "[mounts.host.notes]\nsource = \"~/notes\"\ntarget = \"~/notes\"\nfuture_key = 42\n",
     )
     .expect("unknown key is ignored");
-    assert_eq!(config.shared[0].permission, Permission::ReadOnly);
-    assert_eq!(unknown_keys, ["shared.0.future_key"]);
+    assert_eq!(
+        config.mounts["notes"].effective_access(),
+        Permission::ReadOnly
+    );
+    assert_eq!(unknown_keys, ["mounts.host.notes.future_key"]);
 }
 
 #[test]
-fn shared_reject_relative_targets() {
-    let config = Config::parse("[[shared]]\nsource = \"~/notes\"\ntarget = \"notes\"\n")
-        .expect_err("relative target is invalid");
+fn mount_rejects_invalid_name_and_target() {
+    let config = Config::parse(
+        "[mounts.host.\"bad name\"]\nsource = \"~/notes\"\ntarget = \"./../notes\"\n",
+    )
+    .expect_err("relative target is invalid");
     let msg = config.to_string();
-    assert!(msg.contains("shared entry 1"), "{msg}");
-    assert!(msg.contains("target path is not absolute"), "{msg}");
+    assert!(msg.contains("mount `bad name`"), "{msg}");
+    assert!(msg.contains("must not escape its target root"), "{msg}");
 }
 
 #[test]
-fn shared_reject_empty_source() {
-    let config = Config::parse("[[shared]]\nsource = \"\"\ntarget = \"/home/silo/notes\"\n")
-        .expect_err("empty source is invalid");
+fn mount_rejects_unanchored_relative_target() {
+    let err = Config::parse("[mounts.project.cache]\ntarget = \"cache\"\n")
+        .expect_err("an unanchored relative target is ambiguous");
+    assert!(
+        err.to_string().contains(
+            "path must start with `./` for the project, `~/` for the container home, or `/`"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn mount_rejects_empty_and_mount_syntax_paths() {
+    let config = Config::parse(
+        "[mounts.host.empty]\nsource = \"\"\ntarget = \"/empty\"\n\
+         [mounts.host.comma]\nsource = \"~/notes\"\ntarget = \"/bad,target\"\n\
+         [mounts.host.equals]\nsource = \"~/bad=source\"\ntarget = \"/equals\"\n",
+    )
+    .expect_err("invalid paths are rejected");
     let msg = config.to_string();
     assert!(msg.contains("source path is empty"), "{msg}");
-}
-
-#[test]
-fn shared_reject_empty_target() {
-    let config = Config::parse("[[shared]]\nsource = \"~/notes\"\ntarget = \"\"\n")
-        .expect_err("empty target is invalid");
-    assert!(config.to_string().contains("target path is empty"));
-}
-
-#[test]
-fn shared_reject_colon_paths() {
-    let config =
-        Config::parse("[[shared]]\nsource = \"/tmp/a:b\"\ntarget = \"/home/silo/notes\"\n")
-            .expect_err("colon breaks the volume spec");
-    let msg = config.to_string();
-    assert!(msg.contains("source path contains `:`"), "{msg}");
-}
-
-#[test]
-fn shared_report_every_invalid_entry() {
-    let config = Config::parse(
-        "[[shared]]\nsource = \"~/a\"\ntarget = \"relative\"\n\
-         [[shared]]\nsource = \"~/b\"\ntarget = \"/tmp/c:d\"\n",
-    )
-    .expect_err("both shared entries are invalid");
-    let msg = config.to_string();
-    assert!(msg.contains("shared entry 1"), "{msg}");
-    assert!(msg.contains("shared entry 2"), "{msg}");
-    assert!(msg.contains("not absolute"), "{msg}");
-    assert!(msg.contains("target path contains `:`"), "{msg}");
+    assert!(msg.contains("target path contains `,` or `=`"), "{msg}");
+    assert!(msg.contains("source path contains `,` or `=`"), "{msg}");
 }

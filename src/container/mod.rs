@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
@@ -16,7 +18,7 @@ use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets::NO
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, Container, Permission, Shared, Shell};
+use crate::config::{Config, Container, Mount, MountKind, Permission, Shell};
 
 /// Name of the image this tool builds and runs.
 pub const IMAGE_TAG: &str = "silo:latest";
@@ -79,12 +81,6 @@ const LABEL_OWNER_VALUE: &str = "silo";
 const LABEL_SCHEMA_VALUE: &str = "1";
 const LABEL_SHARED_VALUE: &str = "shared";
 const LABEL_ISOLATED_VALUE: &str = "isolated";
-/// Increment when the built-in image or guest lifecycle contract changes in
-/// a way that makes an existing shared container unsafe to reuse. Version 5
-/// expands the built-in editor, developer-tool, and AI-agent set and restores
-/// Yazi's required MIME detection support.
-const LIFECYCLE_PROTOCOL_VERSION: &str = "5";
-
 /// Runtime races are retried only for this bounded interval.
 const CONFLICT_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONFLICT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -94,14 +90,257 @@ const GUEST_READY_TIMEOUT: Duration = Duration::from_mins(1);
 /// directory is mounted into it as `<home>/<project-name>`.
 const CONTAINER_HOME: &str = "/home/silo";
 
-/// One configured shared mount resolved for this run: `host` is the
-/// canonical source path on this machine, `dest` where it is mounted inside
-/// the container, and `permission` how it may be used.
+const MANAGED_MOUNT_ID_PREFIX: &str = "silo-mount-";
+const PROJECT_ROOT_METADATA: &str = ".project-root";
+const STATE_PROJECT_VALUE: &str = "project";
+const STATE_SHARED_VALUE: &str = "shared";
+
+/// One named configurable mount resolved for this run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedShared {
-    host: PathBuf,
+struct ResolvedMount {
+    name: String,
+    source: ResolvedMountSource,
     dest: PathBuf,
-    permission: Permission,
+    access: Permission,
+}
+
+struct ResolvedIsolatedMounts {
+    named: Vec<ResolvedMount>,
+    skipped: Vec<(&'static str, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedMountSource {
+    Host(PathBuf),
+    Managed(ManagedMount),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedMount {
+    id: String,
+    scope: StateScope,
+    name: String,
+    project: Option<PathBuf>,
+    path: PathBuf,
+}
+
+struct MountLock {
+    file: fs::File,
+}
+
+impl MountLock {
+    fn acquire() -> Result<Self> {
+        let state_root = managed_state_root_from_env().ok_or_else(|| {
+            anyhow!("managed mounts require XDG_STATE_HOME or HOME to be absolute")
+        })?;
+        ensure_private_directory(&state_root, "Silo state root")?;
+        Self::acquire_at(&state_root.join("mounts"))
+    }
+
+    fn acquire_at(root: &Path) -> Result<Self> {
+        ensure_private_directory(root, "managed mount root")?;
+        let path = root.join(".lock");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("could not open mount lock `{}`", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("could not protect mount lock `{}`", path.display()))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("could not lock managed mounts `{}`", path.display()));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for MountLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StateScope {
+    Project,
+    Shared,
+}
+
+impl StateScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => STATE_PROJECT_VALUE,
+            Self::Shared => STATE_SHARED_VALUE,
+        }
+    }
+
+    const fn config_kind(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Shared => "shared",
+        }
+    }
+}
+
+fn ensure_managed_mounts(mounts: &[ResolvedMount]) -> Result<()> {
+    let mut managed = BTreeMap::new();
+    for entry in effective_mounts(mounts) {
+        if let ResolvedMountSource::Managed(mount) = &entry.source {
+            managed.entry(mount.path.clone()).or_insert(mount);
+        }
+    }
+    for mount in managed.into_values() {
+        ensure_managed_mount(mount)?;
+    }
+    Ok(())
+}
+
+fn ensure_managed_mount(mount: &ManagedMount) -> Result<()> {
+    let root = managed_mount_root_from_path(&mount.path, mount.scope)?;
+    ensure_private_directory(root, "managed mount root")?;
+    match (&mount.scope, mount.project.as_deref()) {
+        (StateScope::Shared, None) => {
+            ensure_private_directory(&root.join("shared"), "shared mount root")?;
+        }
+        (StateScope::Project, Some(project)) => {
+            let projects = root.join("projects");
+            let project_dir = projects.join(project_digest(project));
+            ensure_private_directory(&projects, "project mount root")?;
+            ensure_private_directory(&project_dir, "project mount directory")?;
+            ensure_project_metadata(&project_dir, project)?;
+            ensure_private_directory(&project_dir.join("mounts"), "project mount collection")?;
+        }
+        _ => return Err(anyhow!("managed mount scope and project identity disagree")),
+    }
+    ensure_private_directory(&mount.path, "managed mount directory")?;
+    Ok(())
+}
+
+fn managed_mount_root_from_path(path: &Path, scope: StateScope) -> Result<&Path> {
+    let levels = match scope {
+        StateScope::Shared => 2,
+        StateScope::Project => 4,
+    };
+    path.ancestors()
+        .nth(levels)
+        .ok_or_else(|| anyhow!("managed mount `{}` has no storage root", path.display()))
+}
+
+fn ensure_project_metadata(project_dir: &Path, project: &Path) -> Result<()> {
+    let path = project_dir.join(PROJECT_ROOT_METADATA);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(anyhow!(
+                    "refusing to use project mount metadata `{}` because it is not a real file",
+                    path.display()
+                ));
+            }
+            let stored = fs::read(&path).with_context(|| {
+                format!("could not read project mount metadata `{}`", path.display())
+            })?;
+            if stored != project.as_os_str().as_bytes() {
+                return Err(anyhow!(
+                    "refusing to use project mount directory `{}` because its project metadata does not match `{}`",
+                    project_dir.display(),
+                    project.display()
+                ));
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).with_context(|| {
+                format!(
+                    "could not protect project mount metadata `{}`",
+                    path.display()
+                )
+            })?;
+            return Ok(());
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "could not inspect project mount metadata `{}`",
+                    path.display()
+                )
+            });
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = project_dir.join(format!(
+        "{PROJECT_ROOT_METADATA}.tmp.{}-{nonce}",
+        std::process::id()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)
+            .with_context(|| {
+                format!(
+                    "could not create project mount metadata `{}`",
+                    temporary.display()
+                )
+            })?;
+        file.write_all(project.as_os_str().as_bytes())
+            .with_context(|| {
+                format!(
+                    "could not write project mount metadata `{}`",
+                    temporary.display()
+                )
+            })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "could not sync project mount metadata `{}`",
+                temporary.display()
+            )
+        })?;
+        fs::rename(&temporary, &path).with_context(|| {
+            format!(
+                "could not publish project mount metadata `{}`",
+                path.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn ensure_private_directory(path: &Path, description: &str) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("could not create {description} `{}`", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("could not inspect {description} `{}`", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(anyhow!(
+            "refusing to use {description} `{}` because it is not a real directory",
+            path.display()
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("could not protect {description} `{}`", path.display()))
+}
+
+fn effective_mounts(mounts: &[ResolvedMount]) -> impl Iterator<Item = &ResolvedMount> {
+    mounts.iter().enumerate().filter_map(|(index, entry)| {
+        (!mounts[index + 1..]
+            .iter()
+            .any(|later| later.dest == entry.dest))
+        .then_some(entry)
+    })
 }
 
 /// Config-driven mounts applied on top of the shared project directory: the
@@ -109,7 +348,7 @@ struct ResolvedShared {
 #[derive(Default)]
 struct ConfigMounts {
     git: Option<PathBuf>,
-    shared: Vec<ResolvedShared>,
+    named: Vec<ResolvedMount>,
 }
 
 /// Stable identity and container path for the current project.
@@ -132,8 +371,8 @@ impl Project {
         let cwd = fs::canonicalize(cwd)
             .with_context(|| format!("failed to resolve project directory `{}`", cwd.display()))?;
         let root = discover_project_root(&cwd);
-        // Validate before persisting the path in JSON or a volume spec.
-        volume_host_path(&root)?;
+        // Validate before persisting the path in labels or mount metadata.
+        bind_host_path(&root)?;
         let workdir = shared_dir_name(&root)?;
         let id = project_container_id(&root);
         Ok(Self { root, workdir, id })
@@ -169,6 +408,7 @@ struct ContainerInspection {
     state: ContainerState,
     labels: HashMap<String, String>,
     image: Option<String>,
+    mount_sources: Vec<PathBuf>,
 }
 
 impl ContainerInspection {
@@ -177,6 +417,7 @@ impl ContainerInspection {
             state: ContainerState::Absent,
             labels: HashMap::new(),
             image: None,
+            mount_sources: Vec::new(),
         }
     }
 }
@@ -225,6 +466,15 @@ struct ContainerInventory {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountInfo(ManagedMount);
+
+#[derive(Default)]
+struct MountInventory {
+    items: Vec<MountInfo>,
+    warnings: Vec<String>,
+}
+
 /// Runtime labels expected on the deterministic shared container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContainerIdentity {
@@ -254,34 +504,151 @@ fn mount_host(path: &Path, root_canonical: &Path) -> Option<PathBuf> {
     host.starts_with(root_canonical).then_some(host)
 }
 
-/// Resolves the configured shared mounts into mounts for this run: expands
-/// a leading `~` in each source to the home directory and canonicalizes it
-/// (symlinks mount their target), keeping the
-/// configured container target and permission. Entries keep their config
-/// order, so a later shared mount can override an earlier one at the same
-/// target.
+/// Resolves enabled named mounts for this project. Host sources are expanded
+/// and canonicalized; managed mounts receive deterministic private host
+/// directories. Sorting parents before children makes nested overrides stable.
 ///
 /// # Errors
 ///
-/// Returns an error naming the shared mount when its source does not exist
+/// Returns an error naming the host mount when its source does not exist
 /// or cannot be resolved (e.g. a broken symlink).
-fn resolve_shared(shared: &[Shared], home: Option<&Path>) -> Result<Vec<ResolvedShared>> {
-    let mut resolved = Vec::with_capacity(shared.len());
-    for entry in shared {
-        let host = fs::canonicalize(expand_tilde(&entry.source, home)).with_context(|| {
-            format!(
-                "cannot resolve source `{}` for the shared mount at `{}` (missing path or broken symlink?)",
-                entry.source.display(),
-                entry.target.display()
-            )
-        })?;
-        resolved.push(ResolvedShared {
-            host,
-            dest: entry.target.clone(),
-            permission: entry.permission,
+fn resolve_named_mounts(
+    mounts: &BTreeMap<String, Mount>,
+    project_root: &Path,
+    home: Option<&Path>,
+    xdg_state_home: Option<&Path>,
+) -> Result<Vec<ResolvedMount>> {
+    let mut resolved = Vec::with_capacity(mounts.len());
+    let project_dir = shared_dir_name(project_root)?;
+    for (name, entry) in mounts.iter().filter(|(_, entry)| entry.is_enabled()) {
+        let kind = entry.kind().expect("enabled mounts were validated");
+        let dest = entry
+            .effective_target(&project_dir)
+            .expect("enabled mounts were validated");
+        let source = match kind {
+            MountKind::Host => {
+                let configured = entry.host_source().expect("host mounts were validated");
+                let host = fs::canonicalize(expand_tilde(configured, home)).with_context(|| {
+                    format!(
+                        "cannot resolve source `{}` for host mount `{name}` at `{}` (missing path or broken symlink?)",
+                        configured.display(),
+                        dest.display()
+                    )
+                })?;
+                if !host.is_dir() {
+                    return Err(anyhow!(
+                        "source `{}` for host mount `{name}` must be a directory",
+                        configured.display()
+                    ));
+                }
+                ResolvedMountSource::Host(host)
+            }
+            MountKind::ProjectState => ResolvedMountSource::Managed(managed_mount(
+                StateScope::Project,
+                name,
+                Some(project_root),
+                xdg_state_home,
+                home,
+            )?),
+            MountKind::SharedState => ResolvedMountSource::Managed(managed_mount(
+                StateScope::Shared,
+                name,
+                None,
+                xdg_state_home,
+                home,
+            )?),
+        };
+        resolved.push(ResolvedMount {
+            name: name.clone(),
+            source,
+            dest,
+            access: entry.effective_access(),
         });
     }
+    resolved.sort_by(|left, right| {
+        left.dest
+            .components()
+            .count()
+            .cmp(&right.dest.components().count())
+            .then_with(|| left.dest.cmp(&right.dest))
+            .then_with(|| left.name.cmp(&right.name))
+    });
     Ok(resolved)
+}
+
+fn managed_mount_root(xdg_state_home: Option<&Path>, home: Option<&Path>) -> Result<PathBuf> {
+    Ok(managed_state_root(xdg_state_home, home)?.join("mounts"))
+}
+
+fn managed_state_root(xdg_state_home: Option<&Path>, home: Option<&Path>) -> Result<PathBuf> {
+    let state_home = xdg_state_home
+        .filter(|path| path.is_absolute() && !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            home.filter(|path| path.is_absolute() && !path.as_os_str().is_empty())
+                .map(|path| path.join(".local/state"))
+        })
+        .ok_or_else(|| anyhow!("managed mounts require XDG_STATE_HOME or HOME to be absolute"))?;
+    Ok(state_home.join("silo"))
+}
+
+fn managed_state_root_from_env() -> Option<PathBuf> {
+    managed_state_root(
+        std::env::var_os("XDG_STATE_HOME").as_deref().map(Path::new),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )
+    .ok()
+}
+
+fn needs_mount_lock(mounts: &[ResolvedMount]) -> bool {
+    effective_mounts(mounts).any(|mount| matches!(mount.source, ResolvedMountSource::Managed(_)))
+}
+
+fn managed_mount(
+    scope: StateScope,
+    name: &str,
+    project: Option<&Path>,
+    xdg_state_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<ManagedMount> {
+    let root = managed_mount_root(xdg_state_home, home)?;
+    Ok(managed_mount_at_root(scope, name, project, &root))
+}
+
+fn managed_mount_at_root(
+    scope: StateScope,
+    name: &str,
+    project: Option<&Path>,
+    root: &Path,
+) -> ManagedMount {
+    let name_digest = format!("{:x}", Sha256::digest(name.as_bytes()));
+    let id = match (scope, project) {
+        (StateScope::Project, Some(project)) => format!(
+            "{MANAGED_MOUNT_ID_PREFIX}p-{}-{}",
+            &project_digest(project)[..PROJECT_DIGEST_HEX_LEN],
+            &name_digest[..16]
+        ),
+        (StateScope::Shared, None) => {
+            format!("{MANAGED_MOUNT_ID_PREFIX}s-{}", &name_digest[..24])
+        }
+        _ => unreachable!("scope and project identity must agree"),
+    };
+    let path = match (scope, project) {
+        (StateScope::Project, Some(project)) => root
+            .join("projects")
+            .join(project_digest(project))
+            .join("mounts")
+            .join(name),
+        (StateScope::Shared, None) => root.join("shared").join(name),
+        _ => unreachable!("scope and project identity must agree"),
+    };
+    ManagedMount {
+        id,
+        scope,
+        name: name.to_string(),
+        project: project.map(Path::to_path_buf),
+        path,
+    }
 }
 
 /// Expands a leading `~` in `path` to the home directory: `~` and `~/x`
@@ -300,28 +667,42 @@ fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Returns warnings for shared mounts whose intent a later mount silently
-/// defeats: a read-write shared mount at or under the `.git` target lets
+/// Returns warnings for named mounts whose intent a later mount silently
+/// defeats: a read-write named mount at or under the `.git` target lets
 /// tools in the container modify version control state despite the
-/// read-only `.git` mount.
+/// read-only `.git` mount. Duplicate targets are also reported along with the
+/// deterministic winner.
 fn mount_conflicts(
     project_dest: &Path,
     git_mounted: bool,
-    shared: &[ResolvedShared],
+    mounts: &[ResolvedMount],
 ) -> Vec<String> {
     let git_dest = git_mounted.then(|| project_dest.join(".git"));
     let mut warnings = Vec::new();
-    for entry in shared {
-        if entry.permission == Permission::ReadWrite
+    for entry in effective_mounts(mounts) {
+        if entry.access == Permission::ReadWrite
             && git_dest
                 .as_deref()
                 .is_some_and(|git_dest| entry.dest.starts_with(git_dest))
         {
             warnings.push(format!(
-                "the read-write shared mount of `{}` at `{}` overlaps the read-only `.git` mount, so tools in the container can modify version control state",
-                entry.host.display(),
+                "the read-write mount `{}` at `{}` overlaps the read-only `.git` mount, so tools in the container can modify version control state",
+                entry.name,
                 entry.dest.display()
             ));
+        }
+    }
+    for (index, entry) in mounts.iter().enumerate() {
+        for later in &mounts[index + 1..] {
+            if entry.dest == later.dest {
+                warnings.push(format!(
+                    "mounts `{}` and `{}` both target `{}`; `{}` is applied later and wins",
+                    entry.name,
+                    later.name,
+                    entry.dest.display(),
+                    later.name
+                ));
+            }
         }
     }
     warnings
@@ -492,7 +873,10 @@ fn uses_isolated_lifecycle(config: &Config, isolated: bool) -> bool {
     isolated || config.image.dockerfile.is_some()
 }
 
-/// Runs the existing ephemeral `container run --rm` lifecycle.
+/// Runs an ephemeral create/start lifecycle. Built-in isolated containers use
+/// the same host-backed managed mounts as shared containers. Custom images
+/// omit them because their image-defined user cannot safely be granted access
+/// to private host-owned storage.
 fn run_isolated(
     config: &Config,
     project: &Project,
@@ -500,9 +884,13 @@ fn run_isolated(
     shell: Option<Shell>,
 ) -> Result<ExitCode> {
     let ids = host_ids()?;
-    let shared = resolve_shared(
-        &config.shared,
+    let custom_image = config.image.dockerfile.is_some();
+    let ResolvedIsolatedMounts { named, skipped } = resolve_isolated_named_mounts(
+        &config.mounts,
+        &project.root,
         std::env::var_os("HOME").as_deref().map(Path::new),
+        std::env::var_os("XDG_STATE_HOME").as_deref().map(Path::new),
+        custom_image,
     )?;
     let id = isolated_container_id();
     // Build the command first: it only fails on path validation, before any
@@ -510,9 +898,18 @@ fn run_isolated(
     let git_mount = git_mount_host(&project.root, config.read_only_git);
     let config_mounts = ConfigMounts {
         git: git_mount,
-        shared,
+        named,
     };
-    let mut run = isolated_run_command(
+    for (scope, name) in skipped {
+        eprintln!(
+            "warning: {scope} mount `{name}` was skipped for a custom image because its image-defined user may not be able to access Silo's private host storage; use a host mount with permissions appropriate for the image user"
+        );
+    }
+    let mount_lock = needs_mount_lock(&config_mounts.named)
+        .then(MountLock::acquire)
+        .transpose()?;
+    ensure_managed_mounts(&config_mounts.named)?;
+    let mut create = isolated_create_command(
         std::io::stdin().is_terminal(),
         &project.root,
         &ids,
@@ -527,15 +924,32 @@ fn run_isolated(
     for warning in mount_conflicts(
         &project.workdir,
         config_mounts.git.is_some(),
-        &config_mounts.shared,
+        &config_mounts.named,
     ) {
         eprintln!("warning: {warning}");
     }
     sweep_orphaned_isolated_containers(Some(&id));
-    install_signal_handlers()?;
+    create.stdout(Stdio::null());
+    let create_status = create.status().map_err(spawn_error)?;
+    drop(mount_lock);
+    if !create_status.success() {
+        cleanup_isolated_container(&id);
+        return Ok(exit_code(create_status));
+    }
+    if let Err(err) = install_signal_handlers() {
+        cleanup_isolated_container(&id);
+        return Err(err);
+    }
     // Captured before the child starts, so it holds the pre-raw-mode state.
     let terminal = SavedTerminal::capture();
-    let mut child = run.spawn().map_err(spawn_error)?;
+    let mut start = isolated_start_command(&id);
+    let mut child = match start.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            cleanup_isolated_container(&id);
+            return Err(spawn_error(err));
+        }
+    };
     let pid = libc::pid_t::try_from(child.id()).expect("child pid fits in pid_t");
     let status = wait_for_child(&mut child, pid);
     if let Some(terminal) = &terminal {
@@ -543,6 +957,62 @@ fn run_isolated(
     }
     cleanup_isolated_container(&id);
     status.map(exit_code)
+}
+
+/// Applies the image compatibility policy before resolving mount sources, so
+/// skipped managed mounts never require or inspect managed host storage.
+fn resolve_isolated_named_mounts(
+    mounts: &BTreeMap<String, Mount>,
+    project_root: &Path,
+    home: Option<&Path>,
+    xdg_state_home: Option<&Path>,
+    custom_image: bool,
+) -> Result<ResolvedIsolatedMounts> {
+    let mut available = mounts.clone();
+    let skipped = remove_unavailable_managed_mounts(&mut available, custom_image);
+    if custom_image {
+        for (name, mount) in available.iter().filter(|(_, mount)| mount.is_enabled()) {
+            if mount
+                .target
+                .as_deref()
+                .and_then(Path::to_str)
+                .is_some_and(|target| target.starts_with("~/"))
+            {
+                return Err(anyhow!(
+                    "host mount `{name}` uses home-relative target `{}` but custom images have no Silo-defined home; use a project-relative `./...` target or an absolute target",
+                    mount
+                        .target
+                        .as_deref()
+                        .expect("target was matched")
+                        .display()
+                ));
+            }
+        }
+    }
+    let named = resolve_named_mounts(&available, project_root, home, xdg_state_home)?;
+    Ok(ResolvedIsolatedMounts { named, skipped })
+}
+
+fn remove_unavailable_managed_mounts(
+    mounts: &mut BTreeMap<String, Mount>,
+    custom_image: bool,
+) -> Vec<(&'static str, String)> {
+    let mut skipped = Vec::new();
+    mounts.retain(|name, mount| match mount.kind() {
+        Some(kind @ (MountKind::ProjectState | MountKind::SharedState))
+            if custom_image && mount.is_enabled() =>
+        {
+            let scope = match kind {
+                MountKind::ProjectState => StateScope::Project,
+                MountKind::SharedState => StateScope::Shared,
+                MountKind::Host => unreachable!("matched a managed mount kind"),
+            };
+            skipped.push((scope.config_kind(), name.clone()));
+            false
+        }
+        Some(MountKind::Host | MountKind::ProjectState | MountKind::SharedState) | None => true,
+    });
+    skipped
 }
 
 /// Ensures the shared project container and attaches one exec session.
@@ -594,9 +1064,11 @@ fn run_shared(
 fn resolve_config_mounts(config: &Config, project_root: &Path) -> Result<ConfigMounts> {
     Ok(ConfigMounts {
         git: git_mount_host(project_root, config.read_only_git),
-        shared: resolve_shared(
-            &config.shared,
+        named: resolve_named_mounts(
+            &config.mounts,
+            project_root,
             std::env::var_os("HOME").as_deref().map(Path::new),
+            std::env::var_os("XDG_STATE_HOME").as_deref().map(Path::new),
         )?,
     })
 }
@@ -606,7 +1078,7 @@ fn warn_mount_conflicts(project: &Project, config_mounts: &ConfigMounts) {
     for warning in mount_conflicts(
         &project.workdir,
         config_mounts.git.is_some(),
-        &config_mounts.shared,
+        &config_mounts.named,
     ) {
         eprintln!("warning: {warning}");
     }
@@ -624,6 +1096,149 @@ pub fn print_containers() -> Result<ExitCode> {
         eprintln!("warning: {warning}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Prints every persistent mount directory owned by Silo.
+pub fn print_mounts() -> Result<ExitCode> {
+    let inventory = mount_inventory()?;
+    if inventory.items.is_empty() {
+        println!("No Silo managed mounts.");
+    } else {
+        println!("{}", render_mount_table(&inventory.items));
+    }
+    for warning in inventory.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Permanently deletes one selected, currently unused managed mount.
+pub fn delete_selected_mount(selector: &str) -> Result<ExitCode> {
+    let inventory = mount_inventory()?;
+    let selected = select_mount(&inventory.items, selector)?.0.clone();
+    let _mount_lock = MountLock::acquire()?;
+    let expected = managed_mount(
+        selected.scope,
+        &selected.name,
+        selected.project.as_deref(),
+        std::env::var_os("XDG_STATE_HOME").as_deref().map(Path::new),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )?;
+    if selected != expected {
+        return Err(anyhow!(
+            "refusing to delete managed mount `{}` because its path or identity is inconsistent",
+            selected.id
+        ));
+    }
+    validate_managed_mount(&selected)?;
+    let metadata = fs::symlink_metadata(&selected.path).with_context(|| {
+        format!(
+            "managed mount `{}` disappeared before deletion",
+            selected.id
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(anyhow!(
+            "refusing to delete managed mount `{}` because it is not a real directory",
+            selected.id
+        ));
+    }
+    if mount_directory_in_use(&selected.path)? {
+        return Err(anyhow!(
+            "could not delete managed mount `{}` because a container still references it",
+            selected.id
+        ));
+    }
+    fs::remove_dir_all(&selected.path)
+        .with_context(|| format!("could not delete managed mount `{}`", selected.id))?;
+    if selected.scope == StateScope::Project {
+        prune_empty_project_mount_directory(&selected.path)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn validate_managed_mount(mount: &ManagedMount) -> Result<()> {
+    let root = managed_mount_root_from_path(&mount.path, mount.scope)?;
+    validate_real_directory(root, "managed mount root")?;
+    if let Some(project) = mount.project.as_deref() {
+        validate_real_directory(&root.join("projects"), "project mount root")?;
+        let project_dir = mount
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow!("project mount `{}` has no project directory", mount.id))?;
+        validate_real_directory(project_dir, "project mount directory")?;
+        validate_real_directory(
+            mount.path.parent().unwrap_or(&mount.path),
+            "project mount collection",
+        )?;
+        let stored = read_project_metadata(project_dir)?;
+        if stored != project
+            || OsStr::new(&project_digest(&stored)) != project_dir.file_name().unwrap_or_default()
+        {
+            return Err(anyhow!(
+                "refusing to use project mount `{}` because its project metadata is inconsistent",
+                mount.id
+            ));
+        }
+    } else {
+        validate_real_directory(&root.join("shared"), "shared mount root")?;
+    }
+    Ok(())
+}
+
+fn validate_real_directory(path: &Path, description: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("could not inspect {description} `{}`", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(anyhow!(
+            "refusing to use {description} `{}` because it is not a real directory",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn prune_empty_project_mount_directory(path: &Path) -> Result<()> {
+    let mounts_dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("deleted project mount has no mount collection"))?;
+    if fs::read_dir(mounts_dir)?.next().is_some() {
+        return Ok(());
+    }
+    let project_dir = mounts_dir
+        .parent()
+        .ok_or_else(|| anyhow!("deleted project mount has no project directory"))?;
+    let mut unexpected = Vec::new();
+    for entry in fs::read_dir(project_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name != OsStr::new("mounts") && name != OsStr::new(PROJECT_ROOT_METADATA) {
+            unexpected.push(name);
+        }
+    }
+    if !unexpected.is_empty() {
+        return Ok(());
+    }
+    fs::remove_dir(mounts_dir).with_context(|| {
+        format!(
+            "could not remove empty project mount collection `{}`",
+            mounts_dir.display()
+        )
+    })?;
+    fs::remove_file(project_dir.join(PROJECT_ROOT_METADATA)).with_context(|| {
+        format!(
+            "could not remove project mount metadata `{}`",
+            project_dir.display()
+        )
+    })?;
+    fs::remove_dir(project_dir).with_context(|| {
+        format!(
+            "could not remove empty project mount directory `{}`",
+            project_dir.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// Stops the single Silo container selected by ID or project, preserving it.
@@ -785,6 +1400,341 @@ fn container_inventory() -> Result<ContainerInventory> {
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(inventory)
+}
+
+fn mount_inventory() -> Result<MountInventory> {
+    mount_inventory_for_env(
+        std::env::var_os("XDG_STATE_HOME").as_deref().map(Path::new),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )
+}
+
+fn mount_inventory_for_env(
+    xdg_state_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<MountInventory> {
+    let root = managed_mount_root(xdg_state_home, home)?;
+    let mut inventory = MountInventory::default();
+    if !inventory_root_is_directory(root.parent().unwrap_or(&root), "Silo state", &mut inventory) {
+        return Ok(inventory);
+    }
+    let discovered = mount_inventory_at(&root);
+    inventory.items = discovered.items;
+    inventory.warnings.extend(discovered.warnings);
+    inventory.warnings.sort();
+    Ok(inventory)
+}
+
+fn mount_inventory_at(root: &Path) -> MountInventory {
+    let mut inventory = MountInventory::default();
+    if !inventory_root_is_directory(root, "managed mount", &mut inventory) {
+        return inventory;
+    }
+    collect_shared_mounts(root, &mut inventory);
+    collect_project_mounts(root, &mut inventory);
+    inventory.items.sort_by(|left, right| {
+        left.0
+            .scope
+            .cmp(&right.0.scope)
+            .then_with(|| left.0.project.cmp(&right.0.project))
+            .then_with(|| left.0.name.cmp(&right.0.name))
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+    inventory.warnings.sort();
+    inventory
+}
+
+fn inventory_root_is_directory(
+    root: &Path,
+    description: &str,
+    inventory: &mut MountInventory,
+) -> bool {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            inventory.warnings.push(format!(
+                "ignored {description} root `{}` because it is not a real directory",
+                root.display()
+            ));
+            false
+        }
+        Ok(_) => true,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+        Err(err) => {
+            inventory.warnings.push(format!(
+                "could not inspect {description} root `{}`: {err}",
+                root.display()
+            ));
+            false
+        }
+    }
+}
+
+fn collect_shared_mounts(root: &Path, inventory: &mut MountInventory) {
+    let shared = root.join("shared");
+    if !inventory_root_is_directory(&shared, "shared mount", inventory) {
+        return;
+    }
+    for entry in read_inventory_directory(&shared, "shared mount", inventory) {
+        let Some(name) = inventory_mount_name(&entry, "shared", inventory) else {
+            continue;
+        };
+        let mount = managed_mount_at_root(StateScope::Shared, &name, None, root);
+        inventory.items.push(MountInfo(mount));
+    }
+}
+
+fn collect_project_mounts(root: &Path, inventory: &mut MountInventory) {
+    let projects = root.join("projects");
+    if !inventory_root_is_directory(&projects, "project mount", inventory) {
+        return;
+    }
+    for entry in read_inventory_directory(&projects, "project mount", inventory) {
+        let Some(digest) = entry.file_name().to_str().map(ToString::to_string) else {
+            inventory
+                .warnings
+                .push("ignored project mount directory with a non-UTF-8 digest".to_string());
+            continue;
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            inventory.warnings.push(format!(
+                "ignored invalid project mount directory `{digest}`"
+            ));
+            continue;
+        }
+        if !inventory_entry_is_directory(&entry, "project mount directory", inventory) {
+            continue;
+        }
+        let project_dir = entry.path();
+        let project = match read_project_metadata(&project_dir) {
+            Ok(project) if project_digest(&project) == digest => project,
+            Ok(_) => {
+                inventory.warnings.push(format!(
+                    "ignored project mount directory `{digest}` because its metadata does not match its digest"
+                ));
+                continue;
+            }
+            Err(err) => {
+                inventory.warnings.push(format!(
+                    "ignored project mount directory `{digest}`: {err:#}"
+                ));
+                continue;
+            }
+        };
+        let mounts = project_dir.join("mounts");
+        if !inventory_root_is_directory(&mounts, "project mount collection", inventory) {
+            continue;
+        }
+        for mount_entry in read_inventory_directory(&mounts, "project mount", inventory) {
+            let Some(name) = inventory_mount_name(&mount_entry, "project", inventory) else {
+                continue;
+            };
+            let mount = managed_mount_at_root(StateScope::Project, &name, Some(&project), root);
+            inventory.items.push(MountInfo(mount));
+        }
+    }
+}
+
+fn read_inventory_directory(
+    root: &Path,
+    description: &str,
+    inventory: &mut MountInventory,
+) -> Vec<fs::DirEntry> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            inventory.warnings.push(format!(
+                "could not read {description} directory `{}`: {err}",
+                root.display()
+            ));
+            return Vec::new();
+        }
+    };
+    let mut collected = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => collected.push(entry),
+            Err(err) => {
+                inventory
+                    .warnings
+                    .push(format!("could not inspect a {description} entry: {err}"));
+            }
+        }
+    }
+    collected
+}
+
+fn inventory_mount_name(
+    entry: &fs::DirEntry,
+    scope: &str,
+    inventory: &mut MountInventory,
+) -> Option<String> {
+    let Some(name) = entry.file_name().to_str().map(ToString::to_string) else {
+        inventory
+            .warnings
+            .push(format!("ignored {scope} mount with a non-UTF-8 name"));
+        return None;
+    };
+    if !valid_mount_name(&name) {
+        inventory
+            .warnings
+            .push(format!("ignored invalid {scope} mount entry `{name}`"));
+        return None;
+    }
+    inventory_entry_is_directory(entry, &format!("{scope} mount `{name}`"), inventory)
+        .then_some(name)
+}
+
+fn inventory_entry_is_directory(
+    entry: &fs::DirEntry,
+    description: &str,
+    inventory: &mut MountInventory,
+) -> bool {
+    let file_type = match entry.file_type() {
+        Ok(file_type) => file_type,
+        Err(err) => {
+            inventory
+                .warnings
+                .push(format!("could not inspect {description}: {err}"));
+            return false;
+        }
+    };
+    if file_type.is_symlink() || !file_type.is_dir() {
+        inventory.warnings.push(format!(
+            "ignored {description} because it is not a real directory"
+        ));
+        false
+    } else {
+        true
+    }
+}
+
+fn read_project_metadata(project_dir: &Path) -> Result<PathBuf> {
+    let path = project_dir.join(PROJECT_ROOT_METADATA);
+    let metadata = fs::symlink_metadata(&path).with_context(|| {
+        format!(
+            "could not inspect project mount metadata `{}`",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(anyhow!(
+            "project mount metadata `{}` is not a real file",
+            path.display()
+        ));
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("could not read project mount metadata `{}`", path.display()))?;
+    let project = PathBuf::from(OsString::from_vec(bytes));
+    if !project.is_absolute() {
+        return Err(anyhow!(
+            "project mount metadata `{}` does not contain an absolute path",
+            path.display()
+        ));
+    }
+    Ok(project)
+}
+
+fn valid_mount_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn render_mount_table(items: &[MountInfo]) -> String {
+    let mut table = Table::new();
+    table
+        .load_preset(NOTHING)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(
+            ["ID", "SCOPE", "NAME", "PROJECT", "SOURCE"]
+                .into_iter()
+                .map(|value| Cell::new(value).add_attribute(Attribute::Bold)),
+        );
+    for MountInfo(mount) in items {
+        table.add_row([
+            Cell::new(&mount.id),
+            Cell::new(mount.scope.as_str()),
+            Cell::new(&mount.name),
+            Cell::new(
+                mount
+                    .project
+                    .as_deref()
+                    .map_or_else(|| "-".to_string(), display_path),
+            ),
+            Cell::new(display_path(&mount.path)),
+        ]);
+    }
+    table.to_string()
+}
+
+fn display_path(path: &Path) -> String {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return path.display().to_string();
+    };
+    path.strip_prefix(&home).map_or_else(
+        |_| path.display().to_string(),
+        |relative| {
+            if relative.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", relative.display())
+            }
+        },
+    )
+}
+
+fn select_mount<'a>(items: &'a [MountInfo], selector: &str) -> Result<&'a MountInfo> {
+    if let Some(item) = items.iter().find(|item| item.0.id == selector) {
+        return Ok(item);
+    }
+    let expanded = expand_selector_home(selector);
+    let path_matches: Vec<_> = items
+        .iter()
+        .filter(|item| item.0.project.as_deref() == Some(&expanded))
+        .collect();
+    if !path_matches.is_empty() {
+        return one_mount_match(selector, &path_matches);
+    }
+    let named_matches: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            item.0
+                .project
+                .as_deref()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == selector)
+                || item.0.name == selector
+        })
+        .collect();
+    if !named_matches.is_empty() {
+        return one_mount_match(selector, &named_matches);
+    }
+    let id_matches: Vec<_> = items
+        .iter()
+        .filter(|item| item.0.id.starts_with(selector))
+        .collect();
+    if !id_matches.is_empty() {
+        return one_mount_match(selector, &id_matches);
+    }
+    Err(anyhow!("no Silo managed mount matches `{selector}`"))
+}
+
+fn one_mount_match<'a>(selector: &str, matches: &[&'a MountInfo]) -> Result<&'a MountInfo> {
+    if let [item] = matches {
+        return Ok(*item);
+    }
+    Err(anyhow!(
+        "selector `{selector}` is ambiguous; matching managed mounts: {}",
+        matches
+            .iter()
+            .map(|item| item.0.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 fn populate_session_counts(inventory: &mut ContainerInventory) {
@@ -957,20 +1907,7 @@ fn short_id(id: &str) -> String {
 }
 
 fn display_project(item: &ContainerInfo) -> String {
-    let project = &item.project;
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return project.display().to_string();
-    };
-    project.strip_prefix(&home).map_or_else(
-        |_| project.display().to_string(),
-        |relative| {
-            if relative.as_os_str().is_empty() {
-                "~".to_string()
-            } else {
-                format!("~/{}", relative.display())
-            }
-        },
-    )
+    display_path(&item.project)
 }
 
 fn select_container<'a>(items: &'a [ContainerInfo], selector: &str) -> Result<&'a ContainerInfo> {
@@ -1300,28 +2237,7 @@ fn container_identity(
     lifecycle: &str,
     command: &[OsString],
 ) -> ContainerIdentity {
-    container_identity_for_protocol(
-        project,
-        host_ids,
-        config_mounts,
-        resources,
-        lifecycle,
-        command,
-        LIFECYCLE_PROTOCOL_VERSION,
-    )
-}
-
-fn container_identity_for_protocol(
-    project: &Project,
-    host_ids: &HostIds,
-    config_mounts: &ConfigMounts,
-    resources: &Container,
-    lifecycle: &str,
-    command: &[OsString],
-    protocol: &str,
-) -> ContainerIdentity {
     let mut hasher = Sha256::new();
-    hash_spec_field(&mut hasher, b"protocol", protocol.as_bytes());
     hash_spec_field(&mut hasher, b"image", IMAGE_TAG.as_bytes());
     hash_spec_field(&mut hasher, b"lifecycle", lifecycle.as_bytes());
     hash_spec_field(&mut hasher, b"uid", host_ids.uid.as_bytes());
@@ -1337,12 +2253,22 @@ fn container_identity_for_protocol(
     } else {
         hash_spec_field(&mut hasher, b"git", b"");
     }
-    for mount in &config_mounts.shared {
-        hash_spec_field(
-            &mut hasher,
-            b"mount-host",
-            mount.host.as_os_str().as_bytes(),
-        );
+    for mount in effective_mounts(&config_mounts.named) {
+        hash_spec_field(&mut hasher, b"mount-name", mount.name.as_bytes());
+        match &mount.source {
+            ResolvedMountSource::Host(host) => {
+                hash_spec_field(&mut hasher, b"mount-kind", b"host");
+                hash_spec_field(&mut hasher, b"mount-source", host.as_os_str().as_bytes());
+            }
+            ResolvedMountSource::Managed(mount) => {
+                hash_spec_field(&mut hasher, b"mount-kind", mount.scope.as_str().as_bytes());
+                hash_spec_field(
+                    &mut hasher,
+                    b"mount-source",
+                    mount.path.as_os_str().as_bytes(),
+                );
+            }
+        }
         hash_spec_field(
             &mut hasher,
             b"mount-dest",
@@ -1350,8 +2276,8 @@ fn container_identity_for_protocol(
         );
         hash_spec_field(
             &mut hasher,
-            b"mount-permission",
-            match mount.permission {
+            b"mount-access",
+            match mount.access {
                 Permission::ReadOnly => b"ro",
                 Permission::ReadWrite => b"rw",
             },
@@ -1525,13 +2451,19 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
                     require_image()?;
                     checked_image = true;
                 }
-                match create_shared_container(
+                let mount_lock = needs_mount_lock(&config_mounts.named)
+                    .then(MountLock::acquire)
+                    .transpose()?;
+                ensure_managed_mounts(&config_mounts.named)?;
+                let creation = create_shared_container(
                     project,
                     &ids,
                     &config_mounts,
                     &config.container,
                     &identity,
-                ) {
+                );
+                drop(mount_lock);
+                match creation {
                     Ok(()) => {}
                     Err(err) => last_conflict = Some(err),
                 }
@@ -1550,10 +2482,15 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
             }
             ContainerState::Stopped => {
                 if shared_container_matches(&inspection, project, &identity)? {
+                    let mount_lock = needs_mount_lock(&config_mounts.named)
+                        .then(MountLock::acquire)
+                        .transpose()?;
+                    ensure_managed_mounts(&config_mounts.named)?;
                     let output = Command::new(CONTAINER_BIN)
                         .args(["start", &project.id])
                         .output()
                         .map_err(spawn_error)?;
+                    drop(mount_lock);
                     if !output.status.success() {
                         last_conflict = Some(anyhow!(
                             "failed to start shared container '{}': {}",
@@ -1809,6 +2746,20 @@ fn inspect_container(id: &str) -> Result<ContainerInspection> {
     inspection.ok_or_else(|| container_inspect_error(id, &stderr))
 }
 
+fn mount_directory_in_use(path: &Path) -> Result<bool> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("could not resolve managed mount `{}`", path.display()))?;
+    for id in list_container_ids()? {
+        let inspection = inspect_container(&id)?;
+        if inspection.mount_sources.iter().any(|source| {
+            source == path || fs::canonicalize(source).is_ok_and(|source| source == canonical)
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Runs one raw container inspection; not-found is represented as absence.
 fn probe_container(id: &str) -> Result<(Option<ContainerInspection>, String)> {
     let output = Command::new(CONTAINER_BIN)
@@ -1867,10 +2818,19 @@ fn parse_container_inspection(stdout: &[u8], id: &str) -> Result<ContainerInspec
         .or_else(|| item.pointer("/image/reference").and_then(Value::as_str))
         .or_else(|| item.get("image").and_then(Value::as_str))
         .map(ToString::to_string);
+    let mount_sources = item
+        .pointer("/configuration/mounts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|mount| mount.get("source").and_then(Value::as_str))
+        .map(PathBuf::from)
+        .collect();
     Ok(ContainerInspection {
         state,
         labels,
         image,
+        mount_sources,
     })
 }
 
@@ -2268,14 +3228,14 @@ fn id_of(flag: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Builds the legacy one-shot `container run --rm` command.
+/// Builds the create half of an isolated one-shot container lifecycle.
 ///
 /// # Errors
 ///
 /// Returns an error when the project root has no name (e.g. `/`), or its path
-/// or a mount's path cannot be expressed in a volume spec.
+/// or a mount's path cannot be expressed in a mount specification.
 #[allow(clippy::too_many_arguments)]
-fn isolated_run_command(
+fn isolated_create_command(
     interactive: bool,
     project_root: &Path,
     host_ids: &HostIds,
@@ -2300,7 +3260,11 @@ fn isolated_run_command(
         command,
     );
     let mut run = Command::new(CONTAINER_BIN);
-    run.arg("run").arg("--name").arg(id).arg("--rm").arg("-i");
+    run.arg("create")
+        .arg("--name")
+        .arg(id)
+        .arg("--rm")
+        .arg("-i");
     if interactive {
         // Allocating a pty without a terminal fails with ENOTTY.
         run.arg("-t");
@@ -2321,6 +3285,13 @@ fn isolated_run_command(
         run.args(command);
     }
     Ok(run)
+}
+
+fn isolated_start_command(id: &str) -> Command {
+    let mut start = Command::new(CONTAINER_BIN);
+    start.arg("start").arg("--attach").arg("--interactive");
+    start.arg(id);
+    start
 }
 
 /// Builds the detached creation command for a shared project container.
@@ -2372,7 +3343,7 @@ fn append_creation_mounts(
     shared_dir: &Path,
     config_mounts: &ConfigMounts,
 ) -> Result<()> {
-    let host_dir = volume_host_path(project_root)?;
+    let host_dir = bind_host_path(project_root)?;
     run.arg("-v")
         .arg(format!("{host_dir}:{}", shared_dir.display()))
         .arg("-w")
@@ -2385,15 +3356,19 @@ fn append_creation_mounts(
         run.arg("-v")
             .arg(format!("{host}:{}:ro", shared_dir.join(".git").display()));
     }
-    for entry in &config_mounts.shared {
-        // Configured shared mounts: read-only mounts get the `:ro` suffix,
-        // read-write mounts use the volume default.
-        let host = mount_host_path(&entry.host)?;
-        let spec = match entry.permission {
-            Permission::ReadOnly => format!("{host}:{}:ro", entry.dest.display()),
-            Permission::ReadWrite => format!("{host}:{}", entry.dest.display()),
+    for entry in effective_mounts(&config_mounts.named) {
+        let target = mount_argument_path(&entry.dest)?;
+        let source = match &entry.source {
+            ResolvedMountSource::Host(host) => mount_argument_path(host)?,
+            ResolvedMountSource::Managed(mount) => mount_argument_path(&mount.path)?,
         };
-        run.arg("-v").arg(spec);
+        let readonly = match entry.access {
+            Permission::ReadOnly => ",readonly",
+            Permission::ReadWrite => "",
+        };
+        run.arg("--mount").arg(format!(
+            "type=bind,source={source},target={target}{readonly}"
+        ));
     }
     Ok(())
 }
@@ -2465,7 +3440,7 @@ fn resolve_shell(configured: Option<Shell>, host_shell: Option<&OsStr>) -> Shell
     })
 }
 
-/// Returns the host side of the shared-directory volume spec, rejecting
+/// Returns the host side of the shared-directory bind specification, rejecting
 /// paths the container CLI cannot parse: `:` separates host and container
 /// paths, and the spec is built with `format!`, so the path must be valid
 /// UTF-8.
@@ -2473,13 +3448,25 @@ fn resolve_shell(configured: Option<Shell>, host_shell: Option<&OsStr>) -> Shell
 /// # Errors
 ///
 /// Returns an error when the path is not valid UTF-8 or contains `:`.
-fn volume_host_path(project_root: &Path) -> Result<&str> {
+fn bind_host_path(project_root: &Path) -> Result<&str> {
     spec_host_path(project_root, "share")
 }
 
-/// Like [`volume_host_path`], for the shared and `.git` mount paths.
+/// Like [`bind_host_path`], for configured host and `.git` mount paths.
 fn mount_host_path(path: &Path) -> Result<&str> {
     spec_host_path(path, "mount")
+}
+
+/// Returns a path suitable for Apple's comma-delimited `--mount` syntax.
+fn mount_argument_path(path: &Path) -> Result<&str> {
+    path.to_str()
+        .filter(|value| !value.contains([',', '=']))
+        .ok_or_else(|| {
+            anyhow!(
+                "cannot mount `{}`: the path must be valid UTF-8 without `,` or `=`",
+                path.display()
+            )
+        })
 }
 
 fn spec_host_path<'a>(path: &'a Path, verb: &str) -> Result<&'a str> {
