@@ -19,7 +19,6 @@ fn main() -> ExitCode {
                 Some(ContainersCommand::Delete { selector, force }) => {
                     container::delete_selected_container(selector, *force)
                 }
-                Some(ContainersCommand::Prune) => container::prune_stopped_containers(),
             };
             return result.unwrap_or_else(|err| fail(&err));
         }
@@ -315,16 +314,6 @@ mod tests {
             assert_eq!(selector, "project");
             assert!(force);
         }
-    }
-
-    #[test]
-    fn containers_prune_parses_without_a_selector() {
-        assert!(matches!(
-            parse(&["silo", "containers", "prune"]),
-            Command::Containers {
-                command: Some(ContainersCommand::Prune)
-            }
-        ));
     }
 
     #[test]

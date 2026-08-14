@@ -527,16 +527,6 @@ fn image_digest_parser_accepts_current_inspect_schema() {
 }
 
 #[test]
-fn image_digest_parser_accepts_legacy_inspect_schema() {
-    let output = format!(r#"[{{"index":{{"digest":"{TEST_IMAGE_DIGEST}"}}}}]"#);
-
-    assert_eq!(
-        parse_image_digest(output.as_bytes()).expect("legacy schema parses"),
-        TEST_IMAGE_DIGEST
-    );
-}
-
-#[test]
 fn image_digest_parser_rejects_missing_or_malformed_output() {
     let missing =
         parse_image_digest(br#"[{"configuration":{}}]"#).expect_err("missing digest is rejected");
@@ -552,13 +542,6 @@ fn system_not_started_matches_the_cli_hint() {
                   Ensure container system service has been started with \
                   `container system start`.";
     assert!(system_not_started(stderr), "{stderr}");
-}
-
-#[test]
-fn system_not_started_matches_the_older_wording() {
-    assert!(system_not_started(
-        "error: container system start has not been run"
-    ));
 }
 
 #[test]
@@ -2298,7 +2281,7 @@ fn guest_readiness_probe_targets_the_explicit_marker() {
 }
 
 #[test]
-fn stop_guard_uses_the_current_embedded_script_for_stale_containers() {
+fn stop_guard_uses_the_current_embedded_script_for_existing_containers() {
     let command = stop_guard_command("silo-old");
     let args: Vec<&str> = command
         .get_args()
@@ -2457,19 +2440,6 @@ fn inspect_parser_accepts_current_nested_state() {
 }
 
 #[test]
-fn inspect_parser_accepts_legacy_image_digest_location() {
-    let json = br#"[{
-        "id":"silo-test",
-        "image":{"reference":"silo:latest","descriptor":{"digest":"sha256:bbbb"}},
-        "status":{"state":"running"}
-    }]"#;
-    let inspection = parse_container_inspection(json, "silo-test").expect("image parses");
-
-    assert_eq!(inspection.image.as_deref(), Some("silo:latest"));
-    assert_eq!(inspection.image_digest.as_deref(), Some("sha256:bbbb"));
-}
-
-#[test]
 fn inspect_parser_reads_bind_sources_for_safe_mount_deletion() {
     let json = br#"[{
         "id":"silo-test",
@@ -2486,17 +2456,6 @@ fn inspect_parser_reads_bind_sources_for_safe_mount_deletion() {
             PathBuf::from("/home/user/.local/state/silo/mounts/shared/codex"),
             PathBuf::from("/home/user/.local/state/silo/mounts/projects/abc/mounts/cache")
         ]
-    );
-}
-
-#[test]
-fn inspect_parser_accepts_legacy_flat_state() {
-    let json = br#"[{"configuration":{"id":"silo-test"},"status":"stopped"}]"#;
-    assert_eq!(
-        parse_container_inspection(json, "silo-test")
-            .expect("state parses")
-            .state,
-        ContainerState::Stopped,
     );
 }
 
@@ -2549,24 +2508,6 @@ fn inspect_parser_reads_runtime_labels() {
     assert_eq!(
         inspection.labels.get(LABEL_SPEC).map(String::as_str),
         Some("spec-digest")
-    );
-}
-
-#[test]
-fn inspect_parser_accepts_label_array_shape() {
-    let json = br#"[{
-        "configuration":{
-            "id":"silo-test",
-            "labels":[{"key":"dev.silo.owner","value":"silo"}]
-        },
-        "status":"stopped"
-    }]"#;
-    let inspection = parse_container_inspection(json, "silo-test").expect("inspection parses");
-
-    assert_eq!(inspection.state, ContainerState::Stopped);
-    assert_eq!(
-        inspection.labels.get(LABEL_OWNER).map(String::as_str),
-        Some(LABEL_OWNER_VALUE)
     );
 }
 
@@ -2808,23 +2749,13 @@ fn existing_container_identity_reuses_digest_spec_when_image_lookup_fails() {
 }
 
 #[test]
-fn existing_container_identity_reuses_legacy_tag_spec_without_image() {
+fn existing_container_identity_requires_a_recorded_digest_when_image_lookup_fails() {
     let project = test_project("/tmp/project");
-    let legacy = container_identity(
-        &project,
-        IMAGE_TAG,
-        &HostIds {
-            uid: "501".into(),
-            gid: "20".into(),
-        },
-        &ConfigMounts::default(),
-        &Container::default(),
-        LABEL_SHARED_VALUE,
-        &[OsString::from(SHARED_INIT_COMMAND)],
-    );
-    let inspection = shared_inspection(&project, &legacy);
+    let expected = shared_identity(&project);
+    let mut inspection = shared_inspection(&project, &expected);
+    inspection.image_digest = None;
 
-    let actual = desired_existing_container_identity_with(
+    let error = desired_existing_container_identity_with(
         &inspection,
         &project,
         &HostIds {
@@ -2833,11 +2764,15 @@ fn existing_container_identity_reuses_legacy_tag_spec_without_image() {
         },
         &ConfigMounts::default(),
         &Container::default(),
-        || Err(anyhow!("image is missing")),
+        || Err(anyhow!("image inspection is unavailable")),
     )
-    .expect("a pre-digest container remains reusable");
+    .expect_err("an identity without a recorded digest is not reusable");
 
-    assert_eq!(actual, legacy);
+    assert!(
+        error
+            .to_string()
+            .contains("image inspection is unavailable")
+    );
 }
 
 #[test]
@@ -2948,7 +2883,7 @@ fn spec_drift_preserves_the_container_when_the_image_is_missing() {
             Ok(())
         },
     )
-    .expect_err("the old container must survive without a replacement image");
+    .expect_err("the existing container must survive without a replacement image");
 
     assert!(error.to_string().contains("replacement image is missing"));
     assert!(!stopped.get());
@@ -3024,7 +2959,7 @@ fn spec_drift_classifies_a_concurrent_stop_as_retryable() {
     assert!(
         error
             .to_string()
-            .contains("could not safely stop the old container")
+            .contains("could not safely stop the existing container")
     );
     assert!(!deleted.get());
 }
@@ -3033,7 +2968,7 @@ fn spec_drift_classifies_a_concurrent_stop_as_retryable() {
 fn isolated_orphan_discovery_reads_runtime_ids_without_matching_buildkit() {
     let json = br#"[
         {"id":"silo-123","status":{"state":"running"}},
-        {"configuration":{"id":"silo-456"},"status":{"state":"stopped"}},
+        {"id":"silo-456","status":{"state":"stopped"}},
         {"id":"buildkit","status":{"state":"running"}}
     ]"#;
     let ids = parse_container_ids(json).expect("container list parses");

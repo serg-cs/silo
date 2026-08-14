@@ -1442,32 +1442,6 @@ pub fn delete_selected_container(selector: &str, force: bool) -> Result<ExitCode
     Ok(ExitCode::SUCCESS)
 }
 
-/// Deletes every stopped container still carrying valid Silo ownership
-/// metadata, primarily reclaiming roots left by older Silo releases.
-pub fn prune_stopped_containers() -> Result<ExitCode> {
-    let inventory = container_inventory()?;
-    for warning in inventory.warnings {
-        eprintln!("warning: {warning}");
-    }
-    let mut failures = Vec::new();
-    for container in inventory
-        .items
-        .into_iter()
-        .filter(|container| container.state == ContainerState::Stopped)
-    {
-        if let Err(err) = delete_stopped_container(&container) {
-            failures.push(format!("{}: {err:#}", container.id));
-        }
-    }
-    if failures.is_empty() {
-        return Ok(ExitCode::SUCCESS);
-    }
-    Err(anyhow!(
-        "could not prune one or more stopped Silo containers:\n{}",
-        failures.join("\n")
-    ))
-}
-
 fn stop_selected_container(container: &ContainerInfo, force: bool) -> Result<()> {
     let Some(inspection) = revalidate_selected_container(container)? else {
         return Ok(());
@@ -2293,9 +2267,8 @@ fn guarded_stop(container: &ContainerInfo) -> Result<()> {
     }
 }
 
-/// Runs the guard embedded in this host binary rather than the copy in the
-/// existing container. This keeps replacement safe while upgrading a stale
-/// container whose image predates the current reservation checks.
+/// Runs the guard embedded in this host binary rather than the container's
+/// copy, so replacement always uses the current reservation checks.
 fn stop_guard_command(id: &str) -> Command {
     let mut command = Command::new(CONTAINER_BIN);
     command
@@ -2852,8 +2825,8 @@ fn desired_existing_container_identity_with(
     }
 }
 
-/// Reconstructs digest-based and pre-digest specifications from durable
-/// inspection data, accepting only the one recorded on the container.
+/// Reconstructs the digest-based specification from durable inspection data,
+/// accepting it only when it matches the value recorded on the container.
 fn existing_container_identity(
     inspection: &ContainerInspection,
     project: &Project,
@@ -2864,10 +2837,8 @@ fn existing_container_identity(
     inspection
         .image_digest
         .as_deref()
-        .into_iter()
-        .chain(std::iter::once(IMAGE_TAG))
         .map(|image| shared_container_identity(project, image, ids, config_mounts, resources))
-        .find(|identity| inspection.labels.get(LABEL_SPEC) == Some(&identity.spec))
+        .filter(|identity| inspection.labels.get(LABEL_SPEC) == Some(&identity.spec))
 }
 
 /// Creates a detached shared container with a unique, automatically removed
@@ -3060,7 +3031,7 @@ fn replace_outdated_shared_container_with(
                 require_replacement_image()?;
                 if let Err(err) = stop(&container) {
                     return Ok(ReplacementOutcome::Conflict(err.context(format!(
-                        "configuration changed for container `{}`, but Silo could not safely stop the old container; it was not replaced",
+                        "configuration changed for container `{}`, but Silo could not safely stop the existing container; it was not replaced",
                         project.id
                     ))));
                 }
@@ -3085,7 +3056,7 @@ fn replace_outdated_shared_container_with(
     match delete(&container) {
         Ok(()) => Ok(ReplacementOutcome::Replaced),
         Err(err) => Ok(ReplacementOutcome::Conflict(err.context(format!(
-            "configuration changed for container `{}`, but Silo could not safely delete the old container; it was not replaced",
+            "configuration changed for container `{}`, but Silo could not safely delete the existing container; it was not replaced",
             project.id
         )))),
     }
@@ -3145,21 +3116,17 @@ fn container_inspect_error(id: &str, stderr: &str) -> anyhow::Error {
     anyhow!("could not inspect container `{id}`: {stderr}")
 }
 
-/// Parses the state and labels from current and older inspect JSON shapes.
+/// Parses a container inspection using the current Apple Container JSON shape.
 fn parse_container_inspection(stdout: &[u8], id: &str) -> Result<ContainerInspection> {
     let items: Vec<Value> =
         serde_json::from_slice(stdout).context("invalid container inspect JSON")?;
     let item = items
         .iter()
-        .find(|item| {
-            item.get("id").and_then(Value::as_str) == Some(id)
-                || item.pointer("/configuration/id").and_then(Value::as_str) == Some(id)
-        })
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
         .ok_or_else(|| anyhow!("container inspect did not return `{id}`"))?;
     let status = item
         .pointer("/status/state")
         .and_then(Value::as_str)
-        .or_else(|| item.get("status").and_then(Value::as_str))
         .ok_or_else(|| anyhow!("container inspect omitted the state for `{id}`"))?;
     let state = match status {
         "running" => ContainerState::Running,
@@ -3169,24 +3136,16 @@ fn parse_container_inspection(stdout: &[u8], id: &str) -> Result<ContainerInspec
     };
     let labels = item
         .pointer("/configuration/labels")
-        .or_else(|| item.get("labels"))
         .map(parse_inspect_labels)
         .transpose()?
         .unwrap_or_default();
     let image = item
         .pointer("/configuration/image/reference")
         .and_then(Value::as_str)
-        .or_else(|| item.pointer("/configuration/image").and_then(Value::as_str))
-        .or_else(|| item.pointer("/image/reference").and_then(Value::as_str))
-        .or_else(|| item.get("image").and_then(Value::as_str))
         .map(ToString::to_string);
     let image_digest = item
         .pointer("/configuration/image/descriptor/digest")
         .and_then(Value::as_str)
-        .or_else(|| {
-            item.pointer("/image/descriptor/digest")
-                .and_then(Value::as_str)
-        })
         .filter(|digest| !digest.is_empty())
         .map(ToString::to_string);
     let mount_sources = item
@@ -3207,36 +3166,18 @@ fn parse_container_inspection(stdout: &[u8], id: &str) -> Result<ContainerInspec
 }
 
 fn parse_inspect_labels(value: &Value) -> Result<HashMap<String, String>> {
-    if let Some(object) = value.as_object() {
-        return object
-            .iter()
-            .map(|(key, value)| {
-                value
-                    .as_str()
-                    .map(|value| (key.clone(), value.to_string()))
-                    .ok_or_else(|| anyhow!("container inspect label `{key}` is not a string"))
-            })
-            .collect();
-    }
-    if let Some(items) = value.as_array() {
-        return items
-            .iter()
-            .map(|item| {
-                let key = item
-                    .get("key")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("container inspect label omitted its key"))?;
-                let value = item
-                    .get("value")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("container inspect label `{key}` omitted its value"))?;
-                Ok((key.to_string(), value.to_string()))
-            })
-            .collect();
-    }
-    Err(anyhow!(
-        "container inspect labels are not an object or array"
-    ))
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("container inspect labels are not an object"))?;
+    object
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| (key.clone(), value.to_string()))
+                .ok_or_else(|| anyhow!("container inspect label `{key}` is not a string"))
+        })
+        .collect()
 }
 
 /// Returns whether the `container delete` result means the container is
@@ -3326,7 +3267,6 @@ fn parse_container_ids(stdout: &[u8]) -> Result<Vec<String>> {
         .map(|item| {
             item.get("id")
                 .and_then(Value::as_str)
-                .or_else(|| item.pointer("/configuration/id").and_then(Value::as_str))
                 .map(ToString::to_string)
                 .ok_or_else(|| anyhow!("container list item omitted its ID"))
         })
@@ -3375,14 +3315,12 @@ fn inspect_error(stderr: &str) -> anyhow::Error {
 }
 
 /// Returns whether the container CLI's stderr indicates the container system
-/// (the VM behind the CLI) has not been started. The CLI's own hint is
-/// "Ensure container system service has been started with `container system
-/// start`."; older releases worded it as "container system start has not
-/// been run".
+/// (the VM behind the CLI) has not been started, using the CLI's documented
+/// startup hint.
 fn system_not_started(stderr: &str) -> bool {
     let stderr = stderr.to_lowercase();
-    stderr.contains("container system start")
-        && (stderr.contains("has been started") || stderr.contains("has not been run"))
+    stderr.contains("container system service has been started")
+        && stderr.contains("container system start")
 }
 
 /// Boots the container system with `container system start`, passing its
@@ -3440,7 +3378,7 @@ fn probe_image() -> Result<(Option<String>, String)> {
     Ok((Some(parse_image_digest(&output.stdout)?), stderr))
 }
 
-/// Reads the immutable index digest from current and legacy inspect schemas.
+/// Reads the immutable index digest from the current image inspection schema.
 fn parse_image_digest(output: &[u8]) -> Result<String> {
     let value: Value = serde_json::from_slice(output)
         .context("could not parse image inspection output as JSON")?;
@@ -3448,16 +3386,12 @@ fn parse_image_digest(output: &[u8]) -> Result<String> {
         .as_array()
         .and_then(|images| images.first())
         .ok_or_else(|| anyhow!("image inspection output did not contain an image"))?;
-    for pointer in ["/configuration/descriptor/digest", "/index/digest"] {
-        if let Some(digest) = image.pointer(pointer).and_then(Value::as_str)
-            && !digest.is_empty()
-        {
-            return Ok(digest.to_string());
-        }
-    }
-    Err(anyhow!(
-        "image inspection output did not contain an OCI image digest"
-    ))
+    image
+        .pointer("/configuration/descriptor/digest")
+        .and_then(Value::as_str)
+        .filter(|digest| !digest.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("image inspection output did not contain an OCI image digest"))
 }
 
 fn execute(command: &mut Command) -> Result<ExitCode> {

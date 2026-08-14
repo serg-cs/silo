@@ -74,8 +74,6 @@ pub(crate) enum ContainersCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Delete all stopped Silo containers.
-    Prune,
 }
 
 #[derive(Subcommand)]
