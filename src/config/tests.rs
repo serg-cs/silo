@@ -63,6 +63,20 @@ fn container_resources_reject_impossible_values() {
 }
 
 #[test]
+fn container_resource_overrides_replace_only_supplied_values() {
+    let mut config = Config::parse("[container]\ncpus = 8\nmemory = \"32G\"\n")
+        .expect("container resources parse");
+
+    config.apply_container_overrides(Some(4), None);
+    assert_eq!(config.container.cpus, Some(4));
+    assert_eq!(config.container.memory.as_deref(), Some("32G"));
+
+    config.apply_container_overrides(None, Some("16G".to_string()));
+    assert_eq!(config.container.cpus, Some(4));
+    assert_eq!(config.container.memory.as_deref(), Some("16G"));
+}
+
+#[test]
 fn shell_defaults_to_host_detection() {
     let config = Config::parse("").expect("empty config parses");
     assert_eq!(config.shell, None);

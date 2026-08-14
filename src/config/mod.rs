@@ -98,6 +98,19 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Applies invocation-specific resource limits after global and project
+    /// configuration have been merged.
+    pub fn apply_container_overrides(&mut self, cpus: Option<usize>, memory: Option<String>) {
+        if let Some(cpus) = cpus {
+            self.container.cpus = Some(cpus);
+        }
+        if let Some(memory) = memory {
+            self.container.memory = Some(memory);
+        }
+    }
+}
+
 /// Image settings.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]

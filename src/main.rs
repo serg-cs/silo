@@ -39,8 +39,8 @@ fn main() -> ExitCode {
         Err(err) => return fail(&err),
     };
     // Loaded once for every config-consuming command. Precedence is built-in
-    // defaults < global config < project config < future CLI flags.
-    let config = match config::Config::load_for_project(&project.root) {
+    // defaults < global config < project config < CLI flags.
+    let mut config = match config::Config::load_for_project(&project.root) {
         Ok(config) => config,
         Err(err) => return fail(&err),
     };
@@ -54,7 +54,13 @@ fn main() -> ExitCode {
         Command::Image {
             command: ImageCommand::Build,
         } => container::build_image(&config),
-        Command::Run { isolated, command } => {
+        Command::Run {
+            isolated,
+            cpus,
+            memory,
+            command,
+        } => {
+            config.apply_container_overrides(cpus.map(std::num::NonZeroUsize::get), memory);
             container::run_image(&config, &project, &command, isolated)
         }
         Command::Containers { .. } | Command::Mounts { .. } => {
@@ -128,6 +134,8 @@ mod tests {
     fn run_passes_through_arbitrary_command() {
         let Command::Run {
             isolated: false,
+            cpus: None,
+            memory: None,
             command,
         } = parse(&["silo", "run", "--", "codex", "--model", "compact"])
         else {
@@ -166,6 +174,8 @@ mod tests {
     fn run_accepts_flag_shaped_tokens_after_double_dash() {
         let Command::Run {
             isolated: false,
+            cpus: None,
+            memory: None,
             command,
         } = parse(&["silo", "run", "--", "-t", "--model", "compact"])
         else {
@@ -185,6 +195,8 @@ mod tests {
     fn run_without_command_keeps_the_default_shell() {
         let Command::Run {
             isolated: false,
+            cpus: None,
+            memory: None,
             command,
         } = parse(&["silo", "run"])
         else {
@@ -197,6 +209,8 @@ mod tests {
     fn run_with_double_dash_and_no_command_keeps_the_default_shell() {
         let Command::Run {
             isolated: false,
+            cpus: None,
+            memory: None,
             command,
         } = parse(&["silo", "run", "--"])
         else {
@@ -209,6 +223,8 @@ mod tests {
     fn run_preserves_double_dash_inside_the_command() {
         let Command::Run {
             isolated: false,
+            cpus: None,
+            memory: None,
             command,
         } = parse(&["silo", "run", "--", "codex", "--", "--flag"])
         else {
@@ -390,6 +406,8 @@ mod tests {
     fn run_isolated_selects_the_ephemeral_lifecycle() {
         let Command::Run {
             isolated: true,
+            cpus: None,
+            memory: None,
             command,
         } = parse(&["silo", "run", "--isolated", "--", "nu", "-c", "version"])
         else {

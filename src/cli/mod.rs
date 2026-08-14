@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::num::NonZeroUsize;
 
 use clap::{Parser, Subcommand};
 
@@ -26,6 +27,12 @@ pub(crate) enum Command {
         /// Use a separate one-shot container removed when the session ends.
         #[arg(long)]
         isolated: bool,
+        /// Override the number of CPUs allocated to the container.
+        #[arg(long)]
+        cpus: Option<NonZeroUsize>,
+        /// Override the memory allocated to the container (for example `4G`).
+        #[arg(long, value_parser = parse_memory)]
+        memory: Option<String>,
         /// Command to run inside the container; empty runs the default shell.
         #[arg(value_name = "COMMAND", last = true)]
         command: Vec<OsString>,
@@ -83,3 +90,15 @@ pub(crate) enum MountsCommand {
         selector: String,
     },
 }
+
+/// Keeps CLI memory validation aligned with the configuration schema while
+/// leaving accepted size syntax to Apple Container.
+fn parse_memory(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err("memory must not be empty".to_string());
+    }
+    Ok(value.to_string())
+}
+
+#[cfg(test)]
+mod tests;
