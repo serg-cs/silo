@@ -2427,16 +2427,37 @@ fn wait_for_path(path: &Path) {
 fn inspect_parser_accepts_current_nested_state() {
     let json = br#"[{
         "id":"silo-test",
-        "configuration":{"image":{
-            "reference":"silo:latest",
-            "descriptor":{"digest":"sha256:aaaa"}
-        }},
+        "configuration":{
+            "image":{
+                "reference":"silo:latest",
+                "descriptor":{"digest":"sha256:aaaa"}
+            },
+            "resources":{"cpus":8,"memoryInBytes":12884901888}
+        },
         "status":{"state":"running","networks":[]}
     }]"#;
     let inspection = parse_container_inspection(json, "silo-test").expect("state parses");
     assert_eq!(inspection.state, ContainerState::Running);
     assert_eq!(inspection.image.as_deref(), Some("silo:latest"));
     assert_eq!(inspection.image_digest.as_deref(), Some("sha256:aaaa"));
+    assert_eq!(inspection.resources.cpus, Some(8));
+    assert_eq!(
+        inspection.resources.memory_bytes,
+        Some(12 * 1024 * 1024 * 1024)
+    );
+}
+
+#[test]
+fn inspect_parser_allows_missing_resources() {
+    let json = br#"[{
+        "id":"silo-test",
+        "configuration":{},
+        "status":{"state":"stopped"}
+    }]"#;
+
+    let inspection = parse_container_inspection(json, "silo-test").expect("inspection parses");
+
+    assert_eq!(inspection.resources, ContainerResources::default());
 }
 
 #[test]
@@ -2680,6 +2701,7 @@ fn shared_inspection(project: &Project, identity: &ContainerIdentity) -> Contain
         image: Some(IMAGE_TAG.to_string()),
         image_digest: Some(TEST_IMAGE_DIGEST.to_string()),
         mount_sources: Vec::new(),
+        resources: ContainerResources::default(),
     }
 }
 
@@ -2703,6 +2725,7 @@ fn inspect_identity_refuses_foreign_containers_including_buildkit() {
         image: None,
         image_digest: None,
         mount_sources: Vec::new(),
+        resources: ContainerResources::default(),
     };
 
     let error = validate_shared_container(&foreign, &project, &identity)
@@ -3010,6 +3033,7 @@ fn isolated_orphan_cleanup_requires_complete_runtime_ownership_labels() {
         image: Some(IMAGE_TAG.to_string()),
         image_digest: None,
         mount_sources: Vec::new(),
+        resources: ContainerResources::default(),
     };
     assert!(is_owned_isolated(&inspection));
 
@@ -3253,6 +3277,10 @@ fn inventory_item(id: &str, project: &str, lifecycle: ContainerLifecycle) -> Con
         project: PathBuf::from(project),
         spec: "a".repeat(64),
         image: IMAGE_TAG.to_string(),
+        resources: ContainerResources {
+            cpus: Some(4),
+            memory_bytes: Some(1024 * 1024 * 1024),
+        },
     }
 }
 
@@ -3343,6 +3371,7 @@ fn selected_ownership_rejects_a_replacement_with_different_labels() {
         project: project.root.clone(),
         spec: identity.spec.clone(),
         image: IMAGE_TAG.to_string(),
+        resources: ContainerResources::default(),
     };
     validate_selected_ownership(&selected, &inspection).expect("selected identity matches");
 
@@ -3376,19 +3405,24 @@ fn normal_delete_policy_refuses_active_and_unknown_sessions() {
 
 #[test]
 fn container_table_shows_the_agreed_snapshot_fields() {
-    let item = inventory_item(
+    let mut item = inventory_item(
         "silo-1234567890abcdef12345678",
         "/work/project",
         ContainerLifecycle::Shared,
     );
+    item.resources.cpus = Some(37);
     let table = render_container_table(&[item]);
     for expected in [
         "CONTAINER",
         "TYPE",
         "STATE",
         "SESSIONS",
+        "CPUS",
+        "MEMORY",
         "PROJECT",
         "IMAGE",
+        "37",
+        "1 GiB",
         "silo-1234567890a",
         "project",
         "silo:latest",
@@ -3399,6 +3433,19 @@ fn container_table_shows_the_agreed_snapshot_fields() {
         !table.contains(&display_path(Path::new("/work/project"))),
         "{table}"
     );
+}
+
+#[test]
+fn container_table_formats_memory_compactly_and_marks_unknown_resources() {
+    let mut item = inventory_item("silo-known", "/work/known", ContainerLifecycle::Shared);
+    item.resources.memory_bytes = Some(1536 * 1024 * 1024);
+    let mut unknown = inventory_item("silo-unknown", "/work/unknown", ContainerLifecycle::Shared);
+    unknown.resources = ContainerResources::default();
+
+    let table = render_container_table(&[item, unknown]);
+
+    assert!(table.contains("1536 MiB"), "{table}");
+    assert!(table.contains('?'), "{table}");
 }
 
 #[test]

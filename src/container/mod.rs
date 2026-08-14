@@ -477,6 +477,7 @@ struct ContainerInspection {
     image: Option<String>,
     image_digest: Option<String>,
     mount_sources: Vec<PathBuf>,
+    resources: ContainerResources,
 }
 
 impl ContainerInspection {
@@ -487,6 +488,7 @@ impl ContainerInspection {
             image: None,
             image_digest: None,
             mount_sources: Vec::new(),
+            resources: ContainerResources::default(),
         }
     }
 }
@@ -518,6 +520,12 @@ impl ContainerLifecycle {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ContainerResources {
+    cpus: Option<u64>,
+    memory_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContainerInfo {
     id: String,
@@ -527,6 +535,7 @@ struct ContainerInfo {
     project: PathBuf,
     spec: String,
     image: String,
+    resources: ContainerResources,
 }
 
 #[derive(Default)]
@@ -1568,6 +1577,7 @@ fn container_inventory() -> Result<ContainerInventory> {
             project,
             spec,
             image: inspection.image.unwrap_or_else(|| IMAGE_TAG.to_string()),
+            resources: inspection.resources,
         });
     }
     populate_session_counts(&mut inventory);
@@ -2090,9 +2100,18 @@ fn render_container_table(items: &[ContainerInfo]) -> String {
         .load_preset(NOTHING)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(
-            ["CONTAINER", "TYPE", "STATE", "SESSIONS", "PROJECT", "IMAGE"]
-                .into_iter()
-                .map(|value| Cell::new(value).add_attribute(Attribute::Bold)),
+            [
+                "CONTAINER",
+                "TYPE",
+                "STATE",
+                "SESSIONS",
+                "CPUS",
+                "MEMORY",
+                "PROJECT",
+                "IMAGE",
+            ]
+            .into_iter()
+            .map(|value| Cell::new(value).add_attribute(Attribute::Bold)),
         );
     for item in items {
         let mut state = Cell::new(item.state.as_str());
@@ -2112,11 +2131,34 @@ fn render_container_table(items: &[ContainerInfo]) -> String {
                 item.sessions
                     .map_or_else(|| "?".to_string(), |count| count.to_string()),
             ),
+            Cell::new(
+                item.resources
+                    .cpus
+                    .map_or_else(|| "?".to_string(), |cpus| cpus.to_string()),
+            ),
+            Cell::new(
+                item.resources
+                    .memory_bytes
+                    .map_or_else(|| "?".to_string(), format_memory),
+            ),
             Cell::new(display_project(&item.project, &ambiguous_names)),
             Cell::new(&item.image),
         ]);
     }
     table.to_string()
+}
+
+fn format_memory(bytes: u64) -> String {
+    const MEBIBYTE: u64 = 1024 * 1024;
+    const GIBIBYTE: u64 = 1024 * MEBIBYTE;
+
+    if bytes.is_multiple_of(GIBIBYTE) {
+        format!("{} GiB", bytes / GIBIBYTE)
+    } else if bytes.is_multiple_of(MEBIBYTE) {
+        format!("{} MiB", bytes / MEBIBYTE)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn short_id(id: &str) -> String {
@@ -2782,6 +2824,7 @@ fn container_info_from_inspection(
             .image
             .clone()
             .unwrap_or_else(|| IMAGE_TAG.to_string()),
+        resources: inspection.resources,
     })
 }
 
@@ -3023,6 +3066,7 @@ fn replace_outdated_shared_container_with(
             .image
             .clone()
             .unwrap_or_else(|| IMAGE_TAG.to_string()),
+        resources: inspection.resources,
     };
 
     match inspection.state {
@@ -3156,12 +3200,21 @@ fn parse_container_inspection(stdout: &[u8], id: &str) -> Result<ContainerInspec
         .filter_map(|mount| mount.get("source").and_then(Value::as_str))
         .map(PathBuf::from)
         .collect();
+    let resources = ContainerResources {
+        cpus: item
+            .pointer("/configuration/resources/cpus")
+            .and_then(Value::as_u64),
+        memory_bytes: item
+            .pointer("/configuration/resources/memoryInBytes")
+            .and_then(Value::as_u64),
+    };
     Ok(ContainerInspection {
         state,
         labels,
         image,
         image_digest,
         mount_sources,
+        resources,
     })
 }
 
