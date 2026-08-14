@@ -16,12 +16,10 @@ fn main() -> ExitCode {
         Command::Containers { command } => {
             let result = match command {
                 None | Some(ContainersCommand::List) => container::print_containers(),
-                Some(ContainersCommand::Stop { selector, force }) => {
-                    container::stop_container(selector, *force)
-                }
                 Some(ContainersCommand::Delete { selector, force }) => {
                     container::delete_selected_container(selector, *force)
                 }
+                Some(ContainersCommand::Prune) => container::prune_stopped_containers(),
             };
             return result.unwrap_or_else(|err| fail(&err));
         }
@@ -282,23 +280,11 @@ mod tests {
     }
 
     #[test]
-    fn containers_stop_requires_an_explicit_selector() {
-        let err = Cli::try_parse_from(["silo", "containers", "stop"])
+    fn containers_stop_is_no_longer_available() {
+        let err = Cli::try_parse_from(["silo", "containers", "stop", "silo-abcd"])
             .err()
-            .expect("selector is required");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    }
-
-    #[test]
-    fn containers_stop_parses_force() {
-        let Command::Containers {
-            command: Some(ContainersCommand::Stop { selector, force }),
-        } = parse(&["silo", "containers", "stop", "silo-abcd", "--force"])
-        else {
-            panic!("expected containers stop");
-        };
-        assert_eq!(selector, "silo-abcd");
-        assert!(force);
+            .expect("stop is not a management command");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]
@@ -313,6 +299,16 @@ mod tests {
             assert_eq!(selector, "project");
             assert!(force);
         }
+    }
+
+    #[test]
+    fn containers_prune_parses_without_a_selector() {
+        assert!(matches!(
+            parse(&["silo", "containers", "prune"]),
+            Command::Containers {
+                command: Some(ContainersCommand::Prune)
+            }
+        ));
     }
 
     #[test]

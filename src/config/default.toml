@@ -21,13 +21,14 @@ read_only_git = true
 # docs = { source = "~/docs", target = "~/docs" }
 # output = { source = "./output", target = "/output", writable = true }
 
-### Project mounts are writable Silo-managed state private to one project.
+### Project mounts are writable Silo-managed state private to one project and
+### survive automatic container removal after the final session exits.
 [mounts.project]
 # cargo = { target = "~/.cargo" }
 # cargo-target = { target = "./target" }
 
-### Shared mounts are writable Silo-managed state reused by every project with
-### the same name. Managed mounts are skipped for custom images.
+### Shared mounts are durable writable state reused by every project with the
+### same name. Managed mounts are skipped for custom images.
 [mounts.shared]
 # codex = { target = "~/.codex" }
 

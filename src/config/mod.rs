@@ -11,7 +11,8 @@
 //!
 //! On top of the built-in mounts (the shared project directory and the
 //! optional read-only `.git`), the `mounts` table provides named host mounts
-//! and managed project- or user-scoped persistent state.
+//! and managed project- or user-scoped state that survives automatic
+//! container removal.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;

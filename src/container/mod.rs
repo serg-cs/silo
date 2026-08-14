@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,9 @@ const STATUS_HELPER: &str = include_str!("silo-status.sh");
 const STOP_GUARD: &str = include_str!("silo-stop-guard.sh");
 
 const CONTAINER_BIN: &str = "container";
+
+/// Fixed parent for the per-user lock guarding Apple's user-global builder.
+const BUILD_LOCK_PARENT: &str = "/tmp";
 
 /// File that explicitly marks a directory as a Silo project root.
 const PROJECT_MARKER: &str = ".silo.toml";
@@ -128,6 +131,31 @@ struct MountLock {
     file: fs::File,
 }
 
+/// Cross-process serialization for Silo operations that replace Apple's
+/// user-global image builder. Its location cannot depend on process-specific
+/// state-directory environment variables.
+struct BuildLock {
+    _lock: MountLock,
+}
+
+impl BuildLock {
+    fn acquire() -> Result<Self> {
+        let root = global_build_lock_root();
+        ensure_owned_private_directory(&root, "image build lock root")?;
+        MountLock::acquire_at_for(&root, "image build").map(|lock| Self { _lock: lock })
+    }
+
+    #[cfg(test)]
+    fn acquire_at(state_root: &Path) -> Result<Self> {
+        MountLock::acquire_at_for(&state_root.join("build"), "image build")
+            .map(|lock| Self { _lock: lock })
+    }
+}
+
+fn global_build_lock_root() -> PathBuf {
+    Path::new(BUILD_LOCK_PARENT).join(format!("silo-build-{}", unsafe { libc::geteuid() }))
+}
+
 impl MountLock {
     fn acquire() -> Result<Self> {
         let state_root = managed_state_root_from_env().ok_or_else(|| {
@@ -138,7 +166,11 @@ impl MountLock {
     }
 
     fn acquire_at(root: &Path) -> Result<Self> {
-        ensure_private_directory(root, "managed mount root")?;
+        Self::acquire_at_for(root, "managed mount")
+    }
+
+    fn acquire_at_for(root: &Path, description: &str) -> Result<Self> {
+        ensure_private_directory(root, &format!("{description} lock root"))?;
         let path = root.join(".lock");
         let file = fs::OpenOptions::new()
             .read(true)
@@ -147,12 +179,13 @@ impl MountLock {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
-            .with_context(|| format!("could not open mount lock `{}`", path.display()))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("could not protect mount lock `{}`", path.display()))?;
+            .with_context(|| format!("could not open {description} lock `{}`", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!("could not protect {description} lock `{}`", path.display())
+        })?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(io::Error::last_os_error())
-                .with_context(|| format!("could not lock managed mounts `{}`", path.display()));
+                .with_context(|| format!("could not lock {description} `{}`", path.display()));
         }
         Ok(Self { file })
     }
@@ -328,6 +361,40 @@ fn ensure_private_directory(path: &Path, description: &str) -> Result<()> {
         return Err(anyhow!(
             "refusing to use {description} `{}` because it is not a real directory",
             path.display()
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("could not protect {description} `{}`", path.display()))
+}
+
+/// Protects a predictable directory in a shared parent such as `/tmp` from
+/// being substituted by another user before it is used for locking.
+fn ensure_owned_private_directory(path: &Path, description: &str) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not create {description} `{}`", path.display()));
+        }
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("could not inspect {description} `{}`", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(anyhow!(
+            "refusing to use {description} `{}` because it is not a real directory",
+            path.display()
+        ));
+    }
+    let expected_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != expected_uid {
+        return Err(anyhow!(
+            "refusing to use {description} `{}` because it is owned by user {} instead of {}",
+            path.display(),
+            metadata.uid(),
+            expected_uid
         ));
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -766,12 +833,25 @@ impl Drop for BuildDir {
 ///
 /// # Errors
 ///
-/// Returns an error when the configured Dockerfile path is empty, missing or
-/// not a file, when the container CLI is missing, when the Dockerfile cannot
-/// be written, or when the build itself fails.
+/// Returns an error when build serialization or storage cleanup fails, when
+/// the configured Dockerfile is unusable, when the container CLI is missing,
+/// when the embedded Dockerfile cannot be written, or when the build fails.
 pub fn build_image(config: &Config) -> Result<ExitCode> {
+    // Reject invalid custom input before storage maintenance can begin.
     if let Some(dockerfile) = &config.image.dockerfile {
         validate_dockerfile(dockerfile)?;
+    }
+    let _build_lock = BuildLock::acquire()?;
+    ensure_container_system_started()?;
+    run_build_lifecycle(
+        delete_builder,
+        || build_configured_image(config),
+        cleanup_build_storage,
+    )
+}
+
+fn build_configured_image(config: &Config) -> Result<ExitCode> {
+    if let Some(dockerfile) = &config.image.dockerfile {
         return execute_build(&mut build_command(
             dockerfile,
             dockerfile_context(dockerfile),
@@ -791,6 +871,110 @@ pub fn build_image(config: &Config) -> Result<ExitCode> {
         &build_dir.dockerfile(),
         build_dir.path(),
     ))
+}
+
+/// Reclaims stale builder storage before the build and guarantees normal-path
+/// teardown afterward, without hiding the build's own failure status.
+fn run_build_lifecycle(
+    delete_before: impl FnOnce() -> Result<()>,
+    build: impl FnOnce() -> Result<ExitCode>,
+    cleanup_after: impl FnOnce() -> Result<()>,
+) -> Result<ExitCode> {
+    delete_before()?;
+    let build_result = build();
+    let cleanup_result = cleanup_after();
+    match build_result {
+        Ok(code) if code == ExitCode::SUCCESS => {
+            cleanup_result?;
+            Ok(code)
+        }
+        Ok(code) => {
+            if let Err(err) = cleanup_result {
+                eprintln!("warning: image build cleanup failed: {err:#}");
+            }
+            Ok(code)
+        }
+        Err(err) => {
+            if let Err(cleanup_err) = cleanup_result {
+                eprintln!("warning: image build cleanup failed: {cleanup_err:#}");
+            }
+            Err(err)
+        }
+    }
+}
+
+fn ensure_container_system_started() -> Result<()> {
+    let (_, stderr) = probe_image()?;
+    if system_not_started(&stderr) && !start_container_system() {
+        return Err(anyhow!(
+            "could not start the Apple container system before cleaning build storage"
+        ));
+    }
+    Ok(())
+}
+
+fn delete_builder() -> Result<()> {
+    // Silo exclusively owns the user's Apple container state, so reclaiming
+    // the global builder is part of its storage lifecycle.
+    execute_maintenance(builder_delete_command(), "delete the global image builder")
+}
+
+fn prune_images() -> Result<()> {
+    // The exclusive-ownership contract also makes global dangling images
+    // disposable after Silo publishes its tagged image.
+    execute_maintenance(image_prune_command(), "prune dangling images")
+}
+
+fn cleanup_build_storage() -> Result<()> {
+    cleanup_build_storage_with(delete_builder, prune_images)
+}
+
+fn cleanup_build_storage_with(
+    delete: impl FnOnce() -> Result<()>,
+    prune: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let builder = delete();
+    let images = prune();
+    match (builder, images) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(builder), Ok(())) => Err(builder),
+        (Ok(()), Err(images)) => Err(images),
+        (Err(builder), Err(images)) => Err(anyhow!(
+            "could not delete the global image builder: {builder:#}; could not prune dangling images: {images:#}"
+        )),
+    }
+}
+
+fn builder_delete_command() -> Command {
+    let mut command = Command::new(CONTAINER_BIN);
+    command.args(["builder", "delete", "--force"]);
+    command
+}
+
+fn image_prune_command() -> Command {
+    let mut command = Command::new(CONTAINER_BIN);
+    command.args(["image", "prune"]);
+    command
+}
+
+fn execute_maintenance(mut command: Command, description: &str) -> Result<()> {
+    let status = command.status().map_err(spawn_error)?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "failed to {description}: `{}` exited with {}",
+        command_display(&command),
+        status
+    ))
+}
+
+fn command_display(command: &Command) -> String {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Checks that a configured Dockerfile path is usable: non-empty, existing,
@@ -1243,14 +1427,6 @@ fn prune_empty_project_mount_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stops the single Silo container selected by ID or project, preserving it.
-pub fn stop_container(selector: &str, force: bool) -> Result<ExitCode> {
-    let inventory = container_inventory()?;
-    let container = select_container(&inventory.items, selector)?.clone();
-    stop_selected_container(&container, force)?;
-    Ok(ExitCode::SUCCESS)
-}
-
 /// Stops and then deletes the single Silo container selected by ID or project.
 pub fn delete_selected_container(selector: &str, force: bool) -> Result<ExitCode> {
     let inventory = container_inventory()?;
@@ -1264,6 +1440,32 @@ pub fn delete_selected_container(selector: &str, force: bool) -> Result<ExitCode
         delete_stopped_container(&container)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Deletes every stopped container still carrying valid Silo ownership
+/// metadata, primarily reclaiming roots left by older Silo releases.
+pub fn prune_stopped_containers() -> Result<ExitCode> {
+    let inventory = container_inventory()?;
+    for warning in inventory.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let mut failures = Vec::new();
+    for container in inventory
+        .items
+        .into_iter()
+        .filter(|container| container.state == ContainerState::Stopped)
+    {
+        if let Err(err) = delete_stopped_container(&container) {
+            failures.push(format!("{}: {err:#}", container.id));
+        }
+    }
+    if failures.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    Err(anyhow!(
+        "could not prune one or more stopped Silo containers:\n{}",
+        failures.join("\n")
+    ))
 }
 
 fn stop_selected_container(container: &ContainerInfo, force: bool) -> Result<()> {
@@ -1292,7 +1494,7 @@ fn stop_selected_container(container: &ContainerInfo, force: bool) -> Result<()>
                 stop_runtime_container(container)?;
             } else {
                 return Err(anyhow!(
-                    "container `{}` is in an unsupported runtime state; use `--force` to stop it",
+                    "container `{}` is in an unsupported runtime state; use `--force` to terminate and delete it",
                     container.id
                 ));
             }
@@ -2534,28 +2736,14 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
                 }
             }
             ContainerState::Stopped => {
-                let identity = desired_identity(&inspection)?;
-                if shared_container_matches(&inspection, project, &identity)? {
-                    let mount_lock = needs_mount_lock(&config_mounts.named)
-                        .then(MountLock::acquire)
-                        .transpose()?;
-                    ensure_managed_mounts(&config_mounts.named)?;
-                    let output = Command::new(CONTAINER_BIN)
-                        .args(["start", &project.id])
-                        .output()
-                        .map_err(spawn_error)?;
-                    drop(mount_lock);
-                    if !output.status.success() {
-                        last_conflict = Some(anyhow!(
-                            "failed to start shared container '{}': {}",
-                            project.id,
-                            String::from_utf8_lossy(&output.stderr).trim()
-                        ));
-                    }
-                } else {
-                    match replace_outdated_shared_container(project, &inspection)? {
-                        ReplacementOutcome::Replaced => continue,
-                        ReplacementOutcome::Conflict(err) => last_conflict = Some(err),
+                let container = container_info_from_inspection(project, &inspection)?;
+                match delete_stopped_container(&container) {
+                    Ok(()) => continue,
+                    Err(err) => {
+                        last_conflict = Some(err.context(format!(
+                            "could not remove stopped container '{}' before recreating it",
+                            project.id
+                        )));
                     }
                 }
             }
@@ -2597,6 +2785,31 @@ fn shared_container_identity(
         LABEL_SHARED_VALUE,
         &[OsString::from(SHARED_INIT_COMMAND)],
     )
+}
+
+fn container_info_from_inspection(
+    project: &Project,
+    inspection: &ContainerInspection,
+) -> Result<ContainerInfo> {
+    validate_shared_ownership(inspection, project)?;
+    let spec = inspection.labels.get(LABEL_SPEC).cloned().ok_or_else(|| {
+        anyhow!(
+            "container '{}' is missing its Silo specification label",
+            project.id
+        )
+    })?;
+    Ok(ContainerInfo {
+        id: project.id.clone(),
+        lifecycle: ContainerLifecycle::Shared,
+        state: inspection.state,
+        sessions: Some(0),
+        project: project.root.clone(),
+        spec,
+        image: inspection
+            .image
+            .clone()
+            .unwrap_or_else(|| IMAGE_TAG.to_string()),
+    })
 }
 
 /// Prefers the current tag, but preserves a valid existing container when
@@ -3501,6 +3714,7 @@ fn create_command(
         .arg(&project.id)
         .arg("--cidfile")
         .arg(cidfile)
+        .arg("--rm")
         .arg("-d");
     append_resources(&mut run, resources);
     append_identity_labels(&mut run, &identity, LABEL_SHARED_VALUE);

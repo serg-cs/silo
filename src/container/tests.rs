@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::{Mount, MountKind, Permission, Shell};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -141,6 +141,107 @@ fn build_command_targets_embedded_dockerfile() {
             "/tmp/context"
         ]
     );
+}
+
+#[test]
+fn build_maintenance_commands_target_global_apple_storage() {
+    assert_eq!(
+        args_without_labels(&builder_delete_command()),
+        ["builder", "delete", "--force"]
+    );
+    assert_eq!(
+        args_without_labels(&image_prune_command()),
+        ["image", "prune"]
+    );
+}
+
+#[test]
+fn build_lifecycle_deletes_before_and_cleans_after_success() {
+    let events = RefCell::new(Vec::new());
+    let result = run_build_lifecycle(
+        || {
+            events.borrow_mut().push("delete-before");
+            Ok(())
+        },
+        || {
+            events.borrow_mut().push("build");
+            Ok(ExitCode::SUCCESS)
+        },
+        || {
+            events.borrow_mut().push("cleanup-after");
+            Ok(())
+        },
+    )
+    .expect("the lifecycle succeeds");
+
+    assert_eq!(result, ExitCode::SUCCESS);
+    assert_eq!(
+        events.into_inner(),
+        ["delete-before", "build", "cleanup-after"]
+    );
+}
+
+#[test]
+fn build_lifecycle_aborts_when_stale_builder_cannot_be_deleted() {
+    let built = Cell::new(false);
+    let cleaned = Cell::new(false);
+    let error = run_build_lifecycle(
+        || Err(anyhow!("builder is busy")),
+        || {
+            built.set(true);
+            Ok(ExitCode::SUCCESS)
+        },
+        || {
+            cleaned.set(true);
+            Ok(())
+        },
+    )
+    .expect_err("pre-build deletion is required");
+
+    assert!(error.to_string().contains("builder is busy"));
+    assert!(!built.get());
+    assert!(!cleaned.get());
+}
+
+#[test]
+fn failed_build_keeps_its_status_when_cleanup_also_fails() {
+    let result = run_build_lifecycle(
+        || Ok(()),
+        || Ok(ExitCode::from(7)),
+        || Err(anyhow!("prune failed")),
+    )
+    .expect("the build status is preserved");
+
+    assert_eq!(result, ExitCode::from(7));
+}
+
+#[test]
+fn successful_build_reports_cleanup_failure() {
+    let error = run_build_lifecycle(
+        || Ok(()),
+        || Ok(ExitCode::SUCCESS),
+        || Err(anyhow!("prune failed")),
+    )
+    .expect_err("cleanup is part of successful completion");
+
+    assert!(error.to_string().contains("prune failed"));
+}
+
+#[test]
+fn build_cleanup_attempts_builder_and_image_reclamation() {
+    let pruned = Cell::new(false);
+    let error = cleanup_build_storage_with(
+        || Err(anyhow!("delete failed")),
+        || {
+            pruned.set(true);
+            Err(anyhow!("prune failed"))
+        },
+    )
+    .expect_err("both maintenance failures are reported");
+
+    assert!(pruned.get());
+    assert!(error.to_string().contains("delete failed"));
+    assert!(error.to_string().contains("prune failed"));
 }
 
 #[test]
@@ -724,6 +825,17 @@ fn validate_dockerfile_rejects_missing_paths() {
     let path = std::env::temp_dir().join(format!("silo-test-missing-{}", std::process::id()));
     let _ = fs::remove_file(&path);
     let err = validate_dockerfile(&path).expect_err("missing path is invalid");
+    assert!(err.to_string().contains("does not exist"));
+}
+
+#[test]
+fn build_image_validates_custom_dockerfile_before_runtime_access() {
+    let dir = TestDir::new("missing-build-dockerfile");
+    let mut config = Config::default();
+    config.image.dockerfile = Some(dir.path().join("Dockerfile"));
+
+    let err = build_image(&config).expect_err("missing Dockerfile prevents maintenance");
+
     assert!(err.to_string().contains("does not exist"));
 }
 
@@ -1814,6 +1926,51 @@ fn managed_mount_lock_serializes_competing_operations() {
 }
 
 #[test]
+fn build_lock_serializes_competing_image_builds() {
+    let dir = TestDir::new("image-build-lock");
+    let first = BuildLock::acquire_at(dir.path()).expect("first lock succeeds");
+    let root = dir.path().to_path_buf();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let contender = std::thread::spawn(move || {
+        let second = BuildLock::acquire_at(&root).expect("second lock succeeds");
+        sender.send(()).expect("notification sends");
+        drop(second);
+    });
+
+    assert!(
+        receiver.recv_timeout(Duration::from_millis(100)).is_err(),
+        "the competing Silo build must wait for global builder ownership"
+    );
+    drop(first);
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the competing build resumes after unlock");
+    contender.join().expect("contender exits");
+}
+
+#[test]
+fn build_lock_location_is_stable_for_the_current_user() {
+    assert_eq!(
+        global_build_lock_root(),
+        Path::new(BUILD_LOCK_PARENT).join(format!("silo-build-{}", unsafe { libc::geteuid() }))
+    );
+}
+
+#[test]
+fn shared_build_lock_directory_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TestDir::new("private-build-lock");
+    let root = dir.path().join("lock");
+    ensure_owned_private_directory(&root, "test lock root").expect("lock root is created");
+
+    assert_eq!(
+        fs::metadata(root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
+#[test]
 fn isolated_container_id_embeds_the_pid() {
     assert_eq!(
         isolated_container_id(),
@@ -2018,6 +2175,7 @@ fn create_command_starts_the_detached_supervisor() {
             project.id.as_str(),
             "--cidfile",
             "/tmp/project.cid",
+            "--rm",
             "-d",
             "-v",
             "/tmp/project:/home/silo/project",
@@ -2062,7 +2220,7 @@ fn shared_create_command_applies_configured_resources() {
     .expect("command builds");
     let args = args_without_labels(&command);
 
-    assert_eq!(&args[6..10], ["--cpus", "6", "--memory", "12G"],);
+    assert_eq!(&args[7..11], ["--cpus", "6", "--memory", "12G"],);
 }
 
 #[test]
@@ -3127,6 +3285,14 @@ fn embedded_image_installs_playwright_cli_with_chromium() {
 }
 
 #[test]
+fn embedded_image_removes_package_caches_in_their_install_layers() {
+    assert!(DOCKERFILE.contains("brew cleanup --prune=all"));
+    assert!(DOCKERFILE.contains("rm -rf \"$(brew --cache)\""));
+    assert!(DOCKERFILE.contains("sudo apt-get clean"));
+    assert!(DOCKERFILE.contains("sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*"));
+}
+
+#[test]
 fn inventory_metadata_requires_a_matching_project_path_digest() {
     let project = test_project("/tmp/project");
     let identity = shared_identity(&project);
@@ -3255,7 +3421,7 @@ fn selected_ownership_rejects_a_replacement_with_different_labels() {
 }
 
 #[test]
-fn normal_stop_policy_refuses_active_and_unknown_sessions() {
+fn normal_delete_policy_refuses_active_and_unknown_sessions() {
     let mut item = inventory_item("silo-111", "/work/project", ContainerLifecycle::Shared);
     item.state = ContainerState::Running;
     item.sessions = Some(2);
@@ -3270,7 +3436,7 @@ fn normal_stop_policy_refuses_active_and_unknown_sessions() {
     assert!(unknown.to_string().contains("unknown session state"));
 
     item.sessions = Some(0);
-    require_inactive_sessions(&item.id, item.sessions).expect("an idle container can stop");
+    require_inactive_sessions(&item.id, item.sessions).expect("an idle container can be deleted");
 }
 
 #[test]

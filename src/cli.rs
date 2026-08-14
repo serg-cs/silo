@@ -58,14 +58,6 @@ pub(crate) enum ContainersCommand {
     /// List all shared and isolated Silo containers.
     #[command(alias = "ls")]
     List,
-    /// Stop one Silo container without deleting it.
-    Stop {
-        /// Exact container ID, unique ID prefix, project path, or unique project name.
-        selector: String,
-        /// Terminate active sessions before stopping the container.
-        #[arg(long)]
-        force: bool,
-    },
     /// Stop and delete one Silo container.
     #[command(alias = "rm")]
     Delete {
@@ -75,6 +67,8 @@ pub(crate) enum ContainersCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Delete all stopped Silo containers.
+    Prune,
 }
 
 #[derive(Subcommand)]

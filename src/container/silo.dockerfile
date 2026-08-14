@@ -31,7 +31,8 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         python3 \
         sudo \
         util-linux \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # ---- User --------------------------------------------------------------------
 # Single user with passwordless sudo.
@@ -43,7 +44,8 @@ USER silo
 
 # ---- Homebrew ----------------------------------------------------------------
 # brew refuses to run as root, so silo installs (and owns) it.
-RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+    && rm -rf "$(brew --cache)"
 
 # ---- Homebrew packages (formulae & casks) ----------------------------------
 RUN brew install \
@@ -81,13 +83,16 @@ RUN brew install \
         yazi \
         yamllint \
         zoxide \
-        zsh
+        zsh \
+    && brew cleanup --prune=all \
+    && rm -rf "$(brew --cache)"
 
 # ---- Agent browser tooling ---------------------------------------------------
 # Preinstall Chromium and its Linux libraries for browser inspection,
 # screenshots, and interactive agent sessions without a first-run download.
 RUN playwright-cli install-browser --with-deps \
-    && sudo rm -rf /var/lib/apt/lists/*
+    && sudo apt-get clean \
+    && sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # ---- Entrypoint / shell ------------------------------------------------------
 # Starts as root only to remap silo; drops to silo and execs the command
