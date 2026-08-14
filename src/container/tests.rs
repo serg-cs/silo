@@ -3084,6 +3084,7 @@ fn embedded_image_installs_and_registers_supported_shells() {
 #[test]
 fn embedded_image_installs_developer_tooling_and_yazi_dependencies() {
     for package in [
+        "actionlint",
         "antigravity-cli",
         "claude-code",
         "copilot-cli",
@@ -3093,9 +3094,15 @@ fn embedded_image_installs_developer_tooling_and_yazi_dependencies() {
         "jq",
         "just",
         "lazygit",
+        "playwright-cli",
+        "python",
         "qwen-code",
+        "ruff",
+        "shellcheck",
         "tmux",
+        "uv",
         "vim",
+        "yamllint",
     ] {
         assert!(
             DOCKERFILE
@@ -3110,6 +3117,13 @@ fn embedded_image_installs_developer_tooling_and_yazi_dependencies() {
             .any(|line| line.trim().trim_end_matches(" \\").trim() == "file"),
         "missing system package file"
     );
+}
+
+#[test]
+fn embedded_image_installs_playwright_cli_with_chromium() {
+    assert!(DOCKERFILE.contains("PLAYWRIGHT_BROWSERS_PATH=/home/silo/.cache/ms-playwright"));
+    assert!(DOCKERFILE.contains("playwright-cli install-browser --with-deps"));
+    assert!(!DOCKERFILE.contains("npm install --global @playwright/test"));
 }
 
 #[test]

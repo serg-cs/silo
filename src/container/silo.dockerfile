@@ -14,7 +14,8 @@ ENV BREW_PREFIX=/home/linuxbrew/.linuxbrew \
     HOMEBREW_NO_AUTO_UPDATE=1 \
     HOMEBREW_NO_ENV_HINTS=1 \
     LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8
+    LC_ALL=C.UTF-8 \
+    PLAYWRIGHT_BROWSERS_PATH=/home/silo/.cache/ms-playwright
 ENV PATH="${BREW_PREFIX}/bin:${BREW_PREFIX}/sbin:${PATH}"
 
 # ---- System packages (apt) ---------------------------------------------------
@@ -46,6 +47,7 @@ RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.co
 
 # ---- Homebrew packages (formulae & casks) ----------------------------------
 RUN brew install \
+        actionlint \
         antigravity-cli \
         bat \
         claude-code \
@@ -65,15 +67,27 @@ RUN brew install \
         nushell \
         opencode \
         pi-coding-agent \
+        playwright-cli \
+        python \
         qwen-code \
         ripgrep \
+        ruff \
         rust \
         rust-analyzer \
+        shellcheck \
         tmux \
+        uv \
         vim \
         yazi \
+        yamllint \
         zoxide \
         zsh
+
+# ---- Agent browser tooling ---------------------------------------------------
+# Preinstall Chromium and its Linux libraries for browser inspection,
+# screenshots, and interactive agent sessions without a first-run download.
+RUN playwright-cli install-browser --with-deps \
+    && sudo rm -rf /var/lib/apt/lists/*
 
 # ---- Entrypoint / shell ------------------------------------------------------
 # Starts as root only to remap silo; drops to silo and execs the command
