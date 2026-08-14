@@ -5,6 +5,9 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const TEST_IMAGE_DIGEST: &str =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 fn resolved_host(name: &str, host: &str, dest: &str, access: Permission) -> ResolvedMount {
     ResolvedMount {
         name: name.to_string(),
@@ -134,6 +137,7 @@ fn build_command_targets_embedded_dockerfile() {
             "--tag",
             "silo:latest",
             "--pull",
+            "--no-cache",
             "/tmp/context"
         ]
     );
@@ -411,6 +415,37 @@ fn inspect_error_reports_probe_failures() {
 }
 
 #[test]
+fn image_digest_parser_accepts_current_inspect_schema() {
+    let output =
+        format!(r#"[{{"configuration":{{"descriptor":{{"digest":"{TEST_IMAGE_DIGEST}"}}}}}}]"#);
+
+    assert_eq!(
+        parse_image_digest(output.as_bytes()).expect("current schema parses"),
+        TEST_IMAGE_DIGEST
+    );
+}
+
+#[test]
+fn image_digest_parser_accepts_legacy_inspect_schema() {
+    let output = format!(r#"[{{"index":{{"digest":"{TEST_IMAGE_DIGEST}"}}}}]"#);
+
+    assert_eq!(
+        parse_image_digest(output.as_bytes()).expect("legacy schema parses"),
+        TEST_IMAGE_DIGEST
+    );
+}
+
+#[test]
+fn image_digest_parser_rejects_missing_or_malformed_output() {
+    let missing =
+        parse_image_digest(br#"[{"configuration":{}}]"#).expect_err("missing digest is rejected");
+    let malformed = parse_image_digest(b"not json").expect_err("malformed JSON is rejected");
+
+    assert!(missing.to_string().contains("OCI image digest"));
+    assert!(malformed.to_string().contains("as JSON"));
+}
+
+#[test]
 fn system_not_started_matches_the_cli_hint() {
     let stderr = "Error: XPC connection error\n\
                   Ensure container system service has been started with \
@@ -494,7 +529,7 @@ fn execute_build_boots_before_building_when_the_probe_says_not_started() {
     command.args(["-c", &format!("echo build >> '{log_path}'")]);
     let result = execute_build_with(
         &mut command,
-        || Ok((false, NOT_STARTED_HINT.to_string())),
+        || Ok((None, NOT_STARTED_HINT.to_string())),
         || {
             boots.set(boots.get() + 1);
             append_log(&log, "boot");
@@ -517,7 +552,7 @@ fn execute_build_does_not_boot_when_the_probe_says_the_system_is_up() {
     command.args(["-c", &format!("echo build >> '{log_path}'")]);
     let result = execute_build_with(
         &mut command,
-        || Ok((false, "Error: image not found: silo:latest".to_string())),
+        || Ok((None, "Error: image not found: silo:latest".to_string())),
         || {
             boots.set(boots.get() + 1);
             true
@@ -554,7 +589,7 @@ fn execute_build_boots_and_retries_once_when_the_probe_misses() {
     ]);
     let result = execute_build_with(
         &mut command,
-        || Ok((false, "Error: image not found: silo:latest".to_string())),
+        || Ok((None, "Error: image not found: silo:latest".to_string())),
         || {
             boots.set(boots.get() + 1);
             append_log(&log, "boot");
@@ -574,7 +609,7 @@ fn execute_build_passes_through_failures_unrelated_to_the_system() {
     command.args(["-c", "echo 'Error: Dockerfile is missing' >&2; exit 2"]);
     let result = execute_build_with(
         &mut command,
-        || Ok((false, "Error: image not found: silo:latest".to_string())),
+        || Ok((None, "Error: image not found: silo:latest".to_string())),
         || {
             boots.set(boots.get() + 1);
             true
@@ -592,7 +627,7 @@ fn execute_build_passes_through_the_first_exit_code_when_the_boot_fails() {
     command.args(["-c", &format!("echo '{NOT_STARTED_HINT}' >&2; exit 1")]);
     let result = execute_build_with(
         &mut command,
-        || Ok((false, "Error: image not found: silo:latest".to_string())),
+        || Ok((None, "Error: image not found: silo:latest".to_string())),
         || {
             boots.set(boots.get() + 1);
             false
@@ -607,13 +642,13 @@ fn execute_build_passes_through_the_first_exit_code_when_the_boot_fails() {
 fn inspect_image_boots_and_reprobes_when_the_system_is_not_started() {
     let probes = Cell::new(0);
     let boots = Cell::new(0);
-    let (exists, _) = inspect_image_with(
+    let (digest, _) = inspect_image_with(
         || {
             probes.set(probes.get() + 1);
             if probes.get() == 1 {
-                Ok((false, NOT_STARTED_HINT.to_string()))
+                Ok((None, NOT_STARTED_HINT.to_string()))
             } else {
-                Ok((true, String::new()))
+                Ok((Some(TEST_IMAGE_DIGEST.to_string()), String::new()))
             }
         },
         || {
@@ -622,7 +657,7 @@ fn inspect_image_boots_and_reprobes_when_the_system_is_not_started() {
         },
     )
     .expect("probe runs");
-    assert!(exists);
+    assert_eq!(digest.as_deref(), Some(TEST_IMAGE_DIGEST));
     assert_eq!(probes.get(), 2);
     assert_eq!(boots.get(), 1);
 }
@@ -630,15 +665,15 @@ fn inspect_image_boots_and_reprobes_when_the_system_is_not_started() {
 #[test]
 fn inspect_image_reports_the_original_stderr_when_the_boot_fails() {
     let boots = Cell::new(0);
-    let (exists, stderr) = inspect_image_with(
-        || Ok((false, NOT_STARTED_HINT.to_string())),
+    let (digest, stderr) = inspect_image_with(
+        || Ok((None, NOT_STARTED_HINT.to_string())),
         || {
             boots.set(boots.get() + 1);
             false
         },
     )
     .expect("probe runs");
-    assert!(!exists);
+    assert!(digest.is_none());
     assert_eq!(stderr, NOT_STARTED_HINT);
     assert_eq!(boots.get(), 1);
 }
@@ -646,15 +681,15 @@ fn inspect_image_reports_the_original_stderr_when_the_boot_fails() {
 #[test]
 fn inspect_image_does_not_boot_when_the_system_is_up() {
     let boots = Cell::new(0);
-    let (exists, stderr) = inspect_image_with(
-        || Ok((false, "Error: image not found: silo:latest".to_string())),
+    let (digest, stderr) = inspect_image_with(
+        || Ok((None, "Error: image not found: silo:latest".to_string())),
         || {
             boots.set(boots.get() + 1);
             true
         },
     )
     .expect("probe runs");
-    assert!(!exists);
+    assert!(digest.is_none());
     assert_eq!(stderr, "Error: image not found: silo:latest");
     assert_eq!(boots.get(), 0);
 }
@@ -991,6 +1026,7 @@ fn shared_create_bind_mounts_all_managed_storage() {
     };
     let command = create_command(
         &test_project("/tmp/project"),
+        TEST_IMAGE_DIGEST,
         &ids,
         &mounts,
         &Container::default(),
@@ -1912,6 +1948,7 @@ fn discovered_project_root_drives_shared_and_isolated_mounts() {
     .expect("isolated command builds");
     let shared = create_command(
         &project,
+        TEST_IMAGE_DIGEST,
         &ids,
         &mounts,
         &Container::default(),
@@ -1965,6 +2002,7 @@ fn create_command_starts_the_detached_supervisor() {
     };
     let command = create_command(
         &project,
+        TEST_IMAGE_DIGEST,
         &ids,
         &ConfigMounts::default(),
         &Container::default(),
@@ -2015,6 +2053,7 @@ fn shared_create_command_applies_configured_resources() {
     };
     let command = create_command(
         &project,
+        TEST_IMAGE_DIGEST,
         &ids,
         &ConfigMounts::default(),
         &resources,
@@ -2247,12 +2286,29 @@ fn wait_for_path(path: &Path) {
 fn inspect_parser_accepts_current_nested_state() {
     let json = br#"[{
         "id":"silo-test",
-        "configuration":{"image":{"reference":"silo:latest"}},
+        "configuration":{"image":{
+            "reference":"silo:latest",
+            "descriptor":{"digest":"sha256:aaaa"}
+        }},
         "status":{"state":"running","networks":[]}
     }]"#;
     let inspection = parse_container_inspection(json, "silo-test").expect("state parses");
     assert_eq!(inspection.state, ContainerState::Running);
     assert_eq!(inspection.image.as_deref(), Some("silo:latest"));
+    assert_eq!(inspection.image_digest.as_deref(), Some("sha256:aaaa"));
+}
+
+#[test]
+fn inspect_parser_accepts_legacy_image_digest_location() {
+    let json = br#"[{
+        "id":"silo-test",
+        "image":{"reference":"silo:latest","descriptor":{"digest":"sha256:bbbb"}},
+        "status":{"state":"running"}
+    }]"#;
+    let inspection = parse_container_inspection(json, "silo-test").expect("image parses");
+
+    assert_eq!(inspection.image.as_deref(), Some("silo:latest"));
+    assert_eq!(inspection.image_digest.as_deref(), Some("sha256:bbbb"));
 }
 
 #[test]
@@ -2440,6 +2496,7 @@ fn mount_table_shows_identity_scope_name_project_and_source() {
 fn shared_identity(project: &Project) -> ContainerIdentity {
     container_identity(
         project,
+        TEST_IMAGE_DIGEST,
         &HostIds {
             uid: "501".into(),
             gid: "20".into(),
@@ -2466,6 +2523,7 @@ fn shared_inspection(project: &Project, identity: &ContainerIdentity) -> Contain
             (LABEL_SPEC.to_string(), identity.spec.clone()),
         ]),
         image: Some(IMAGE_TAG.to_string()),
+        image_digest: Some(TEST_IMAGE_DIGEST.to_string()),
         mount_sources: Vec::new(),
     }
 }
@@ -2488,6 +2546,7 @@ fn inspect_identity_refuses_foreign_containers_including_buildkit() {
         state: ContainerState::Running,
         labels: HashMap::new(),
         image: None,
+        image_digest: None,
         mount_sources: Vec::new(),
     };
 
@@ -2510,6 +2569,107 @@ fn inspect_identity_distinguishes_owned_spec_drift() {
         !shared_container_matches(&inspection, &project, &identity)
             .expect("the outdated container is still owned")
     );
+}
+
+#[test]
+fn existing_container_identity_reuses_digest_spec_when_image_lookup_fails() {
+    let project = test_project("/tmp/project");
+    let expected = shared_identity(&project);
+    let inspection = shared_inspection(&project, &expected);
+
+    let actual = desired_existing_container_identity_with(
+        &inspection,
+        &project,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts::default(),
+        &Container::default(),
+        || Err(anyhow!("image inspection is unavailable")),
+    )
+    .expect("the inspected container remains reusable");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn existing_container_identity_reuses_legacy_tag_spec_without_image() {
+    let project = test_project("/tmp/project");
+    let legacy = container_identity(
+        &project,
+        IMAGE_TAG,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts::default(),
+        &Container::default(),
+        LABEL_SHARED_VALUE,
+        &[OsString::from(SHARED_INIT_COMMAND)],
+    );
+    let inspection = shared_inspection(&project, &legacy);
+
+    let actual = desired_existing_container_identity_with(
+        &inspection,
+        &project,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts::default(),
+        &Container::default(),
+        || Err(anyhow!("image is missing")),
+    )
+    .expect("a pre-digest container remains reusable");
+
+    assert_eq!(actual, legacy);
+}
+
+#[test]
+fn existing_container_identity_requires_an_image_for_configuration_drift() {
+    let project = test_project("/tmp/project");
+    let mut inspection = shared_inspection(&project, &shared_identity(&project));
+    inspection
+        .labels
+        .insert(LABEL_SPEC.to_string(), "outdated".to_string());
+
+    let error = desired_existing_container_identity_with(
+        &inspection,
+        &project,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts::default(),
+        &Container::default(),
+        || Err(anyhow!("image is missing")),
+    )
+    .expect_err("configuration drift needs a replacement image");
+
+    assert!(error.to_string().contains("image is missing"));
+}
+
+#[test]
+fn existing_container_identity_prefers_the_current_image_digest() {
+    let project = test_project("/tmp/project");
+    let inspection = shared_inspection(&project, &shared_identity(&project));
+    let updated_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let actual = desired_existing_container_identity_with(
+        &inspection,
+        &project,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts::default(),
+        &Container::default(),
+        || Ok(updated_digest.to_string()),
+    )
+    .expect("the current image is available");
+
+    assert_ne!(actual.spec, shared_identity(&project).spec);
 }
 
 #[test]
@@ -2675,6 +2835,7 @@ fn isolated_orphan_cleanup_requires_complete_runtime_ownership_labels() {
     let project = test_project("/tmp/project");
     let identity = container_identity(
         &project,
+        IMAGE_TAG,
         &HostIds {
             uid: "501".into(),
             gid: "20".into(),
@@ -2698,6 +2859,7 @@ fn isolated_orphan_cleanup_requires_complete_runtime_ownership_labels() {
             (LABEL_SPEC.to_string(), identity.spec),
         ]),
         image: Some(IMAGE_TAG.to_string()),
+        image_digest: None,
         mount_sources: Vec::new(),
     };
     assert!(is_owned_isolated(&inspection));
@@ -2735,6 +2897,7 @@ fn specification_digest_is_deterministic_and_creation_sensitive() {
     ));
     let changed = container_identity(
         &project,
+        TEST_IMAGE_DIGEST,
         &HostIds {
             uid: "501".into(),
             gid: "20".into(),
@@ -2751,6 +2914,26 @@ fn specification_digest_is_deterministic_and_creation_sensitive() {
 }
 
 #[test]
+fn specification_digest_tracks_the_built_image() {
+    let project = test_project("/tmp/project");
+    let current = shared_identity(&project);
+    let updated = container_identity(
+        &project,
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts::default(),
+        &Container::default(),
+        LABEL_SHARED_VALUE,
+        &[OsString::from(SHARED_INIT_COMMAND)],
+    );
+
+    assert_ne!(current.spec, updated.spec);
+}
+
+#[test]
 fn specification_digest_tracks_resource_limits() {
     let project = test_project("/tmp/project");
     let ids = HostIds {
@@ -2761,6 +2944,7 @@ fn specification_digest_tracks_resource_limits() {
     let command = [OsString::from(SHARED_INIT_COMMAND)];
     let defaults = container_identity(
         &project,
+        TEST_IMAGE_DIGEST,
         &ids,
         &mounts,
         &Container::default(),
@@ -2769,6 +2953,7 @@ fn specification_digest_tracks_resource_limits() {
     );
     let with_cpus = container_identity(
         &project,
+        TEST_IMAGE_DIGEST,
         &ids,
         &mounts,
         &Container {
@@ -2780,6 +2965,7 @@ fn specification_digest_tracks_resource_limits() {
     );
     let with_memory = container_identity(
         &project,
+        TEST_IMAGE_DIGEST,
         &ids,
         &mounts,
         &Container {

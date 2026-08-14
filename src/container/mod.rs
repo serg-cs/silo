@@ -408,6 +408,7 @@ struct ContainerInspection {
     state: ContainerState,
     labels: HashMap<String, String>,
     image: Option<String>,
+    image_digest: Option<String>,
     mount_sources: Vec<PathBuf>,
 }
 
@@ -417,6 +418,7 @@ impl ContainerInspection {
             state: ContainerState::Absent,
             labels: HashMap::new(),
             image: None,
+            image_digest: None,
             mount_sources: Vec::new(),
         }
     }
@@ -757,10 +759,10 @@ impl Drop for BuildDir {
     }
 }
 
-/// Builds the image: the embedded Dockerfile by default, or the Dockerfile
-/// configured in `[image] dockerfile`, which is then the user's own image.
-/// When the container system has not been started, boots it first so the
-/// build does not fail and get retried for that.
+/// Rebuilds the image without cached layers: the embedded Dockerfile by
+/// default, or the Dockerfile configured in `[image] dockerfile`, which is
+/// then the user's own image. When the container system has not been started,
+/// boots it first so the build does not fail and get retried for that.
 ///
 /// # Errors
 ///
@@ -2231,6 +2233,7 @@ fn project_digest(project: &Path) -> String {
 /// Builds the desired runtime identity from every creation-time input.
 fn container_identity(
     project: &Project,
+    image: &str,
     host_ids: &HostIds,
     config_mounts: &ConfigMounts,
     resources: &Container,
@@ -2238,7 +2241,7 @@ fn container_identity(
     command: &[OsString],
 ) -> ContainerIdentity {
     let mut hasher = Sha256::new();
-    hash_spec_field(&mut hasher, b"image", IMAGE_TAG.as_bytes());
+    hash_spec_field(&mut hasher, b"image", image.as_bytes());
     hash_spec_field(&mut hasher, b"lifecycle", lifecycle.as_bytes());
     hash_spec_field(&mut hasher, b"uid", host_ids.uid.as_bytes());
     hash_spec_field(&mut hasher, b"gid", host_ids.gid.as_bytes());
@@ -2431,32 +2434,37 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
     let ids = host_ids()?;
     let config_mounts = resolve_config_mounts(config, &project.root)?;
     warn_mount_conflicts(project, &config_mounts);
-    let identity = container_identity(
-        project,
-        &ids,
-        &config_mounts,
-        &config.container,
-        LABEL_SHARED_VALUE,
-        &[OsString::from(SHARED_INIT_COMMAND)],
-    );
     let deadline = Instant::now() + CONFLICT_RETRY_TIMEOUT;
-    let mut checked_image = false;
     let mut last_conflict = None;
+    let desired_identity = |inspection: &ContainerInspection| -> Result<ContainerIdentity> {
+        desired_existing_container_identity(
+            inspection,
+            project,
+            &ids,
+            &config_mounts,
+            &config.container,
+        )
+    };
 
     loop {
         let inspection = inspect_container(&project.id)?;
         match inspection.state {
             ContainerState::Absent => {
-                if !checked_image {
-                    require_image()?;
-                    checked_image = true;
-                }
+                let image_digest = require_image_digest()?;
+                let identity = shared_container_identity(
+                    project,
+                    &image_digest,
+                    &ids,
+                    &config_mounts,
+                    &config.container,
+                );
                 let mount_lock = needs_mount_lock(&config_mounts.named)
                     .then(MountLock::acquire)
                     .transpose()?;
                 ensure_managed_mounts(&config_mounts.named)?;
                 let creation = create_shared_container(
                     project,
+                    &image_digest,
                     &ids,
                     &config_mounts,
                     &config.container,
@@ -2469,18 +2477,17 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
                 }
             }
             ContainerState::Running => {
+                let identity = desired_identity(&inspection)?;
                 if shared_container_matches(&inspection, project, &identity)? {
                     return Ok(());
                 }
                 match replace_outdated_shared_container(project, &inspection)? {
-                    ReplacementOutcome::Replaced => {
-                        checked_image = true;
-                        continue;
-                    }
+                    ReplacementOutcome::Replaced => continue,
                     ReplacementOutcome::Conflict(err) => last_conflict = Some(err),
                 }
             }
             ContainerState::Stopped => {
+                let identity = desired_identity(&inspection)?;
                 if shared_container_matches(&inspection, project, &identity)? {
                     let mount_lock = needs_mount_lock(&config_mounts.named)
                         .then(MountLock::acquire)
@@ -2500,10 +2507,7 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
                     }
                 } else {
                     match replace_outdated_shared_container(project, &inspection)? {
-                        ReplacementOutcome::Replaced => {
-                            checked_image = true;
-                            continue;
-                        }
+                        ReplacementOutcome::Replaced => continue,
                         ReplacementOutcome::Conflict(err) => last_conflict = Some(err),
                     }
                 }
@@ -2530,10 +2534,87 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
     }
 }
 
+fn shared_container_identity(
+    project: &Project,
+    image: &str,
+    ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    resources: &Container,
+) -> ContainerIdentity {
+    container_identity(
+        project,
+        image,
+        ids,
+        config_mounts,
+        resources,
+        LABEL_SHARED_VALUE,
+        &[OsString::from(SHARED_INIT_COMMAND)],
+    )
+}
+
+/// Prefers the current tag, but preserves a valid existing container when
+/// the image store is temporarily unavailable or the mutable tag was removed.
+fn desired_existing_container_identity(
+    inspection: &ContainerInspection,
+    project: &Project,
+    ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    resources: &Container,
+) -> Result<ContainerIdentity> {
+    desired_existing_container_identity_with(
+        inspection,
+        project,
+        ids,
+        config_mounts,
+        resources,
+        require_image_digest,
+    )
+}
+
+fn desired_existing_container_identity_with(
+    inspection: &ContainerInspection,
+    project: &Project,
+    ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    resources: &Container,
+    inspect_image: impl FnOnce() -> Result<String>,
+) -> Result<ContainerIdentity> {
+    match inspect_image() {
+        Ok(digest) => Ok(shared_container_identity(
+            project,
+            &digest,
+            ids,
+            config_mounts,
+            resources,
+        )),
+        Err(err) => existing_container_identity(inspection, project, ids, config_mounts, resources)
+            .ok_or(err),
+    }
+}
+
+/// Reconstructs digest-based and pre-digest specifications from durable
+/// inspection data, accepting only the one recorded on the container.
+fn existing_container_identity(
+    inspection: &ContainerInspection,
+    project: &Project,
+    ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    resources: &Container,
+) -> Option<ContainerIdentity> {
+    inspection
+        .image_digest
+        .as_deref()
+        .into_iter()
+        .chain(std::iter::once(IMAGE_TAG))
+        .map(|image| shared_container_identity(project, image, ids, config_mounts, resources))
+        .find(|identity| inspection.labels.get(LABEL_SPEC) == Some(&identity.spec))
+}
+
 /// Creates a detached shared container with a unique, automatically removed
 /// cidfile beneath the current user's temporary directory.
 fn create_shared_container(
     project: &Project,
+    image_digest: &str,
     ids: &HostIds,
     config_mounts: &ConfigMounts,
     resources: &Container,
@@ -2544,9 +2625,23 @@ fn create_shared_container(
         .tempdir_in(std::env::temp_dir())
         .context("failed to create temporary cid directory")?;
     let cidfile = cid_dir.path().join("container.cid");
-    let output = create_command(project, ids, config_mounts, resources, &cidfile)?
-        .output()
-        .map_err(spawn_error)?;
+    let current_digest = require_image_digest()?;
+    if current_digest != image_digest {
+        return Err(anyhow!(
+            "image `{IMAGE_TAG}` changed while creating container '{}'; retrying",
+            project.id
+        ));
+    }
+    let output = create_command(
+        project,
+        image_digest,
+        ids,
+        config_mounts,
+        resources,
+        &cidfile,
+    )?
+    .output()
+    .map_err(spawn_error)?;
 
     if !output.status.success() {
         cleanup_partial_creation(project, identity, &cidfile);
@@ -2567,6 +2662,13 @@ fn create_shared_container(
         ));
     }
     let inspection = inspect_container(&project.id)?;
+    if inspection.image_digest.as_deref() != Some(image_digest) {
+        cleanup_partial_creation(project, identity, &cidfile);
+        return Err(anyhow!(
+            "container '{}' was created from a different image than `{IMAGE_TAG}`; retrying",
+            project.id
+        ));
+    }
     validate_shared_container(&inspection, project, identity)?;
     Ok(())
 }
@@ -2818,6 +2920,15 @@ fn parse_container_inspection(stdout: &[u8], id: &str) -> Result<ContainerInspec
         .or_else(|| item.pointer("/image/reference").and_then(Value::as_str))
         .or_else(|| item.get("image").and_then(Value::as_str))
         .map(ToString::to_string);
+    let image_digest = item
+        .pointer("/configuration/image/descriptor/digest")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            item.pointer("/image/descriptor/digest")
+                .and_then(Value::as_str)
+        })
+        .filter(|digest| !digest.is_empty())
+        .map(ToString::to_string);
     let mount_sources = item
         .pointer("/configuration/mounts")
         .and_then(Value::as_array)
@@ -2830,6 +2941,7 @@ fn parse_container_inspection(stdout: &[u8], id: &str) -> Result<ContainerInspec
         state,
         labels,
         image,
+        image_digest,
         mount_sources,
     })
 }
@@ -3023,47 +3135,69 @@ fn start_container_system() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Runs `container image inspect`, returning whether the image exists and the
-/// probe's stderr (which explains why the check failed, when it did). When
-/// the probe fails because the container system has not been started, boots
-/// it first and probes again once; if the boot fails, the probe's stderr is
-/// reported unchanged so the user still sees the original failure.
-fn inspect_image() -> Result<(bool, String)> {
+/// Runs `container image inspect`, returning the image's OCI digest when it
+/// exists and the probe's stderr otherwise. When the probe fails because the
+/// container system has not been started, boots it first and probes again
+/// once; if the boot fails, the original failure remains available.
+fn inspect_image() -> Result<(Option<String>, String)> {
     inspect_image_with(probe_image, start_container_system)
 }
 
-/// Requires the built image only for operations that create a container.
+/// Requires the built image for operations that only need its presence.
 fn require_image() -> Result<()> {
-    let (exists, stderr) = inspect_image()?;
-    if exists {
-        Ok(())
-    } else {
-        Err(inspect_error(&stderr))
-    }
+    require_image_digest().map(|_| ())
+}
+
+/// Returns the built image's immutable identity for shared-container reuse.
+fn require_image_digest() -> Result<String> {
+    let (digest, stderr) = inspect_image()?;
+    digest.ok_or_else(|| inspect_error(&stderr))
 }
 
 /// The probe/boot/reprobe logic behind [`inspect_image`], separated so tests
 /// can substitute fakes for the `container` CLI.
 fn inspect_image_with(
-    probe: impl Fn() -> Result<(bool, String)>,
+    probe: impl Fn() -> Result<(Option<String>, String)>,
     boot: impl Fn() -> bool,
-) -> Result<(bool, String)> {
-    let (exists, stderr) = probe()?;
-    if !exists && system_not_started(&stderr) && boot() {
+) -> Result<(Option<String>, String)> {
+    let (digest, stderr) = probe()?;
+    if digest.is_none() && system_not_started(&stderr) && boot() {
         return probe();
     }
-    Ok((exists, stderr))
+    Ok((digest, stderr))
 }
 
 /// Runs the raw `container image inspect` probe, without booting anything.
-fn probe_image() -> Result<(bool, String)> {
+fn probe_image() -> Result<(Option<String>, String)> {
     let output = Command::new(CONTAINER_BIN)
         .args(["image", "inspect", IMAGE_TAG])
-        .stdout(Stdio::null())
         .output()
         .map_err(spawn_error)?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Ok((output.status.success(), stderr))
+    if !output.status.success() {
+        return Ok((None, stderr));
+    }
+    Ok((Some(parse_image_digest(&output.stdout)?), stderr))
+}
+
+/// Reads the immutable index digest from current and legacy inspect schemas.
+fn parse_image_digest(output: &[u8]) -> Result<String> {
+    let value: Value = serde_json::from_slice(output)
+        .context("could not parse image inspection output as JSON")?;
+    let image = value
+        .as_array()
+        .and_then(|images| images.first())
+        .ok_or_else(|| anyhow!("image inspection output did not contain an image"))?;
+    for pointer in ["/configuration/descriptor/digest", "/index/digest"] {
+        if let Some(digest) = image.pointer(pointer).and_then(Value::as_str)
+            && !digest.is_empty()
+        {
+            return Ok(digest.to_string());
+        }
+    }
+    Err(anyhow!(
+        "image inspection output did not contain an OCI image digest"
+    ))
 }
 
 fn execute(command: &mut Command) -> Result<ExitCode> {
@@ -3092,7 +3226,7 @@ fn execute_build(command: &mut Command) -> Result<ExitCode> {
 /// can substitute fakes for the `container` CLI.
 fn execute_build_with(
     command: &mut Command,
-    probe: impl Fn() -> Result<(bool, String)>,
+    probe: impl Fn() -> Result<(Option<String>, String)>,
     boot: impl Fn() -> bool,
 ) -> Result<ExitCode> {
     // Boot before building when the probe says the system is not started.
@@ -3197,6 +3331,7 @@ fn build_command(dockerfile: &Path, context: &Path) -> Command {
         .arg("--tag")
         .arg(IMAGE_TAG)
         .arg("--pull")
+        .arg("--no-cache")
         .arg(context);
     command
 }
@@ -3253,6 +3388,7 @@ fn isolated_create_command(
     };
     let identity = container_identity(
         &project,
+        IMAGE_TAG,
         host_ids,
         config_mounts,
         resources,
@@ -3297,6 +3433,7 @@ fn isolated_start_command(id: &str) -> Command {
 /// Builds the detached creation command for a shared project container.
 fn create_command(
     project: &Project,
+    image_digest: &str,
     host_ids: &HostIds,
     config_mounts: &ConfigMounts,
     resources: &Container,
@@ -3304,6 +3441,7 @@ fn create_command(
 ) -> Result<Command> {
     let identity = container_identity(
         project,
+        image_digest,
         host_ids,
         config_mounts,
         resources,
@@ -3321,6 +3459,8 @@ fn create_command(
     append_identity_labels(&mut run, &identity, LABEL_SHARED_VALUE);
     append_creation_mounts(&mut run, &project.root, &project.workdir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
+    // Creation verifies the tag immediately before and the resolved digest
+    // immediately after this command, closing concurrent retag races.
     run.arg(IMAGE_TAG).arg(SHARED_INIT_COMMAND);
     Ok(run)
 }

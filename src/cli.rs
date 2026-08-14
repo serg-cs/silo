@@ -49,7 +49,7 @@ pub(crate) enum Command {
 
 #[derive(Subcommand)]
 pub(crate) enum ImageCommand {
-    /// Build the configured Silo image.
+    /// Rebuild the configured Silo image without cached layers.
     Build,
 }
 
