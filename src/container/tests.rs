@@ -2444,6 +2444,16 @@ fn mount_selectors_support_ids_names_paths_and_report_ambiguity() {
         .to_string();
     assert!(message.contains(&items[0].0.id), "{message}");
     assert!(message.contains(&items[1].0.id), "{message}");
+    assert!(message.contains("project"), "{message}");
+    assert!(message.contains("cargo"), "{message}");
+    assert!(
+        message.contains(&display_path(Path::new("/one/project"))),
+        "{message}"
+    );
+    assert!(
+        message.contains(&display_path(Path::new("/two/project"))),
+        "{message}"
+    );
 }
 
 #[test]
@@ -2491,6 +2501,52 @@ fn mount_table_shows_identity_scope_name_project_and_source() {
         );
     }
     assert!(rendered.contains(&item.0.id), "{rendered}");
+    assert!(
+        !rendered.contains(&display_path(Path::new("/work/project"))),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn mount_table_uses_paths_only_for_repeated_project_names() {
+    let items = [
+        MountInfo(test_managed_mount(
+            StateScope::Project,
+            "cargo",
+            Some(Path::new("/work/alpha")),
+        )),
+        MountInfo(test_managed_mount(
+            StateScope::Project,
+            "codex",
+            Some(Path::new("/work/alpha")),
+        )),
+        MountInfo(test_managed_mount(
+            StateScope::Project,
+            "cargo",
+            Some(Path::new("/one/project")),
+        )),
+        MountInfo(test_managed_mount(
+            StateScope::Project,
+            "cargo",
+            Some(Path::new("/two/project")),
+        )),
+    ];
+
+    let rendered = render_mount_table(&items);
+
+    assert!(rendered.contains("alpha"), "{rendered}");
+    assert!(
+        !rendered.contains(&display_path(Path::new("/work/alpha"))),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&display_path(Path::new("/one/project"))),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&display_path(Path::new("/two/project"))),
+        "{rendered}"
+    );
 }
 
 fn shared_identity(project: &Project) -> ContainerIdentity {
@@ -3123,12 +3179,22 @@ fn selectors_support_ids_prefixes_paths_and_unique_project_names() {
 fn selectors_report_ambiguous_project_matches() {
     let items = [
         inventory_item("silo-111", "/one/project", ContainerLifecycle::Shared),
-        inventory_item("silo-222", "/two/project", ContainerLifecycle::Shared),
+        inventory_item("silo-222", "/two/project", ContainerLifecycle::Isolated),
     ];
     let error = select_container(&items, "project").expect_err("name is ambiguous");
     let message = error.to_string();
     assert!(message.contains("silo-111"), "{message}");
     assert!(message.contains("silo-222"), "{message}");
+    assert!(message.contains("shared"), "{message}");
+    assert!(message.contains("isolated"), "{message}");
+    assert!(
+        message.contains(&display_path(Path::new("/one/project"))),
+        "{message}"
+    );
+    assert!(
+        message.contains(&display_path(Path::new("/two/project"))),
+        "{message}"
+    );
 }
 
 #[test]
@@ -3209,10 +3275,75 @@ fn container_table_shows_the_agreed_snapshot_fields() {
         "PROJECT",
         "IMAGE",
         "silo-1234567890a",
+        "project",
         "silo:latest",
     ] {
         assert!(table.contains(expected), "missing {expected} in:\n{table}");
     }
+    assert!(
+        !table.contains(&display_path(Path::new("/work/project"))),
+        "{table}"
+    );
+}
+
+#[test]
+fn container_table_uses_paths_only_for_repeated_project_names() {
+    let items = [
+        inventory_item("silo-alpha", "/work/alpha", ContainerLifecycle::Shared),
+        inventory_item(
+            "silo-alpha-isolated",
+            "/work/alpha",
+            ContainerLifecycle::Isolated,
+        ),
+        inventory_item("silo-one", "/one/project", ContainerLifecycle::Shared),
+        inventory_item("silo-two", "/two/project", ContainerLifecycle::Shared),
+    ];
+
+    let rendered = render_container_table(&items);
+
+    assert!(rendered.contains("alpha"), "{rendered}");
+    assert!(
+        !rendered.contains(&display_path(Path::new("/work/alpha"))),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&display_path(Path::new("/one/project"))),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&display_path(Path::new("/two/project"))),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn project_display_falls_back_to_paths_without_a_basename() {
+    let ambiguous_names = ambiguous_project_names([Path::new("/")]);
+
+    assert_eq!(display_project(Path::new("/"), &ambiguous_names), "/");
+}
+
+#[cfg(unix)]
+#[test]
+fn project_display_keeps_paths_for_non_utf8_basenames() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let first = Path::new(OsStr::from_bytes(b"/one/\x80"));
+    let second = Path::new(OsStr::from_bytes(b"/two/\x81"));
+    let ambiguous_names = ambiguous_project_names([first, second]);
+
+    assert_eq!(
+        display_project(first, &ambiguous_names),
+        display_path(first)
+    );
+    assert_eq!(
+        display_project(second, &ambiguous_names),
+        display_path(second)
+    );
+    assert_ne!(
+        display_project(first, &ambiguous_names),
+        display_project(second, &ambiguous_names)
+    );
 }
 
 #[cfg(target_os = "linux")]

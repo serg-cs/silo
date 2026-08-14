@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
@@ -1647,6 +1647,8 @@ fn valid_mount_name(name: &str) -> bool {
 }
 
 fn render_mount_table(items: &[MountInfo]) -> String {
+    let ambiguous_names =
+        ambiguous_project_names(items.iter().filter_map(|item| item.0.project.as_deref()));
     let mut table = Table::new();
     table
         .load_preset(NOTHING)
@@ -1661,12 +1663,10 @@ fn render_mount_table(items: &[MountInfo]) -> String {
             Cell::new(&mount.id),
             Cell::new(mount.scope.as_str()),
             Cell::new(&mount.name),
-            Cell::new(
-                mount
-                    .project
-                    .as_deref()
-                    .map_or_else(|| "-".to_string(), display_path),
-            ),
+            Cell::new(mount.project.as_deref().map_or_else(
+                || "-".to_string(),
+                |project| display_project(project, &ambiguous_names),
+            )),
             Cell::new(display_path(&mount.path)),
         ]);
     }
@@ -1687,6 +1687,36 @@ fn display_path(path: &Path) -> String {
             }
         },
     )
+}
+
+/// Finds basenames that identify more than one distinct canonical project.
+fn ambiguous_project_names<'a>(
+    projects: impl IntoIterator<Item = &'a Path>,
+) -> BTreeSet<&'a OsStr> {
+    let mut first_paths = BTreeMap::new();
+    let mut ambiguous = BTreeSet::new();
+    for project in projects {
+        let Some(name) = project.file_name() else {
+            continue;
+        };
+        if let Some(first) = first_paths.get(name) {
+            if *first != project {
+                ambiguous.insert(name);
+            }
+        } else {
+            first_paths.insert(name, project);
+        }
+    }
+    ambiguous
+}
+
+fn display_project(project: &Path, ambiguous_names: &BTreeSet<&OsStr>) -> String {
+    match project.file_name() {
+        Some(name) if !ambiguous_names.contains(name) => name
+            .to_str()
+            .map_or_else(|| display_path(project), str::to_owned),
+        Some(_) | None => display_path(project),
+    }
 }
 
 fn select_mount<'a>(items: &'a [MountInfo], selector: &str) -> Result<&'a MountInfo> {
@@ -1733,7 +1763,20 @@ fn one_mount_match<'a>(selector: &str, matches: &[&'a MountInfo]) -> Result<&'a 
         "selector `{selector}` is ambiguous; matching managed mounts: {}",
         matches
             .iter()
-            .map(|item| item.0.id.as_str())
+            .map(|item| {
+                let mount = &item.0;
+                let project = mount
+                    .project
+                    .as_deref()
+                    .map_or_else(|| "-".to_string(), display_path);
+                format!(
+                    "{} ({}, {}, {})",
+                    mount.id,
+                    mount.scope.as_str(),
+                    mount.name,
+                    project
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ")
     ))
@@ -1865,6 +1908,7 @@ fn inspect_session_count(id: &str) -> Result<usize> {
 
 fn render_container_table(items: &[ContainerInfo]) -> String {
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let ambiguous_names = ambiguous_project_names(items.iter().map(|item| item.project.as_path()));
     let mut table = Table::new();
     table
         .load_preset(NOTHING)
@@ -1892,7 +1936,7 @@ fn render_container_table(items: &[ContainerInfo]) -> String {
                 item.sessions
                     .map_or_else(|| "?".to_string(), |count| count.to_string()),
             ),
-            Cell::new(display_project(item)),
+            Cell::new(display_project(&item.project, &ambiguous_names)),
             Cell::new(&item.image),
         ]);
     }
@@ -1906,10 +1950,6 @@ fn short_id(id: &str) -> String {
     } else {
         id.chars().take(DISPLAY_CHARS).collect()
     }
-}
-
-fn display_project(item: &ContainerInfo) -> String {
-    display_path(&item.project)
 }
 
 fn select_container<'a>(items: &'a [ContainerInfo], selector: &str) -> Result<&'a ContainerInfo> {
@@ -1954,7 +1994,14 @@ fn one_match<'a>(selector: &str, matches: &[&'a ContainerInfo]) -> Result<&'a Co
         "selector `{selector}` is ambiguous; matching containers: {}",
         matches
             .iter()
-            .map(|item| item.id.as_str())
+            .map(|item| {
+                format!(
+                    "{} ({}, {})",
+                    item.id,
+                    item.lifecycle.as_str(),
+                    display_path(&item.project)
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ")
     ))
