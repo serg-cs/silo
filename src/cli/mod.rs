@@ -13,6 +13,11 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
+    /// Inspect and manage Silo configuration.
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
+    },
     /// Manage the image used by Silo.
     Image {
         #[command(subcommand)]
@@ -52,6 +57,25 @@ pub(crate) enum Command {
     /// are appended.
     #[command(external_subcommand)]
     Quick(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConfigCommand {
+    /// Print the effective configuration for the current project.
+    #[command(alias = "ls")]
+    List,
+    /// Edit the nearest project configuration, or the global configuration.
+    Edit {
+        /// Edit the global configuration even when a project file exists.
+        #[arg(long)]
+        global: bool,
+    },
+    /// Print the bundled starter configuration.
+    Default,
+    /// Print the active configuration file paths in precedence order.
+    Path,
+    /// Validate the effective configuration for the current project.
+    Check,
 }
 
 #[derive(Subcommand)]

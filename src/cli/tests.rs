@@ -2,13 +2,71 @@ use std::ffi::OsString;
 
 use clap::{Parser, error::ErrorKind};
 
-use super::{Cli, Command};
+use super::{Cli, Command, ConfigCommand};
 
 fn parse(args: &[&str]) -> Command {
     let arguments: Vec<OsString> = args.iter().map(OsString::from).collect();
     Cli::try_parse_from(arguments)
         .expect("arguments parse")
         .command
+}
+
+#[test]
+fn config_defaults_to_effective_list() {
+    assert!(matches!(
+        parse(&["silo", "config"]),
+        Command::Config { command: None }
+    ));
+    for name in ["list", "ls"] {
+        assert!(matches!(
+            parse(&["silo", "config", name]),
+            Command::Config {
+                command: Some(ConfigCommand::List)
+            }
+        ));
+    }
+}
+
+#[test]
+fn config_parses_management_subcommands() {
+    assert!(matches!(
+        parse(&["silo", "config", "default"]),
+        Command::Config {
+            command: Some(ConfigCommand::Default)
+        }
+    ));
+    assert!(matches!(
+        parse(&["silo", "config", "path"]),
+        Command::Config {
+            command: Some(ConfigCommand::Path)
+        }
+    ));
+    assert!(matches!(
+        parse(&["silo", "config", "check"]),
+        Command::Config {
+            command: Some(ConfigCommand::Check)
+        }
+    ));
+}
+
+#[test]
+fn config_edit_accepts_only_its_global_flag() {
+    assert!(matches!(
+        parse(&["silo", "config", "edit", "--global"]),
+        Command::Config {
+            command: Some(ConfigCommand::Edit { global: true })
+        }
+    ));
+    for arguments in [
+        &["silo", "config", "--global", "edit"][..],
+        &["silo", "config", "list", "--global"][..],
+        &["silo", "config", "path", "--global"][..],
+    ] {
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("misplaced global flag is rejected");
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
 }
 
 #[test]

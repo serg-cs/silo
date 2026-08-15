@@ -435,15 +435,35 @@ impl Project {
 
     /// Canonicalizes a starting directory and discovers its project root.
     fn from_path(cwd: &Path) -> Result<Self> {
-        let cwd = fs::canonicalize(cwd)
-            .with_context(|| format!("failed to resolve project directory `{}`", cwd.display()))?;
-        let root = discover_project_root(&cwd);
+        Self::from_root(project_root_from_path(cwd)?)
+    }
+
+    /// Applies container-specific validation after config-independent project
+    /// root discovery has completed.
+    fn from_root(root: PathBuf) -> Result<Self> {
         // Validate before persisting the path in labels or mount metadata.
         bind_host_path(&root)?;
         let workdir = shared_dir_name(&root)?;
         let id = project_container_id(&root);
         Ok(Self { root, workdir, id })
     }
+}
+
+/// Discovers the current project root without requiring it to be a valid
+/// container mount. Config-only commands use this lighter-weight path.
+///
+/// # Errors
+///
+/// Returns an error when the current directory cannot be read or resolved.
+pub(crate) fn current_project_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    project_root_from_path(&cwd)
+}
+
+fn project_root_from_path(cwd: &Path) -> Result<PathBuf> {
+    let cwd = fs::canonicalize(cwd)
+        .with_context(|| format!("failed to resolve project directory `{}`", cwd.display()))?;
+    Ok(discover_project_root(&cwd))
 }
 
 /// Selects a project root from an already-canonical starting directory.
@@ -846,10 +866,7 @@ impl Drop for BuildDir {
 /// the configured Dockerfile is unusable, when the container CLI is missing,
 /// when the embedded Dockerfile cannot be written, or when the build fails.
 pub fn build_image(config: &Config) -> Result<ExitCode> {
-    // Reject invalid custom input before storage maintenance can begin.
-    if let Some(dockerfile) = &config.image.dockerfile {
-        validate_dockerfile(dockerfile)?;
-    }
+    validate_image_config(config)?;
     let _build_lock = BuildLock::acquire()?;
     ensure_container_system_started()?;
     run_build_lifecycle(
@@ -857,6 +874,30 @@ pub fn build_image(config: &Config) -> Result<ExitCode> {
         || build_configured_image(config),
         cleanup_build_storage,
     )
+}
+
+/// Validates image-related config without accessing the container runtime.
+///
+/// # Errors
+///
+/// Returns an error when a configured Dockerfile path is unusable.
+fn validate_image_config(config: &Config) -> Result<()> {
+    if let Some(dockerfile) = &config.image.dockerfile {
+        validate_dockerfile(dockerfile)?;
+    }
+    Ok(())
+}
+
+/// Validates config relationships that are known to be unusable before any
+/// container runtime access occurs.
+///
+/// # Errors
+///
+/// Returns an error when image config is invalid or an enabled mount is
+/// incompatible with the selected image type.
+pub(crate) fn validate_effective_config(config: &Config) -> Result<()> {
+    validate_image_config(config)?;
+    validate_custom_image_mounts(&config.mounts, config.image.dockerfile.is_some())
 }
 
 fn build_configured_image(config: &Config) -> Result<ExitCode> {
@@ -1163,29 +1204,40 @@ fn resolve_isolated_named_mounts(
     xdg_state_home: Option<&Path>,
     custom_image: bool,
 ) -> Result<ResolvedIsolatedMounts> {
+    validate_custom_image_mounts(mounts, custom_image)?;
     let mut available = mounts.clone();
     let skipped = remove_unavailable_managed_mounts(&mut available, custom_image);
-    if custom_image {
-        for (name, mount) in available.iter().filter(|(_, mount)| mount.is_enabled()) {
-            if mount
-                .target
-                .as_deref()
-                .and_then(Path::to_str)
-                .is_some_and(|target| target.starts_with("~/"))
-            {
-                return Err(anyhow!(
-                    "host mount `{name}` uses home-relative target `{}` but custom images have no Silo-defined home; use a project-relative `./...` target or an absolute target",
-                    mount
-                        .target
-                        .as_deref()
-                        .expect("target was matched")
-                        .display()
-                ));
-            }
-        }
-    }
     let named = resolve_named_mounts(&available, project_root, home, xdg_state_home)?;
     Ok(ResolvedIsolatedMounts { named, skipped })
+}
+
+/// Rejects enabled host mounts whose target depends on the built-in image's
+/// home-directory contract.
+fn validate_custom_image_mounts(
+    mounts: &BTreeMap<String, Mount>,
+    custom_image: bool,
+) -> Result<()> {
+    if !custom_image {
+        return Ok(());
+    }
+    for (name, mount) in mounts
+        .iter()
+        .filter(|(_, mount)| mount.kind() == Some(MountKind::Host) && mount.is_enabled())
+    {
+        let Some(target) = mount.target.as_deref() else {
+            continue;
+        };
+        if target
+            .to_str()
+            .is_some_and(|target| target.starts_with("~/"))
+        {
+            return Err(anyhow!(
+                "host mount `{name}` uses home-relative target `{}` but custom images have no Silo-defined home; use a project-relative `./...` target or an absolute target",
+                target.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn remove_unavailable_managed_mounts(

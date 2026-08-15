@@ -8,10 +8,13 @@ mod cli;
 mod config;
 mod container;
 
-use cli::{Cli, Command, ContainersCommand, ImageCommand, MountsCommand};
+use cli::{Cli, Command, ConfigCommand, ContainersCommand, ImageCommand, MountsCommand};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Command::Config { command } = &cli.command {
+        return run_config_command(command.as_ref()).unwrap_or_else(|err| fail(&err));
+    }
     match &cli.command {
         Command::Containers { command } => {
             let result = match command {
@@ -39,17 +42,12 @@ fn main() -> ExitCode {
     };
     // Loaded once for every config-consuming command. Precedence is built-in
     // defaults < global config < project config < CLI flags.
-    let mut config = match config::Config::load_for_project(&project.root) {
+    let mut config = match load_config(&project.root) {
         Ok(config) => config,
         Err(err) => return fail(&err),
     };
-    // A quick command whose name collides with a built-in command could
-    // never run (the built-in wins), and a flag-shaped name is unreachable.
-    // Such names do not block other commands; report them and continue.
-    if let Err(err) = config.check_quick_names(&builtin_commands()) {
-        eprintln!("warning: {err:#}");
-    }
     let result = match cli.command {
+        Command::Config { .. } => unreachable!("config commands returned before project setup"),
         Command::Image {
             command: ImageCommand::Build,
         } => container::build_image(&config),
@@ -69,6 +67,48 @@ fn main() -> ExitCode {
             .and_then(|command| container::run_image(&config, &project, &command, false)),
     };
     result.unwrap_or_else(|err| fail(&err))
+}
+
+/// Runs config-only commands using project discovery without container mount
+/// validation, allowing inspection and repair from directories such as `/`.
+fn run_config_command(command: Option<&ConfigCommand>) -> anyhow::Result<ExitCode> {
+    if matches!(command, Some(ConfigCommand::Default)) {
+        return config::print_default();
+    }
+    let project_root = container::current_project_root()?;
+    match command {
+        None | Some(ConfigCommand::List) => load_config(&project_root)?.print_effective(),
+        Some(ConfigCommand::Edit { global }) => {
+            config::edit(&project_root, *global)?;
+            load_validated_config(&project_root)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(ConfigCommand::Path) => config::print_paths(&project_root),
+        Some(ConfigCommand::Check) => {
+            load_validated_config(&project_root)?;
+            config::print_valid()
+        }
+        Some(ConfigCommand::Default) => unreachable!("default config returned before discovery"),
+    }
+}
+
+/// Loads the effective project config and emits non-fatal quick-name
+/// diagnostics shared by run, inspection, checking, and post-edit validation.
+fn load_config(project_root: &std::path::Path) -> anyhow::Result<config::Config> {
+    let config = config::Config::load_for_project(project_root)?;
+    // Unreachable quick commands do not block otherwise valid commands.
+    if let Err(err) = config.check_quick_names(&builtin_commands()) {
+        eprintln!("warning: {err:#}");
+    }
+    Ok(config)
+}
+
+/// Extends schema validation with filesystem and cross-field compatibility
+/// checks shared by `config check` and post-edit validation.
+fn load_validated_config(project_root: &std::path::Path) -> anyhow::Result<config::Config> {
+    let config = load_config(project_root)?;
+    container::validate_effective_config(&config)?;
+    Ok(config)
 }
 
 /// Returns the project's built-in subcommand names, enumerated from the CLI
@@ -286,7 +326,7 @@ mod tests {
     #[test]
     fn builtin_commands_covers_the_project_command_set() {
         let names = builtin_commands();
-        for expected in ["run", "containers", "mounts", "image", "help"] {
+        for expected in ["config", "run", "containers", "mounts", "image", "help"] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "missing {expected}"

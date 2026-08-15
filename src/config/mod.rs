@@ -17,10 +17,12 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 /// Contents of the concise starter config file created on first use.
 const DEFAULT_CONFIG: &str = include_str!("default.toml");
@@ -109,6 +111,100 @@ impl Config {
             self.container.memory = Some(memory);
         }
     }
+
+    /// Renders the merged configuration in the compact style used by the
+    /// starter file. Runtime-delegated values and empty sections are omitted,
+    /// while concrete mount defaults are made explicit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an internal mount has no user-facing category or
+    /// a TOML value cannot be serialized.
+    pub(crate) fn effective_toml(&self) -> Result<String> {
+        // Keep scalar settings in the same order and dotted form as the
+        // starter config.
+        let mut output = String::new();
+        if let Some(dockerfile) = &self.image.dockerfile {
+            append_toml_value(&mut output, "image.dockerfile", dockerfile)?;
+        }
+        if let Some(cpus) = self.container.cpus {
+            append_toml_value(&mut output, "container.cpus", &cpus)?;
+        }
+        if let Some(memory) = &self.container.memory {
+            append_toml_value(&mut output, "container.memory", memory)?;
+        }
+        if let Some(shell) = self.shell {
+            append_toml_value(&mut output, "shell", &shell)?;
+        }
+        append_toml_value(&mut output, "read_only_git", &self.read_only_git)?;
+
+        // Group normalized mounts back into their user-facing categories.
+        let mut mounts = EffectiveMountTables::default();
+        for (name, entry) in &self.mounts {
+            match entry.kind() {
+                Some(MountKind::Host) => {
+                    mounts.host.insert(
+                        name.clone(),
+                        EffectiveHostMount {
+                            enabled: entry.is_enabled(),
+                            source: entry.source.clone(),
+                            target: entry.target.clone(),
+                            writable: entry.writable.unwrap_or(false),
+                        },
+                    );
+                }
+                Some(MountKind::ProjectState) => {
+                    mounts.project.insert(
+                        name.clone(),
+                        EffectiveManagedMount {
+                            enabled: entry.is_enabled(),
+                            target: entry.target.clone(),
+                        },
+                    );
+                }
+                Some(MountKind::SharedState) => {
+                    mounts.shared.insert(
+                        name.clone(),
+                        EffectiveManagedMount {
+                            enabled: entry.is_enabled(),
+                            target: entry.target.clone(),
+                        },
+                    );
+                }
+                None => {
+                    return Err(anyhow!(
+                        "cannot print mount `{name}` because it has no config category"
+                    ));
+                }
+            }
+        }
+        append_toml_section(&mut output, "mounts.host", &mounts.host)?;
+        append_toml_section(&mut output, "mounts.project", &mounts.project)?;
+        append_toml_section(&mut output, "mounts.shared", &mounts.shared)?;
+
+        // Use the document serializer for arbitrary quick-command keys while
+        // suppressing its otherwise-empty table.
+        if !self.quick.is_empty() {
+            start_toml_section(&mut output);
+            let quick = toml::to_string(&EffectiveQuick { quick: &self.quick })
+                .context("failed to serialize effective quick commands")?;
+            output.push_str(&quick);
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        Ok(output)
+    }
+
+    /// Prints the merged config as user-facing TOML.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when serialization or stdout writing fails.
+    pub(crate) fn print_effective(&self) -> Result<ExitCode> {
+        write_stdout(&self.effective_toml()?)?;
+        Ok(ExitCode::SUCCESS)
+    }
 }
 
 /// Image settings.
@@ -133,7 +229,7 @@ pub struct Container {
 }
 
 /// Shells guaranteed to be available in Silo's built-in image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Shell {
     Bash,
@@ -218,6 +314,77 @@ struct HostMount {
 struct ManagedMount {
     enabled: Option<bool>,
     target: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct EffectiveMountTables {
+    host: BTreeMap<String, EffectiveHostMount>,
+    project: BTreeMap<String, EffectiveManagedMount>,
+    shared: BTreeMap<String, EffectiveManagedMount>,
+}
+
+#[derive(Serialize)]
+struct EffectiveHostMount {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<PathBuf>,
+    writable: bool,
+}
+
+#[derive(Serialize)]
+struct EffectiveManagedMount {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+struct EffectiveQuick<'a> {
+    quick: &'a BTreeMap<String, Vec<String>>,
+}
+
+/// Appends one static config key while delegating TOML value escaping and
+/// inline-table formatting to the existing serializer.
+fn append_toml_value<T>(output: &mut String, key: &str, value: &T) -> Result<()>
+where
+    T: Serialize + ?Sized,
+{
+    output.push_str(key);
+    output.push_str(" = ");
+    value
+        .serialize(toml::ser::ValueSerializer::new(output))
+        .with_context(|| format!("failed to serialize effective config key `{key}`"))?;
+    output.push('\n');
+    Ok(())
+}
+
+fn append_toml_section<T>(
+    output: &mut String,
+    name: &str,
+    entries: &BTreeMap<String, T>,
+) -> Result<()>
+where
+    T: Serialize,
+{
+    if entries.is_empty() {
+        return Ok(());
+    }
+    start_toml_section(output);
+    output.push('[');
+    output.push_str(name);
+    output.push_str("]\n");
+    for (key, value) in entries {
+        append_toml_value(output, key, value)?;
+    }
+    Ok(())
+}
+
+fn start_toml_section(output: &mut String) {
+    if !output.is_empty() && !output.ends_with("\n\n") {
+        output.push('\n');
+    }
 }
 
 fn deserialize_mounts<'de, D>(
@@ -727,19 +894,179 @@ pub(crate) fn config_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Opti
     Some(base.join("silo"))
 }
 
+/// Prints the embedded starter config without consulting filesystem state.
+///
+/// # Errors
+///
+/// Returns an error when stdout cannot be written.
+pub(crate) fn print_default() -> Result<ExitCode> {
+    write_stdout(DEFAULT_CONFIG)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Reports a successful validation after all loader warnings have been
+/// emitted.
+///
+/// # Errors
+///
+/// Returns an error when stdout cannot be written.
+pub(crate) fn print_valid() -> Result<ExitCode> {
+    write_stdout("configuration is valid\n")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Prints existing config files that contribute to the current resolution,
+/// from the lower-precedence global file to the project override.
+///
+/// # Errors
+///
+/// Returns an error when no config file exists or stdout cannot be written.
+pub(crate) fn print_paths(project_root: &Path) -> Result<ExitCode> {
+    let paths = active_config_paths_from(
+        project_root,
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    );
+    let text = config_paths_text(&paths)?;
+    write_stdout(&text)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Opens the nearest applicable config in the user's chosen editor. A
+/// missing global target is initialized from the bundled template first.
+///
+/// # Errors
+///
+/// Returns an error when the target path cannot be determined or created,
+/// the editor setting is invalid, the editor cannot start, or it fails.
+pub(crate) fn edit(project_root: &Path, global: bool) -> Result<()> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
+    let path = edit_path_from(project_root, global, xdg.as_deref(), home.as_deref())?;
+    if !path.exists() {
+        create_default(&path)?;
+    }
+    run_editor(
+        &path,
+        std::env::var_os("VISUAL").as_deref(),
+        std::env::var_os("EDITOR").as_deref(),
+    )
+}
+
+/// Selects only existing files because `config path` reports active inputs,
+/// not potential locations. The built-in defaults have no filesystem path.
+fn active_config_paths_from(
+    project_root: &Path,
+    xdg: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Vec<(&'static str, PathBuf)> {
+    let mut paths = Vec::new();
+    if let Some(path) = config_path_from(xdg, home)
+        && path.is_file()
+    {
+        paths.push(("global", path));
+    }
+    let project = project_root.join(".silo.toml");
+    if project.is_file() {
+        paths.push(("project", project));
+    }
+    paths
+}
+
+fn config_paths_text(paths: &[(&str, PathBuf)]) -> Result<String> {
+    if paths.is_empty() {
+        return Err(anyhow!(
+            "no configuration files are active; silo is using built-in defaults"
+        ));
+    }
+    let mut text = String::new();
+    for (kind, path) in paths {
+        text.push_str(kind);
+        text.push('\t');
+        text.push_str(&path.to_string_lossy());
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+/// Chooses an existing project override unless global editing was requested.
+fn edit_path_from(
+    project_root: &Path,
+    global: bool,
+    xdg: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf> {
+    let project = project_root.join(".silo.toml");
+    if !global && project.is_file() {
+        return Ok(project);
+    }
+    config_path_from(xdg, home).ok_or_else(|| {
+        anyhow!("cannot determine the global config path; set XDG_CONFIG_HOME or HOME")
+    })
+}
+
+/// Uses the conventional interactive-editor precedence while allowing
+/// settings such as `code --wait` to include arguments.
+fn run_editor(path: &Path, visual: Option<&OsStr>, editor: Option<&OsStr>) -> Result<()> {
+    let editor = selected_editor(visual, editor);
+    let editor = editor.to_str().ok_or_else(|| {
+        anyhow!(
+            "configured editor is not valid UTF-8: {}",
+            editor.to_string_lossy()
+        )
+    })?;
+    // The user's editor setting is intentionally interpreted by the shell;
+    // the config path remains a quoted positional argument.
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("exec {editor} \"$@\""))
+        .arg("silo-config-editor")
+        .arg(path)
+        .status()
+        .with_context(|| format!("failed to start config editor `{editor}`"))?;
+    if !status.success() {
+        return Err(anyhow!("config editor exited with status {status}"));
+    }
+    Ok(())
+}
+
+fn selected_editor(visual: Option<&OsStr>, editor: Option<&OsStr>) -> std::ffi::OsString {
+    visual
+        .filter(|value| !value.is_empty())
+        .or_else(|| editor.filter(|value| !value.is_empty()))
+        .unwrap_or_else(|| OsStr::new("vi"))
+        .to_os_string()
+}
+
+fn write_stdout(text: &str) -> Result<()> {
+    io::stdout()
+        .lock()
+        .write_all(text.as_bytes())
+        .context("failed to write config output")
+}
+
 /// Writes the default config file, warning instead of failing when it cannot
 /// be created, so an unwritable home directory never breaks a command.
 fn write_default(path: &Path) {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if let Err(err) = fs::create_dir_all(parent).and_then(|()| fs::write(path, DEFAULT_CONFIG)) {
+    if let Err(err) = create_default(path) {
         eprintln!(
             "warning: could not create default config at `{}`: {err:#}",
             path.display()
         );
     }
+}
+
+/// Creates a starter config with strict errors for commands that need to edit
+/// the resulting file.
+fn create_default(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create config directory `{}`", parent.display()))?;
+    fs::write(path, DEFAULT_CONFIG)
+        .with_context(|| format!("failed to create default config `{}`", path.display()))
 }
 
 #[cfg(test)]

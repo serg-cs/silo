@@ -804,6 +804,60 @@ fn validate_dockerfile_rejects_empty_paths() {
 }
 
 #[test]
+fn image_config_validation_checks_only_configured_dockerfiles() {
+    validate_image_config(&Config::default()).expect("built-in image config is valid");
+
+    let mut config = Config::default();
+    config.image.dockerfile = Some(PathBuf::new());
+    let message = validate_image_config(&config)
+        .expect_err("configured empty Dockerfile is invalid")
+        .to_string();
+    assert!(message.contains("empty"), "{message}");
+}
+
+#[test]
+fn effective_config_validation_rejects_custom_image_home_mounts() {
+    let dir = TestDir::new("validate-custom-image-mounts");
+    let dockerfile = dir.path().join("Dockerfile");
+    fs::write(&dockerfile, "FROM scratch").expect("Dockerfile creation succeeds");
+    let mut config = Config::default();
+    config.image.dockerfile = Some(dockerfile);
+    config.mounts.insert(
+        "docs".into(),
+        Mount {
+            kind: Some(MountKind::Host),
+            source: Some(dir.path().to_path_buf()),
+            target: Some(PathBuf::from("~/docs")),
+            ..Mount::default()
+        },
+    );
+
+    let message = validate_effective_config(&config)
+        .expect_err("custom image has no defined home for an enabled host mount")
+        .to_string();
+    assert!(message.contains("host mount `docs`"), "{message}");
+    assert!(
+        message.contains("custom images have no Silo-defined home"),
+        "{message}"
+    );
+
+    config.mounts.get_mut("docs").expect("mount exists").enabled = Some(false);
+    validate_effective_config(&config).expect("disabled home-relative mount is ignored");
+
+    {
+        let mount = config.mounts.get_mut("docs").expect("mount exists");
+        mount.enabled = Some(true);
+        mount.target = Some(PathBuf::from("./docs"));
+    }
+    validate_effective_config(&config).expect("project-relative host target is supported");
+
+    let mount = config.mounts.get_mut("docs").expect("mount exists");
+    mount.kind = Some(MountKind::SharedState);
+    mount.target = Some(PathBuf::from("~/.cache"));
+    validate_effective_config(&config).expect("managed mounts are skipped for custom images");
+}
+
+#[test]
 fn validate_dockerfile_rejects_missing_paths() {
     let path = std::env::temp_dir().join(format!("silo-test-missing-{}", std::process::id()));
     let _ = fs::remove_file(&path);
@@ -2043,6 +2097,21 @@ fn project_without_markers_uses_the_exact_directory() {
     let cwd = Path::new("/silo-test-unmarked-project/src");
 
     assert_eq!(discover_project_root(cwd), cwd);
+}
+
+#[test]
+fn config_project_root_discovery_does_not_validate_container_mounts() {
+    let root = project_root_from_path(Path::new("/"))
+        .expect("filesystem root is valid for config discovery");
+    assert_eq!(root, Path::new("/"));
+
+    let message = Project::from_path(Path::new("/"))
+        .expect_err("filesystem root is still invalid for a container project")
+        .to_string();
+    assert!(
+        message.contains("cannot share the root directory"),
+        "{message}"
+    );
 }
 
 #[test]
