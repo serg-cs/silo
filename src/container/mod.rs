@@ -719,7 +719,7 @@ fn managed_mount_at_root(
     project: Option<&Path>,
     root: &Path,
 ) -> ManagedMount {
-    let name_digest = format!("{:x}", Sha256::digest(name.as_bytes()));
+    let name_digest = hex_digest(Sha256::digest(name.as_bytes()));
     let id = match (scope, project) {
         (StateScope::Project, Some(project)) => format!(
             "{MANAGED_MOUNT_ID_PREFIX}p-{}-{}",
@@ -1889,7 +1889,7 @@ fn render_mount_table(items: &[MountInfo]) -> String {
         ambiguous_project_names(items.iter().filter_map(|item| item.0.project.as_deref()));
     let mut table = Table::new();
     table
-        .load_preset(NOTHING)
+        .load_style(NOTHING)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(
             ["ID", "SCOPE", "NAME", "PROJECT", "SOURCE"]
@@ -2149,7 +2149,7 @@ fn render_container_table(items: &[ContainerInfo]) -> String {
     let ambiguous_names = ambiguous_project_names(items.iter().map(|item| item.project.as_path()));
     let mut table = Table::new();
     table
-        .load_preset(NOTHING)
+        .load_style(NOTHING)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(
             [
@@ -2453,8 +2453,7 @@ fn isolated_container_id() -> String {
 
 /// Returns the deterministic shared ID derived from a canonical project path.
 fn project_container_id(project: &Path) -> String {
-    let digest = Sha256::digest(project.as_os_str().as_bytes());
-    let hex = format!("{digest:x}");
+    let hex = hex_digest(Sha256::digest(project.as_os_str().as_bytes()));
     format!("{CONTAINER_NAME_PREFIX}{}", &hex[..PROJECT_DIGEST_HEX_LEN])
 }
 
@@ -2543,7 +2542,20 @@ impl SavedTerminal {
 
 /// Computes the full project digest stored in the runtime label.
 fn project_digest(project: &Path) -> String {
-    format!("{:x}", Sha256::digest(project.as_os_str().as_bytes()))
+    hex_digest(Sha256::digest(project.as_os_str().as_bytes()))
+}
+
+/// Encodes digest bytes in the lowercase format used by runtime identifiers.
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+    let bytes = bytes.as_ref();
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 /// Builds the desired runtime identity from every creation-time input.
@@ -2614,7 +2626,7 @@ fn container_identity(
     ContainerIdentity {
         project: project_digest(&project.root),
         project_root: project.root.to_string_lossy().into_owned(),
-        spec: format!("{:x}", hasher.finalize()),
+        spec: hex_digest(hasher.finalize()),
     }
 }
 
@@ -2741,7 +2753,7 @@ fn session_reservation_token(project: &Project) -> String {
     hasher.update(project.root.as_os_str().as_bytes());
     hasher.update(std::process::id().to_be_bytes());
     hasher.update(timestamp.to_be_bytes());
-    format!("{:x}", hasher.finalize())
+    hex_digest(hasher.finalize())
 }
 
 /// Ensures the deterministic shared container exists, belongs to this
