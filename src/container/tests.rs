@@ -82,6 +82,29 @@ fn built_in_images_remain_shared_by_default() {
 }
 
 #[test]
+fn forwarded_shared_preflight_preserves_image_fallback() {
+    let image_checked = Cell::new(false);
+    let system_checked = Cell::new(false);
+
+    runtime_preflight_with(
+        false,
+        true,
+        || {
+            image_checked.set(true);
+            Err(anyhow!("image inspection is unavailable"))
+        },
+        || {
+            system_checked.set(true);
+            Ok(())
+        },
+    )
+    .expect("shared forwarding only requires the container system");
+
+    assert!(!image_checked.get());
+    assert!(system_checked.get());
+}
+
+#[test]
 fn configured_shell_precedes_the_host_shell() {
     assert_eq!(
         resolve_shell(Some(Shell::Fish), Some(OsStr::new("/bin/bash"))),
@@ -778,6 +801,34 @@ fn inspect_image_does_not_boot_when_the_system_is_up() {
     assert_eq!(boots.get(), 0);
 }
 
+#[test]
+fn system_preflight_allows_a_missing_image_tag() {
+    let boots = Cell::new(0);
+
+    ensure_container_system_with(
+        || Ok("Error: image not found: silo:latest".to_string()),
+        || {
+            boots.set(boots.get() + 1);
+            true
+        },
+    )
+    .expect("a running system does not require the image tag");
+
+    assert_eq!(boots.get(), 0);
+}
+
+#[test]
+fn system_preflight_reports_a_failed_boot() {
+    let error = ensure_container_system_with(|| Ok(NOT_STARTED_HINT.to_string()), || false)
+        .expect_err("an unavailable system must start");
+
+    assert!(
+        error
+            .to_string()
+            .contains("could not start Apple container system")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exit_code_reports_signals_as_128_plus_signal() {
@@ -1031,6 +1082,7 @@ fn run_command_mounts_git_read_only() {
         &ConfigMounts {
             git: Some(PathBuf::from("/tmp/project/.git")),
             named: vec![],
+            network: None,
         },
         &Container::default(),
         "silo-123",
@@ -1091,7 +1143,11 @@ fn run_command_mounts_configured_named_mounts() {
         true,
         Path::new("/tmp/project"),
         &ids,
-        &ConfigMounts { git: None, named },
+        &ConfigMounts {
+            git: None,
+            named,
+            network: None,
+        },
         &Container::default(),
         "silo-123",
         &[],
@@ -1127,6 +1183,7 @@ fn run_command_orders_git_then_named_mounts() {
         &ConfigMounts {
             git: Some(PathBuf::from("/tmp/project/.git")),
             named,
+            network: None,
         },
         &Container::default(),
         "silo-123",
@@ -1172,6 +1229,7 @@ fn shared_create_bind_mounts_all_managed_storage() {
                 access: Permission::ReadOnly,
             },
         ],
+        network: None,
     };
     let command = create_command(
         &test_project("/tmp/project"),
@@ -1249,6 +1307,7 @@ fn built_in_isolated_mount_filter_keeps_all_managed_mounts() {
         &ConfigMounts {
             git: None,
             named: mounts,
+            network: None,
         },
         &Container::default(),
         "silo-123",
@@ -2276,6 +2335,67 @@ fn shared_create_command_applies_configured_resources() {
 }
 
 #[test]
+fn forward_network_and_environment_reach_container_commands() {
+    let project = test_project("/tmp/project");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let mounts = ConfigMounts {
+        network: Some("silo-net-test".to_string()),
+        ..ConfigMounts::default()
+    };
+    let environment = [
+        ("SILO_POSTGRES_HOST".to_string(), "192.168.64.1".to_string()),
+        ("SILO_POSTGRES_PORT".to_string(), "5432".to_string()),
+    ];
+
+    let isolated = isolated_create_command_with_forward(
+        false,
+        &project.root,
+        &ids,
+        &mounts,
+        &Container::default(),
+        "silo-isolated",
+        &[],
+        Some(Shell::Zsh),
+        &environment,
+    )
+    .expect("isolated command builds");
+    let isolated_args = args_without_labels(&isolated);
+    assert!(
+        isolated_args
+            .windows(2)
+            .any(|pair| pair == ["--network", "silo-net-test"])
+    );
+    assert!(isolated_args.contains(&"SILO_POSTGRES_HOST=192.168.64.1"));
+    assert!(isolated_args.contains(&"SILO_POSTGRES_PORT=5432"));
+
+    let shared = create_command(
+        &project,
+        TEST_IMAGE_DIGEST,
+        &ids,
+        &mounts,
+        &Container::default(),
+        Path::new("/tmp/project.cid"),
+    )
+    .expect("shared command builds");
+    assert!(
+        args_without_labels(&shared)
+            .windows(2)
+            .any(|pair| pair == ["--network", "silo-net-test"])
+    );
+
+    let exec = exec_command_with_forward(false, &project, "abc123", &[], Shell::Zsh, &environment);
+    let exec_args: Vec<_> = exec
+        .get_args()
+        .map(|arg| arg.to_str().expect("argument is UTF-8"))
+        .collect();
+    assert!(exec_args.contains(&"SILO_POSTGRES_HOST=192.168.64.1"));
+    assert!(exec_args.contains(&"SILO_POSTGRES_PORT=5432"));
+}
+
+#[test]
 fn exec_command_attaches_as_silo_with_home() {
     let project = test_project("/tmp/project");
     let command = exec_command(
@@ -2816,6 +2936,29 @@ fn inspect_identity_distinguishes_owned_spec_drift() {
         !shared_container_matches(&inspection, &project, &identity)
             .expect("the outdated container is still owned")
     );
+}
+
+#[test]
+fn forward_network_changes_the_container_specification() {
+    let project = test_project("/tmp/project");
+    let without_network = shared_identity(&project);
+    let with_network = container_identity(
+        &project,
+        TEST_IMAGE_DIGEST,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts {
+            network: Some("silo-net-test".to_string()),
+            ..ConfigMounts::default()
+        },
+        &Container::default(),
+        LABEL_SHARED_VALUE,
+        &[OsString::from(SHARED_INIT_COMMAND)],
+    );
+
+    assert_ne!(without_network.spec, with_network.spec);
 }
 
 #[test]

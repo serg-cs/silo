@@ -142,8 +142,85 @@ fn default_config_file_matches_builtin_defaults() {
     assert_eq!(from_file.read_only_git, defaults.read_only_git);
     assert_eq!(from_file.image.dockerfile, defaults.image.dockerfile);
     assert_eq!(from_file.container, defaults.container);
+    assert!(from_file.forward.is_empty());
     assert!(from_file.mounts.is_empty());
     assert!(from_file.quick.is_empty());
+}
+
+#[test]
+fn forwards_default_to_enabled_and_render_like_mounts() {
+    let config = Config::parse(
+        "[forward]\npostgres = { port = 5432 }\nredis = { port = 6379, enabled = false }\n",
+    )
+    .expect("forwards parse");
+
+    assert!(config.forward["postgres"].is_enabled());
+    assert!(!config.forward["redis"].is_enabled());
+    assert_eq!(config.forward["postgres"].port, 5432);
+    assert_eq!(
+        config.effective_toml().expect("forwards serialize"),
+        "read_only_git = true\n\n[forward]\npostgres = { port = 5432, enabled = true }\nredis = { port = 6379, enabled = false }\n"
+    );
+}
+
+#[test]
+fn forward_validation_rejects_unsafe_names_and_privileged_ports() {
+    let error = Config::parse("[forward]\n\"Postgres\" = { port = 5432 }\nhttp = { port = 80 }\n")
+        .expect_err("invalid forwards fail")
+        .to_string();
+
+    assert!(error.contains("forward `Postgres`"), "{error}");
+    assert!(error.contains("forward `http`"), "{error}");
+    assert!(error.contains("between 1024 and 65535"), "{error}");
+}
+
+#[test]
+fn project_can_add_and_overlay_forwards() {
+    let dir = TestDir::new("project-forward-overlay");
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "[forward]\npostgres = { enabled = false }\nmetrics = { port = 19090 }\nredis = { port = 6379 }\n",
+    )
+    .expect("project config writes");
+    let global =
+        Config::parse("[forward]\npostgres = { port = 5432 }\nmetrics = { port = 9090 }\n")
+            .expect("global forwards parse");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("project merges forwards");
+    assert_eq!(merged.forward["postgres"].port, 5432);
+    assert!(!merged.forward["postgres"].is_enabled());
+    assert_eq!(merged.forward["metrics"].port, 19090);
+    assert!(merged.forward["metrics"].is_enabled());
+    assert_eq!(merged.forward["redis"].port, 6379);
+    assert!(merged.forward["redis"].is_enabled());
+}
+
+#[test]
+fn project_forward_additions_require_a_port() {
+    let dir = TestDir::new("project-forward-missing-port");
+
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "[forward]\nredis = { enabled = true }\n",
+    )
+    .expect("project config rewrites");
+    let global =
+        Config::parse("[forward]\npostgres = { port = 5432 }\n").expect("global forward parses");
+    let error = format!(
+        "{:#}",
+        Config::apply_project_file(global, dir.path()).expect_err("incomplete forward fails")
+    );
+    assert!(error.contains("must define `port`"), "{error}");
+}
+
+#[test]
+fn project_forward_ports_are_recognized() {
+    let (_, unknown_keys) = deserialize_toml::<ProjectConfig>(
+        "[forward]\npostgres = { enabled = true, port = 5432 }\n",
+    )
+    .expect("project forward parses");
+
+    assert!(unknown_keys.is_empty());
 }
 
 #[test]

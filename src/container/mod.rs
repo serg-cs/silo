@@ -18,7 +18,8 @@ use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets::NO
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, Container, Mount, MountKind, Permission, Shell};
+use crate::config::{Config, Container, Forward, Mount, MountKind, Permission, Shell};
+use crate::forward;
 
 /// Name of the image this tool builds and runs.
 pub const IMAGE_TAG: &str = "silo:latest";
@@ -416,6 +417,7 @@ fn effective_mounts(mounts: &[ResolvedMount]) -> impl Iterator<Item = &ResolvedM
 struct ConfigMounts {
     git: Option<PathBuf>,
     named: Vec<ResolvedMount>,
+    network: Option<String>,
 }
 
 /// Stable identity and container path for the current project.
@@ -1086,20 +1088,24 @@ pub fn run_image(
     command: &[OsString],
     isolated: bool,
 ) -> Result<ExitCode> {
+    let isolated_lifecycle = uses_isolated_lifecycle(config, isolated);
+    let has_forwards = config.forward.values().any(Forward::is_enabled);
+    runtime_preflight(isolated_lifecycle, has_forwards)?;
+    let forwarding = forward::Session::prepare(config, &project.root)?;
     let shell = config
         .image
         .dockerfile
         .is_none()
         .then(|| resolve_shell(config.shell, std::env::var_os("SHELL").as_deref()));
-    if uses_isolated_lifecycle(config, isolated) {
-        require_image()?;
-        return run_isolated(config, project, command, shell);
+    if isolated_lifecycle {
+        return run_isolated(config, project, command, shell, &forwarding);
     }
     run_shared(
         config,
         project,
         command,
         shell.expect("the shared lifecycle always uses the built-in image"),
+        &forwarding,
     )
 }
 
@@ -1107,6 +1113,33 @@ pub fn run_image(
 /// home, shell, or supervisor, so preserve their image-agnostic lifecycle.
 fn uses_isolated_lifecycle(config: &Config, isolated: bool) -> bool {
     isolated || config.image.dockerfile.is_some()
+}
+
+/// Prepares only the runtime resources required by the selected lifecycle.
+fn runtime_preflight(isolated_lifecycle: bool, has_forwards: bool) -> Result<()> {
+    runtime_preflight_with(
+        isolated_lifecycle,
+        has_forwards,
+        require_image,
+        ensure_container_system,
+    )
+}
+
+fn runtime_preflight_with(
+    isolated_lifecycle: bool,
+    has_forwards: bool,
+    require_image: impl FnOnce() -> Result<()>,
+    ensure_container_system: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if isolated_lifecycle {
+        require_image()
+    } else if has_forwards {
+        // Forward network management needs the service, but an existing
+        // shared container can remain reusable without the mutable image tag.
+        ensure_container_system()
+    } else {
+        Ok(())
+    }
 }
 
 /// Runs an ephemeral create/start lifecycle. Built-in isolated containers use
@@ -1118,6 +1151,7 @@ fn run_isolated(
     project: &Project,
     command: &[OsString],
     shell: Option<Shell>,
+    forwarding: &forward::Session,
 ) -> Result<ExitCode> {
     let ids = host_ids()?;
     let custom_image = config.image.dockerfile.is_some();
@@ -1135,6 +1169,7 @@ fn run_isolated(
     let config_mounts = ConfigMounts {
         git: git_mount,
         named,
+        network: forwarding.network_name().map(ToString::to_string),
     };
     for (scope, name) in skipped {
         eprintln!(
@@ -1145,7 +1180,7 @@ fn run_isolated(
         .then(MountLock::acquire)
         .transpose()?;
     ensure_managed_mounts(&config_mounts.named)?;
-    let mut create = isolated_create_command(
+    let mut create = isolated_create_command_with_forward(
         std::io::stdin().is_terminal(),
         &project.root,
         &ids,
@@ -1154,6 +1189,7 @@ fn run_isolated(
         &id,
         command,
         shell,
+        forwarding.environment(),
     )?;
     // Warn about shared mounts whose intent a later mount defeats, e.g. a
     // read-write shared mount overlapping the read-only `.git`.
@@ -1169,11 +1205,11 @@ fn run_isolated(
     let create_status = create.status().map_err(spawn_error)?;
     drop(mount_lock);
     if !create_status.success() {
-        cleanup_isolated_container(&id);
+        cleanup_isolated_container(&id, &project.root);
         return Ok(exit_code(create_status));
     }
     if let Err(err) = install_signal_handlers() {
-        cleanup_isolated_container(&id);
+        cleanup_isolated_container(&id, &project.root);
         return Err(err);
     }
     // Captured before the child starts, so it holds the pre-raw-mode state.
@@ -1182,7 +1218,7 @@ fn run_isolated(
     let mut child = match start.spawn() {
         Ok(child) => child,
         Err(err) => {
-            cleanup_isolated_container(&id);
+            cleanup_isolated_container(&id, &project.root);
             return Err(spawn_error(err));
         }
     };
@@ -1191,7 +1227,7 @@ fn run_isolated(
     if let Some(terminal) = &terminal {
         terminal.restore();
     }
-    cleanup_isolated_container(&id);
+    cleanup_isolated_container(&id, &project.root);
     status.map(exit_code)
 }
 
@@ -1268,6 +1304,7 @@ fn run_shared(
     project: &Project,
     command: &[OsString],
     shell: Shell,
+    forwarding: &forward::Session,
 ) -> Result<ExitCode> {
     sweep_orphaned_isolated_containers(None);
     let deadline = Instant::now() + GUEST_READY_TIMEOUT + CONFLICT_RETRY_TIMEOUT;
@@ -1278,7 +1315,7 @@ fn run_shared(
                 project.id
             ));
         }
-        ensure_shared_container(project, config)?;
+        ensure_shared_container(project, config, forwarding.network_name())?;
         if !wait_for_guest_ready(project)? {
             continue;
         }
@@ -1289,12 +1326,13 @@ fn run_shared(
     };
 
     // The attached process owns the terminal, but not the shared container.
-    let mut exec = exec_command(
+    let mut exec = exec_command_with_forward(
         std::io::stdin().is_terminal(),
         project,
         &reservation,
         command,
         shell,
+        forwarding.environment(),
     );
     install_signal_handlers()?;
     let terminal = SavedTerminal::capture();
@@ -1308,7 +1346,11 @@ fn run_shared(
 }
 
 /// Resolves all creation-time config mounts for a project.
-fn resolve_config_mounts(config: &Config, project_root: &Path) -> Result<ConfigMounts> {
+fn resolve_config_mounts(
+    config: &Config,
+    project_root: &Path,
+    network: Option<&str>,
+) -> Result<ConfigMounts> {
     Ok(ConfigMounts {
         git: git_mount_host(project_root, config.read_only_git),
         named: resolve_named_mounts(
@@ -1317,6 +1359,7 @@ fn resolve_config_mounts(config: &Config, project_root: &Path) -> Result<ConfigM
             std::env::var_os("HOME").as_deref().map(Path::new),
             std::env::var_os("XDG_STATE_HOME").as_deref().map(Path::new),
         )?,
+        network: network.map(ToString::to_string),
     })
 }
 
@@ -1500,6 +1543,7 @@ pub fn delete_selected_container(selector: &str, force: bool) -> Result<ExitCode
     } else {
         delete_stopped_container(&container)?;
     }
+    forward::cleanup_project_network(&container.project);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2584,6 +2628,15 @@ fn container_identity(
     } else {
         hash_spec_field(&mut hasher, b"git", b"");
     }
+    hash_spec_field(
+        &mut hasher,
+        b"network",
+        config_mounts
+            .network
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     for mount in effective_mounts(&config_mounts.named) {
         hash_spec_field(&mut hasher, b"mount-name", mount.name.as_bytes());
         match &mount.source {
@@ -2758,9 +2811,13 @@ fn session_reservation_token(project: &Project) -> String {
 
 /// Ensures the deterministic shared container exists, belongs to this
 /// project, matches the requested creation specification, and is running.
-fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
+fn ensure_shared_container(
+    project: &Project,
+    config: &Config,
+    network: Option<&str>,
+) -> Result<()> {
     let ids = host_ids()?;
-    let config_mounts = resolve_config_mounts(config, &project.root)?;
+    let config_mounts = resolve_config_mounts(config, &project.root, network)?;
     warn_mount_conflicts(project, &config_mounts);
     let deadline = Instant::now() + CONFLICT_RETRY_TIMEOUT;
     let mut last_conflict = None;
@@ -2778,6 +2835,12 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<()> {
         let inspection = inspect_container(&project.id)?;
         match inspection.state {
             ContainerState::Absent => {
+                if network.is_none() {
+                    // A previous forwarding configuration may have left its
+                    // now-unneeded project network behind after the container
+                    // exited or was interrupted.
+                    forward::cleanup_project_network(&project.root);
+                }
                 let image_digest = require_image_digest()?;
                 let identity = shared_container_identity(
                     project,
@@ -3370,8 +3433,12 @@ fn sweep_orphaned_isolated_containers(current_id: Option<&str>) {
         if inspection.state == ContainerState::Absent || !is_owned_isolated(&inspection) {
             continue;
         }
+        let (_, project, _) = silo_metadata(&inspection)
+            .expect("isolated ownership validation requires complete metadata");
         if let Err(err) = delete_container(&id) {
             eprintln!("warning: could not remove orphaned isolated container `{id}`: {err:#}");
+        } else {
+            forward::cleanup_project_network(&project);
         }
     }
 }
@@ -3411,9 +3478,11 @@ fn owner_alive(pid: libc::pid_t) -> bool {
 
 /// Removes an isolated container after its foreground process exits. `--rm`
 /// normally did this already; force deletion is a best-effort crash safety net.
-fn cleanup_isolated_container(id: &str) {
+fn cleanup_isolated_container(id: &str, project_root: &Path) {
     if let Err(err) = delete_container(id) {
         eprintln!("warning: could not remove isolated container `{id}`: {err:#}");
+    } else {
+        forward::cleanup_project_network(project_root);
     }
 }
 
@@ -3463,6 +3532,24 @@ fn require_image() -> Result<()> {
     require_image_digest().map(|_| ())
 }
 
+/// Boots Apple's container service without requiring the Silo image tag.
+fn ensure_container_system() -> Result<()> {
+    ensure_container_system_with(probe_image_stderr, start_container_system)
+}
+
+fn ensure_container_system_with(
+    probe: impl FnOnce() -> Result<String>,
+    boot: impl FnOnce() -> bool,
+) -> Result<()> {
+    let stderr = probe()?;
+    if system_not_started(&stderr) && !boot() {
+        return Err(anyhow!(
+            "could not start Apple container system; `{CONTAINER_BIN} image inspect` reported:\n{stderr}"
+        ));
+    }
+    Ok(())
+}
+
 /// Returns the built image's immutable identity for shared-container reuse.
 fn require_image_digest() -> Result<String> {
     let (digest, stderr) = inspect_image()?;
@@ -3493,6 +3580,15 @@ fn probe_image() -> Result<(Option<String>, String)> {
         return Ok((None, stderr));
     }
     Ok((Some(parse_image_digest(&output.stdout)?), stderr))
+}
+
+/// Probes service availability while deliberately ignoring image-tag state.
+fn probe_image_stderr() -> Result<String> {
+    let output = Command::new(CONTAINER_BIN)
+        .args(["image", "inspect", IMAGE_TAG])
+        .output()
+        .map_err(spawn_error)?;
+    Ok(String::from_utf8_lossy(&output.stderr).trim().to_string())
 }
 
 /// Reads the immutable index digest from the current image inspection schema.
@@ -3681,6 +3777,7 @@ fn id_of(flag: &str) -> Result<String> {
 /// Returns an error when the project root has no name (e.g. `/`), or its path
 /// or a mount's path cannot be expressed in a mount specification.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn isolated_create_command(
     interactive: bool,
     project_root: &Path,
@@ -3690,6 +3787,31 @@ fn isolated_create_command(
     id: &str,
     command: &[OsString],
     shell: Option<Shell>,
+) -> Result<Command> {
+    isolated_create_command_with_forward(
+        interactive,
+        project_root,
+        host_ids,
+        config_mounts,
+        resources,
+        id,
+        command,
+        shell,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn isolated_create_command_with_forward(
+    interactive: bool,
+    project_root: &Path,
+    host_ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    resources: &Container,
+    id: &str,
+    command: &[OsString],
+    shell: Option<Shell>,
+    forward_environment: &[(String, String)],
 ) -> Result<Command> {
     let shared_dir = shared_dir_name(project_root)?;
     let project = Project {
@@ -3717,9 +3839,11 @@ fn isolated_create_command(
         run.arg("-t");
     }
     append_resources(&mut run, resources);
+    append_network(&mut run, config_mounts.network.as_deref());
     append_identity_labels(&mut run, &identity, LABEL_ISOLATED_VALUE);
     append_creation_mounts(&mut run, project_root, &shared_dir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
+    append_environment(&mut run, forward_environment);
     if let Some(shell) = shell {
         run.arg("--env").arg(format!("SHELL={}", shell.path()));
     }
@@ -3768,6 +3892,7 @@ fn create_command(
         .arg("--rm")
         .arg("-d");
     append_resources(&mut run, resources);
+    append_network(&mut run, config_mounts.network.as_deref());
     append_identity_labels(&mut run, &identity, LABEL_SHARED_VALUE);
     append_creation_mounts(&mut run, &project.root, &project.workdir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
@@ -3785,6 +3910,20 @@ fn append_resources(run: &mut Command, resources: &Container) {
     }
     if let Some(memory) = &resources.memory {
         run.arg("--memory").arg(memory);
+    }
+}
+
+/// Attaches a creation command to its Silo-owned project network.
+fn append_network(run: &mut Command, network: Option<&str>) {
+    if let Some(network) = network {
+        run.arg("--network").arg(network);
+    }
+}
+
+/// Adds environment values resolved for this one attached session.
+fn append_environment(run: &mut Command, environment: &[(String, String)]) {
+    for (name, value) in environment {
+        run.arg("--env").arg(format!("{name}={value}"));
     }
 }
 
@@ -3834,12 +3973,24 @@ fn append_host_ids(run: &mut Command, host_ids: &HostIds) {
 }
 
 /// Builds one session attachment command for the running shared container.
+#[cfg(test)]
 fn exec_command(
     interactive: bool,
     project: &Project,
     reservation: &str,
     command: &[OsString],
     shell: Shell,
+) -> Command {
+    exec_command_with_forward(interactive, project, reservation, command, shell, &[])
+}
+
+fn exec_command_with_forward(
+    interactive: bool,
+    project: &Project,
+    reservation: &str,
+    command: &[OsString],
+    shell: Shell,
+    forward_environment: &[(String, String)],
 ) -> Command {
     let mut exec = Command::new(CONTAINER_BIN);
     exec.arg("exec").arg("-i");
@@ -3853,8 +4004,9 @@ fn exec_command(
     exec.arg("--env")
         .arg(format!("HOME={CONTAINER_HOME}"))
         .arg("--env")
-        .arg(format!("SHELL={}", shell.path()))
-        .arg(&project.id);
+        .arg(format!("SHELL={}", shell.path()));
+    append_environment(&mut exec, forward_environment);
+    exec.arg(&project.id);
     exec.arg(SESSION_WRAPPER_COMMAND).arg(reservation);
     if command.is_empty() {
         exec.arg(shell.path());

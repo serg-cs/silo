@@ -6,8 +6,9 @@
 //! every key has a default, so a missing or partial file always yields a
 //! usable [`Config`]. Project settings are partial and replace explicitly
 //! present global options. Precedence is `defaults < global config < project
-//! config < CLI flags`. Named mounts are the exception to whole-collection
-//! replacement: project entries overlay global entries by name and field.
+//! config < CLI flags`. Named mounts and forwards are the exceptions to
+//! whole-collection replacement: project entries overlay global entries by
+//! name and field.
 //!
 //! On top of the built-in mounts (the shared project directory and the
 //! optional read-only `.git`), the `mounts` table provides named host mounts
@@ -35,6 +36,10 @@ pub struct Config {
     /// Resource limits for containers created by Silo. Omitted limits are
     /// left to Apple container's configured defaults.
     pub container: Container,
+    /// Named host loopback ports exposed to this project's container.
+    /// Project config may add entries or overlay global entries by name and
+    /// field.
+    pub forward: BTreeMap<String, Forward>,
     /// Interactive shell used by the built-in image. When omitted, Silo
     /// mirrors a supported host `$SHELL` and falls back to Zsh.
     pub shell: Option<Shell>,
@@ -62,6 +67,7 @@ pub struct Config {
 struct ProjectConfig {
     image: ProjectImage,
     container: ProjectContainer,
+    forward: Option<BTreeMap<String, ProjectForward>>,
     shell: Option<Shell>,
     read_only_git: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_mounts")]
@@ -86,11 +92,20 @@ struct ProjectContainer {
     memory: Option<String>,
 }
 
+/// Partial forward supplied by a project configuration.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ProjectForward {
+    port: Option<u16>,
+    enabled: Option<bool>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             image: Image::default(),
             container: Container::default(),
+            forward: BTreeMap::new(),
             shell: None,
             // Protection on by default; disable it in the config file.
             read_only_git: true,
@@ -137,6 +152,22 @@ impl Config {
             append_toml_value(&mut output, "shell", &shell)?;
         }
         append_toml_value(&mut output, "read_only_git", &self.read_only_git)?;
+
+        // Keep forwards compact and aligned with named mount syntax.
+        let forwards = self
+            .forward
+            .iter()
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    EffectiveForward {
+                        port: entry.port,
+                        enabled: entry.is_enabled(),
+                    },
+                )
+            })
+            .collect();
+        append_toml_section(&mut output, "forward", &forwards)?;
 
         // Group normalized mounts back into their user-facing categories.
         let mut mounts = EffectiveMountTables::default();
@@ -226,6 +257,20 @@ pub struct Container {
     /// Memory allocated to the container, using Apple container's accepted
     /// syntax (for example `4G`). `None` uses its configured default.
     pub memory: Option<String>,
+}
+
+/// One named host loopback port exposed to a container.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Forward {
+    pub port: u16,
+    pub enabled: Option<bool>,
+}
+
+impl Forward {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 /// Shells guaranteed to be available in Silo's built-in image.
@@ -338,6 +383,12 @@ struct EffectiveManagedMount {
     enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+struct EffectiveForward {
+    port: u16,
+    enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -530,7 +581,9 @@ impl Config {
         let (mut project, unknown_keys) = deserialize_toml::<ProjectConfig>(&text)
             .with_context(|| format!("invalid project config in `{}`", path.display()))?;
         project.resolve_paths(project_root);
-        config.apply_project(project);
+        config
+            .apply_project(project)
+            .with_context(|| format!("invalid project config in `{}`", path.display()))?;
         config
             .validate()
             .with_context(|| format!("invalid project config in `{}`", path.display()))?;
@@ -539,7 +592,7 @@ impl Config {
     }
 
     /// Replaces every global option explicitly supplied by the project.
-    fn apply_project(&mut self, project: ProjectConfig) {
+    fn apply_project(&mut self, project: ProjectConfig) -> Result<()> {
         if let Some(dockerfile) = project.image.dockerfile {
             self.image.dockerfile = Some(dockerfile);
         }
@@ -548,6 +601,31 @@ impl Config {
         }
         if let Some(memory) = project.container.memory {
             self.container.memory = Some(memory);
+        }
+        if let Some(forwards) = project.forward {
+            for (name, overlay) in forwards {
+                if let Some(entry) = self.forward.get_mut(&name) {
+                    if let Some(port) = overlay.port {
+                        entry.port = port;
+                    }
+                    if overlay.enabled.is_some() {
+                        entry.enabled = overlay.enabled;
+                    }
+                } else {
+                    let port = overlay.port.ok_or_else(|| {
+                        anyhow!(
+                            "project forward `{name}` must define `port` when adding a new entry"
+                        )
+                    })?;
+                    self.forward.insert(
+                        name,
+                        Forward {
+                            port,
+                            enabled: overlay.enabled,
+                        },
+                    );
+                }
+            }
         }
         if let Some(shell) = project.shell {
             self.shell = Some(shell);
@@ -568,6 +646,7 @@ impl Config {
         if let Some(quick) = project.quick {
             self.quick = quick;
         }
+        Ok(())
     }
 
     /// Parses the config from TOML text, filling missing keys with defaults.
@@ -663,6 +742,34 @@ impl Config {
                 "invalid `container.memory` config option: memory must not be empty"
             ));
         }
+        let mut forward_problems = Vec::new();
+        for (name, entry) in &self.forward {
+            let valid_name = name.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_lowercase() || (index > 0 && (byte.is_ascii_digit() || byte == b'_'))
+            });
+            if !valid_name || name.is_empty() {
+                forward_problems.push(format!(
+                    "forward `{name}`: name must start with a lowercase ASCII letter and contain only lowercase ASCII letters, numbers, or `_`"
+                ));
+            }
+            if entry.port < 1024 {
+                forward_problems.push(format!(
+                    "forward `{name}`: port must be between 1024 and 65535"
+                ));
+            }
+        }
+        if !forward_problems.is_empty() {
+            let noun = if forward_problems.len() == 1 {
+                "entry"
+            } else {
+                "entries"
+            };
+            return Err(anyhow!(
+                "invalid forward {noun} in the `[forward]` config option: {}",
+                forward_problems.join("; ")
+            ));
+        }
+
         let mut problems: Vec<String> = Vec::new();
         for (name, entry) in &self.mounts {
             let label = format!("mount `{name}`");
@@ -721,7 +828,7 @@ where
     let deserializer = toml::Deserializer::parse(text)?;
     let mut unknown_keys = Vec::new();
     let value = serde_ignored::deserialize(deserializer, |path| {
-        unknown_keys.push(path.to_string());
+        unknown_keys.push(path.to_string().replace(".?.", "."));
     })?;
     unknown_keys.sort();
     Ok((value, unknown_keys))

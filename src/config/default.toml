@@ -15,6 +15,11 @@
 ### Prevent the container from modifying the project's Git metadata.
 read_only_git = true
 
+### Forward host loopback TCP ports into project containers. Entries are
+### enabled by default and project config may add or override them by name.
+[forward]
+# postgres = { port = 5432, enabled = true }
+
 ### Targets use `./` for the project directory, `~/` for the container home,
 ### or `/` for an absolute container path. Host mounts default to read-only.
 [mounts.host]
