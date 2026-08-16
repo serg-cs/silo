@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Learn the Silo project model and open your first project-scoped development workspace.">
+    <meta name="theme-color" content="#fcc010">
+    <link rel="canonical" href="https://serg-cs.github.io/silo/docs/">
+    <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="../assets/styles.css">
+    <script src="../assets/site.js" defer></script>
+    <title>Documentation — Silo</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <div class="nav-shell">
+        <a class="brand" href="../" aria-label="Silo home"><img src="../assets/favicon.svg" alt="" width="32" height="32"><span>Silo</span></a>
+        <button class="menu-button" type="button" aria-expanded="false" aria-controls="site-navigation" data-menu-button>Menu</button>
+        <nav class="site-nav" id="site-navigation" aria-label="Primary navigation" data-site-navigation>
+          <a href="../">Home</a>
+          <a href="./" aria-current="page">Docs</a>
+          <a href="./commands/">Commands</a>
+          <a class="github-link" href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="docs-layout" id="main">
+      <aside class="docs-sidebar" aria-label="Documentation navigation">
+        <p class="docs-sidebar-title">Documentation</p>
+        <nav aria-label="Documentation sections">
+          <a href="./" aria-current="page">Start here</a>
+          <a href="./concepts/">Concepts</a>
+          <a href="./configuration/">Configuration</a>
+          <a href="./how-it-works/">How it works</a>
+          <a href="./tips/">Tips &amp; troubleshooting</a>
+        </nav>
+      </aside>
+
+      <article class="doc-content">
+        <header class="doc-header">
+          <p class="eyebrow">Documentation</p>
+          <h1>Start with the project.</h1>
+          <p>Silo turns the current project into the unit of isolation. Build the image once, open a session, and add only the state and host access that your tools actually need.</p>
+        </header>
+
+        <section id="requirements">
+          <h2><a href="#requirements">Requirements</a></h2>
+          <p>Silo runs on Apple's <code>container</code> CLI. Its upstream supported environment is an Apple silicon Mac running macOS 26. Consult the <a href="https://github.com/apple/container#requirements" target="_blank" rel="noopener noreferrer">official runtime requirements</a> for current platform details.</p>
+          <p>Host loopback forwarding additionally requires Apple <code>container</code> 1.2.1 or newer. Other Silo operations do not perform that version check.</p>
+        </section>
+
+        <section id="install">
+          <h2><a href="#install">Install from source</a></h2>
+          <p>Install Rust 1.91 or newer with Cargo, then build and install the latest Silo source directly from GitHub:</p>
+          <pre data-copy><code>cargo install --git https://github.com/serg-cs/silo --locked</code></pre>
+          <p>If you already have the repository checked out, install that checkout instead:</p>
+          <pre data-copy><code>cargo install --path . --locked</code></pre>
+          <p>Cargo places the executable in <code>$CARGO_HOME/bin</code>, or <code>~/.cargo/bin</code> by default. Add that directory to <code>PATH</code> if your shell cannot find <code>silo</code>, then verify the installation:</p>
+          <pre data-copy><code>silo --version</code></pre>
+        </section>
+
+        <section id="first-session">
+          <h2><a href="#first-session">Your first session</a></h2>
+          <p>Build Silo's image before the first run. The built-in image is substantial because it includes several coding agents, browser tooling, language runtimes, shells, and common development utilities.</p>
+          <pre data-copy><code>silo image build</code></pre>
+          <p>Move into a Git repository or any working directory and open a shell:</p>
+          <pre data-copy><code>cd ~/code/my-project
+silo run</code></pre>
+          <p>Silo discovers a project root, mounts it read-write as the container's working directory, and starts a shared container. With the built-in image, the host user and group IDs are mirrored into the container so files remain usable on both sides.</p>
+          <p>Run a single command by placing it after the required <code>--</code> separator:</p>
+          <pre data-copy><code>silo run -- cargo test
+silo run -- codex --model gpt-5</code></pre>
+          <p>Open another terminal and run <code>silo run</code> again to join the same project container. The shared container remains alive until every active session exits.</p>
+        </section>
+
+        <section id="project-config">
+          <h2><a href="#project-config">Add a project configuration</a></h2>
+          <p>A <code>.silo.toml</code> file marks an explicit project root and adds project-specific settings. Start small:</p>
+          <pre data-copy><code>[mounts.project]
+cargo = { target = "~/.cargo" }
+cargo-target = { target = "./target" }
+
+[quick]
+test = ["cargo", "test"]
+agent = ["codex"]</code></pre>
+          <p>Validate and inspect the result before running it:</p>
+          <pre data-copy><code>silo config check
+silo config list</code></pre>
+          <p>You can now write <code>silo test --workspace</code>. Silo expands it to <code>cargo test --workspace</code> inside the container. Project-managed Cargo state survives automatic container removal but remains private to this project.</p>
+        </section>
+
+        <section id="choose-a-lifecycle">
+          <h2><a href="#choose-a-lifecycle">Choose the lifecycle</a></h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Mode</th><th>Use it for</th><th>Lifecycle</th></tr></thead>
+              <tbody>
+                <tr><td><code>silo run</code></td><td>Normal shells, commands, and concurrent agents</td><td>Stable per-project container; stops after the last session</td></tr>
+                <tr><td><code>silo run --isolated</code></td><td>Clean-room checks and one-off untrusted work</td><td>New foreground container; deleted when the session ends</td></tr>
+                <tr><td>Custom Dockerfile</td><td>A project-defined environment</td><td>Always isolated because Silo cannot assume the built-in image contract</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Both built-in lifecycles mount the project and can use configured host or managed mounts. Custom images retain their own user, entrypoint, command, and filesystem assumptions, so their mount behavior is intentionally narrower.</p>
+        </section>
+
+        <section id="next-steps">
+          <h2><a href="#next-steps">Where to go next</a></h2>
+          <ul>
+            <li>Read <a href="./concepts/">Concepts</a> for the project, image, container, session, and state model.</li>
+            <li>Use the <a href="./commands/">Command reference</a> for every subcommand, flag, alias, and selector.</li>
+            <li>Open <a href="./configuration/">Configuration</a> for the complete TOML schema and merge rules.</li>
+            <li>Study <a href="./how-it-works/">How it works</a> for container identity, session safety, mounts, and forwarding.</li>
+          </ul>
+        </section>
+
+        <nav class="page-links page-links-next" aria-label="Next documentation page">
+          <a class="page-link" href="./concepts/"><span>Next</span>Core concepts</a>
+        </nav>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-shell"><p>Silo documentation</p><div class="footer-links"><a href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a><a href="https://github.com/serg-cs/silo/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License</a></div></div>
+    </footer>
+  </body>
+</html>

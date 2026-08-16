@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Silo">
+  <rect width="64" height="64" rx="16" fill="#fcc010"/>
+  <path d="M44 18H27c-5.5 0-9 3.2-9 8s3.5 8 9 8h10c5.5 0 9 3.2 9 8s-3.5 8-9 8H20" fill="none" stroke="#211a0d" stroke-linecap="square" stroke-width="5"/>
+</svg>

@@ -1,7 +1,13 @@
 [package]
 name = "silo"
 version = "0.1.0"
+authors = ["Sergio Castaño Sánchez"]
+description = "Project-scoped Linux workspaces for coding agents and developer tools on macOS"
 edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/serg-cs/silo"
 
 [lints.clippy]
 pedantic = "deny"

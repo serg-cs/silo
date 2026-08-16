@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Understand Silo projects, images, sessions, containers, persistent mounts, and custom image boundaries.">
+    <meta name="theme-color" content="#fcc010">
+    <link rel="canonical" href="https://serg-cs.github.io/silo/docs/concepts/">
+    <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <script src="../../assets/site.js" defer></script>
+    <title>Concepts — Silo</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header"><div class="nav-shell">
+      <a class="brand" href="../../" aria-label="Silo home"><img src="../../assets/favicon.svg" alt="" width="32" height="32"><span>Silo</span></a>
+      <button class="menu-button" type="button" aria-expanded="false" aria-controls="site-navigation" data-menu-button>Menu</button>
+      <nav class="site-nav" id="site-navigation" aria-label="Primary navigation" data-site-navigation><a href="../../">Home</a><a href="../" aria-current="page">Docs</a><a href="../commands/">Commands</a><a class="github-link" href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a></nav>
+    </div></header>
+
+    <main class="docs-layout" id="main">
+      <aside class="docs-sidebar" aria-label="Documentation navigation"><p class="docs-sidebar-title">Documentation</p><nav aria-label="Documentation sections">
+        <a href="../">Start here</a><a href="./" aria-current="page">Concepts</a><a href="../configuration/">Configuration</a><a href="../how-it-works/">How it works</a><a href="../tips/">Tips &amp; troubleshooting</a>
+      </nav></aside>
+
+      <article class="doc-content">
+        <header class="doc-header">
+          <p class="eyebrow">Concepts</p>
+          <h1>The Silo mental model.</h1>
+          <p>A project selects a workspace. The image supplies the tools. Sessions decide how long a container lives, and mounts decide which state outlives it.</p>
+        </header>
+
+        <section id="projects">
+          <h2><a href="#projects">Projects are the unit of identity</a></h2>
+          <p>Every command that runs a container starts by resolving the current directory to a canonical path and discovering a project root:</p>
+          <ol>
+            <li>The nearest ancestor containing a <code>.silo.toml</code> file wins. An explicit Silo marker takes precedence over every Git directory in the ancestor chain.</li>
+            <li>Without a Silo marker, the nearest ancestor containing a real <code>.git</code> directory becomes the root.</li>
+            <li>Without either marker, the exact current directory is the project.</li>
+          </ol>
+          <p>The canonical root determines the mounted source tree, the container working directory, the shared container ID, project-scoped state, and ownership labels. Two directories with the same basename remain separate projects when their canonical paths differ.</p>
+          <div class="note"><p>Put an empty or partial <code>.silo.toml</code> at a monorepo boundary when you want Silo's project root to differ from Git's root.</p></div>
+        </section>
+
+        <section id="image">
+          <h2><a href="#image">One image supplies the environment</a></h2>
+          <p><code>silo image build</code> creates the local OCI image <code>silo:latest</code>. Unless configuration selects a custom Dockerfile, Silo builds its embedded Ubuntu-based development image.</p>
+          <p>The built-in image includes:</p>
+          <ul>
+            <li>Codex, Claude Code, and many other coding-agent CLIs.</li>
+            <li>Bash, Zsh, Fish, and Nushell, with the host's supported <code>$SHELL</code> mirrored automatically and Zsh as the fallback.</li>
+            <li>Rust, Node.js, Python, <code>uv</code>, Ruff, Playwright with Chromium, GitHub CLI, Jujutsu, and common linters.</li>
+            <li>Practical terminal tools including Ripgrep, fd, fzf, jq, just, tmux, Helix, Vim, lazygit, Yazi, and Zoxide.</li>
+          </ul>
+          <p>Rebuilding is explicit and uncached. Silo serializes builds because Apple's builder is user-global, cleans stale builder storage, and prunes dangling images after the build.</p>
+        </section>
+
+        <section id="sessions">
+          <h2><a href="#sessions">Sessions and containers are different</a></h2>
+          <p>A session is the interactive shell or command you asked Silo to run. A container is the Linux environment hosting it. Shared mode lets several sessions occupy the same project container; isolated mode gives one session a new container.</p>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Property</th><th>Shared</th><th>Isolated</th></tr></thead>
+            <tbody>
+              <tr><td>Requested by</td><td><code>silo run</code></td><td><code>silo run --isolated</code> or any custom image</td></tr>
+              <tr><td>Container ID</td><td>Stable digest of the project path</td><td>Unique to the Silo process</td></tr>
+              <tr><td>Concurrency</td><td>Multiple overlapping sessions</td><td>One foreground session</td></tr>
+              <tr><td>Exit behavior</td><td>Stops after the final lease closes</td><td>Stops and is deleted</td></tr>
+              <tr><td>Best for</td><td>Normal development and cooperating agents</td><td>Clean-room work and throwaway checks</td></tr>
+            </tbody>
+          </table></div>
+          <p>Shared does not mean global: one project never joins another project's container. It means that multiple commands for the same canonical project can share running processes and ephemeral container state while their sessions overlap.</p>
+        </section>
+
+        <section id="state">
+          <h2><a href="#state">State has an explicit lifetime</a></h2>
+          <p>The project root is always a host bind mount and therefore survives every container. Additional named mounts let you choose where other state lives:</p>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Mount type</th><th>Source</th><th>Typical use</th></tr></thead>
+            <tbody>
+              <tr><td>Host</td><td>An existing host directory</td><td>Documents, local output, or data owned outside Silo</td></tr>
+              <tr><td>Project</td><td>Private Silo-managed host storage keyed by project and name</td><td>Build caches and dependencies that should not cross projects</td></tr>
+              <tr><td>Shared</td><td>Private Silo-managed host storage keyed only by name</td><td>Agent credentials or tool state intentionally reused by projects</td></tr>
+            </tbody>
+          </table></div>
+          <p>Host mounts default to read-only and may opt into writes. Managed mounts are writable. Relative targets beginning with <code>./</code> anchor to the project directory; <code>~/</code> anchors to the built-in container home; absolute targets stay absolute.</p>
+          <p>Managed state lives below <code>$XDG_STATE_HOME/silo/mounts</code>, or <code>~/.local/state/silo/mounts</code> when <code>XDG_STATE_HOME</code> is unavailable. Use <code>silo mounts</code> to inspect it and <code>silo mounts delete</code> to remove an unused mount safely.</p>
+        </section>
+
+        <section id="git-boundary">
+          <h2><a href="#git-boundary">Choose how tools access Git metadata</a></h2>
+          <p>The whole project tree is mounted read-write so editors, builds, formatters, and agents can change working files. By default, Silo overlays the project's real <code>.git</code> directory read-only; tools can still inspect the index, refs, history, and worktree status.</p>
+          <p>Projects that expect agents or other containerized tools to stage, commit, switch branches, or otherwise manage the repository can enable Git metadata writes:</p>
+          <pre data-copy><code>read_only_git = false</code></pre>
+          <p>This setting does not change source-file access. A writable named mount that overlaps <code>.git</code> can also make metadata writable, and Silo warns when it detects that overlap.</p>
+        </section>
+
+        <section id="custom-images">
+          <h2><a href="#custom-images">Custom images keep their own contract</a></h2>
+          <p>Setting <code>image.dockerfile</code> changes more than the packages. Silo preserves the image's user, entrypoint, command, and filesystem expectations instead of injecting the built-in supervisor and <code>/home/silo</code> contract.</p>
+          <ul>
+            <li>Custom-image runs always use the isolated lifecycle.</li>
+            <li>Project and shared managed mounts are skipped because Silo cannot safely grant the image user access to private host-owned storage.</li>
+            <li>Enabled host mounts remain available, but their target must be project-relative or absolute; <code>~/</code> has no Silo-defined meaning for a custom image.</li>
+            <li>The project root and configured Git metadata overlay remain available.</li>
+          </ul>
+          <div class="warning"><p>A custom Dockerfile is therefore an environment escape hatch, not a drop-in extension of the built-in shared image.</p></div>
+        </section>
+
+        <nav class="page-links" aria-label="Adjacent documentation pages">
+          <a class="page-link" href="../"><span>Previous</span>Start here</a>
+          <a class="page-link" href="../configuration/"><span>Next</span>Configuration</a>
+        </nav>
+      </article>
+    </main>
+
+    <footer class="site-footer"><div class="footer-shell"><p>Silo documentation</p><div class="footer-links"><a href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a><a href="https://github.com/serg-cs/silo/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License</a></div></div></footer>
+  </body>
+</html>

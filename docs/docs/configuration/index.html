@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Complete Silo TOML configuration reference, including precedence, mounts, forwards, quick commands, and custom images.">
+    <meta name="theme-color" content="#fcc010">
+    <link rel="canonical" href="https://serg-cs.github.io/silo/docs/configuration/">
+    <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <script src="../../assets/site.js" defer></script>
+    <title>Configuration — Silo</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header"><div class="nav-shell">
+      <a class="brand" href="../../" aria-label="Silo home"><img src="../../assets/favicon.svg" alt="" width="32" height="32"><span>Silo</span></a>
+      <button class="menu-button" type="button" aria-expanded="false" aria-controls="site-navigation" data-menu-button>Menu</button>
+      <nav class="site-nav" id="site-navigation" aria-label="Primary navigation" data-site-navigation><a href="../../">Home</a><a href="../" aria-current="page">Docs</a><a href="../commands/">Commands</a><a class="github-link" href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a></nav>
+    </div></header>
+
+    <main class="docs-layout" id="main">
+      <aside class="docs-sidebar" aria-label="Documentation navigation"><p class="docs-sidebar-title">Documentation</p><nav aria-label="Documentation sections">
+        <a href="../">Start here</a><a href="../concepts/">Concepts</a><a href="./" aria-current="page">Configuration</a><a href="../how-it-works/">How it works</a><a href="../tips/">Tips &amp; troubleshooting</a>
+      </nav></aside>
+
+      <article class="doc-content">
+        <header class="doc-header">
+          <p class="eyebrow">Reference</p>
+          <h1>Configuration, layer by layer.</h1>
+          <p>Every setting is optional. Start with the defaults, keep personal preferences global, and add a small project file only where the workspace needs to differ.</p>
+        </header>
+
+        <section id="files">
+          <h2><a href="#files">Configuration files</a></h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Layer</th><th>Location</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr><td>Built-in</td><td>Embedded in Silo</td><td>Usable defaults for every option</td></tr>
+              <tr><td>Global</td><td><code>$XDG_CONFIG_HOME/silo/config.toml</code></td><td>User-wide preferences</td></tr>
+              <tr><td>Global fallback</td><td><code>~/.config/silo/config.toml</code></td><td>Used when <code>XDG_CONFIG_HOME</code> is unset, empty, or relative</td></tr>
+              <tr><td>Project</td><td><code>&lt;project&gt;/.silo.toml</code></td><td>Project-specific overrides and an explicit root marker</td></tr>
+              <tr><td>Invocation</td><td><code>--cpus</code>, <code>--memory</code></td><td>Resource overrides for one run</td></tr>
+            </tbody>
+          </table></div>
+          <p>Precedence is <strong>built-in defaults → global file → project file → CLI flags</strong>. A missing global file is initialized from Silo's commented starter template when a config-consuming command first loads it. If no home directory can be determined, Silo continues with built-in defaults.</p>
+          <pre data-copy><code>silo config default  # print the starter file
+silo config path     # list active files
+silo config list     # print the merged result
+silo config check    # validate the merged result</code></pre>
+        </section>
+
+        <section id="merging">
+          <h2><a href="#merging">How layers merge</a></h2>
+          <p>Most project values replace the same global value only when present. Omitted values inherit. Three collections have explicit rules:</p>
+          <ul>
+            <li><strong>Forwards merge by name and field.</strong> A project may change only <code>enabled</code> or <code>port</code> on an inherited forward. A new project forward must provide <code>port</code>.</li>
+            <li><strong>Mounts merge by name and field.</strong> A project may retarget or disable an inherited mount. Moving the same name to another category resets category-specific fields before applying the project entry.</li>
+            <li><strong>Quick commands replace as a collection.</strong> If the project contains a <code>[quick]</code> table, it replaces the global table. An empty project table clears all global quick commands.</li>
+          </ul>
+          <div class="note"><p>A project can inherit a global custom Dockerfile or replace it with another path, but there is no project-level sentinel that resets a global custom image back to the built-in image.</p></div>
+        </section>
+
+        <section id="complete-example">
+          <h2><a href="#complete-example">Complete example</a></h2>
+          <pre data-copy><code># Every setting shown here is optional.
+# image.dockerfile = "/absolute/path/to/Dockerfile"
+container.cpus = 4
+container.memory = "6G"
+shell = "zsh"
+read_only_git = true
+
+[forward]
+postgres = { port = 5432, enabled = true }
+redis = { port = 6379, enabled = false }
+
+[mounts.host]
+docs = { source = "~/Documents/docs", target = "~/docs" }
+output = { source = "./output", target = "./output", writable = true }
+
+[mounts.project]
+cargo = { target = "~/.cargo" }
+cargo-target = { target = "./target" }
+
+[mounts.shared]
+codex = { target = "~/.codex" }
+
+[quick]
+test = ["cargo", "test"]
+agent = ["codex"]</code></pre>
+          <p>Do not copy the whole example by default. Include only the settings that express an actual workspace decision.</p>
+        </section>
+
+        <section id="image-options">
+          <h2><a href="#image-options">Image and container options</a></h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Key</th><th>Type and default</th><th>Behavior</th></tr></thead>
+            <tbody>
+              <tr><td><code>image.dockerfile</code></td><td>Path; built-in image</td><td>Build this Dockerfile as <code>silo:latest</code>. Project-relative paths resolve from the project root. Use an absolute path in the global file.</td></tr>
+              <tr><td><code>container.cpus</code></td><td>Positive integer; runtime default</td><td>Passes the CPU limit to containers at creation time.</td></tr>
+              <tr><td><code>container.memory</code></td><td>Non-empty string; runtime default</td><td>Passes Apple's accepted memory syntax, such as <code>4G</code>.</td></tr>
+              <tr><td><code>shell</code></td><td><code>bash</code>, <code>zsh</code>, <code>fish</code>, or <code>nu</code>; automatic</td><td>Selects the interactive shell in the built-in image. Automatic mode mirrors a supported host <code>$SHELL</code> and otherwise uses Zsh.</td></tr>
+              <tr><td><code>read_only_git</code></td><td>Boolean; <code>true</code></td><td>Overlays the real project <code>.git</code> directory read-only when it resolves safely inside the project.</td></tr>
+            </tbody>
+          </table></div>
+          <p>CPU and memory values participate in shared-container identity. A changed limit causes the next run to replace a mismatched stopped workspace or coordinate safe replacement when possible.</p>
+        </section>
+
+        <section id="forwards">
+          <h2><a href="#forwards">Host loopback forwards</a></h2>
+          <pre data-copy><code>[forward]
+postgres = { port = 5432 }
+web_api = { port = 8080, enabled = true }</code></pre>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Field</th><th>Requirement</th></tr></thead>
+            <tbody>
+              <tr><td>Name</td><td>Starts with a lowercase ASCII letter; remaining characters are lowercase letters, digits, or <code>_</code>.</td></tr>
+              <tr><td><code>port</code></td><td>Host loopback TCP port from 1024 through 65535.</td></tr>
+              <tr><td><code>enabled</code></td><td>Optional boolean; defaults to <code>true</code>.</td></tr>
+            </tbody>
+          </table></div>
+          <p>Inside the session, each enabled name becomes an uppercase environment prefix. The example supplies <code>SILO_POSTGRES_HOST</code>, <code>SILO_POSTGRES_PORT</code>, <code>SILO_WEB_API_HOST</code>, and <code>SILO_WEB_API_PORT</code>.</p>
+          <p>The configured port is where the service listens on the host, so PostgreSQL may stay on host <code>localhost:5432</code>. Inside the container, connect to <code>$SILO_POSTGRES_HOST:$SILO_POSTGRES_PORT</code>; container-local <code>localhost</code> is not the host.</p>
+          <p>Silo forwards only the named host loopback ports. It creates a private project network and relays traffic through bounded listeners rather than exposing every host service.</p>
+        </section>
+
+        <section id="host-mounts">
+          <h2><a href="#host-mounts">Host mounts</a></h2>
+          <pre data-copy><code>[mounts.host]
+reference = { source = "~/Documents/reference", target = "~/reference" }
+artifacts = { source = "./artifacts", target = "./artifacts", writable = true }
+disabled = { enabled = false }</code></pre>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Field</th><th>Default</th><th>Behavior</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td><code>true</code></td><td>Disabled entries may omit source and target and are not resolved at run time.</td></tr>
+              <tr><td><code>source</code></td><td>Required when enabled</td><td>An existing host directory. <code>~</code> expands from host home; relative file paths resolve from the containing config's base.</td></tr>
+              <tr><td><code>target</code></td><td>Required when enabled</td><td>Destination inside the container.</td></tr>
+              <tr><td><code>writable</code></td><td><code>false</code></td><td>Host mounts are read-only unless writes are explicitly enabled.</td></tr>
+            </tbody>
+          </table></div>
+          <p>Sources are canonicalized when a session starts. Missing paths, broken symlinks, and non-directory sources fail loudly instead of creating an unexpected mount.</p>
+        </section>
+
+        <section id="managed-mounts">
+          <h2><a href="#managed-mounts">Project and shared mounts</a></h2>
+          <pre data-copy><code>[mounts.project]
+dependencies = { target = "~/.cache/dependencies" }
+build = { target = "./target" }
+
+[mounts.shared]
+agent-state = { target = "~/.agent" }
+disabled = { enabled = false }</code></pre>
+          <p>Managed entries accept only <code>target</code> and optional <code>enabled</code>. Silo creates private writable host storage:</p>
+          <ul>
+            <li><strong>Project</strong> storage is keyed by canonical project path and mount name.</li>
+            <li><strong>Shared</strong> storage is keyed by mount name and is intentionally reused across projects.</li>
+          </ul>
+          <p>Mount names must start with an ASCII letter or digit and then contain only letters, digits, <code>_</code>, or <code>-</code>. One name cannot appear in more than one mount category in the same file.</p>
+        </section>
+
+        <section id="target-paths">
+          <h2><a href="#target-paths">Target path rules</a></h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Form</th><th>Resolves to</th><th>Example</th></tr></thead>
+            <tbody>
+              <tr><td><code>./…</code></td><td>The mounted project working directory</td><td><code>./target</code></td></tr>
+              <tr><td><code>~/…</code></td><td><code>/home/silo</code> in the built-in image</td><td><code>~/.cargo</code></td></tr>
+              <tr><td><code>/…</code></td><td>An absolute container path</td><td><code>/output</code></td></tr>
+            </tbody>
+          </table></div>
+          <p>Targets must be non-empty UTF-8, may not contain commas, equals signs, or newlines, and may not use <code>..</code> to escape a relative anchor. Custom images reject home-relative host targets because they do not define Silo's <code>/home/silo</code> contract.</p>
+          <p>Nested mounts are ordered from parent to child. If two entries resolve to the same target, the deterministic later entry wins and Silo emits a warning.</p>
+        </section>
+
+        <section id="quick">
+          <h2><a href="#quick">Quick commands</a></h2>
+          <pre data-copy><code>[quick]
+check = ["just", "check"]
+cx = ["codex", "--model", "gpt-5"]</code></pre>
+          <p>Each key is the token typed after <code>silo</code>. Each value is a TOML array containing the executable and any fixed arguments. Invocation arguments are appended without shell interpolation.</p>
+          <p>Names beginning with <code>-</code> or colliding with built-in commands are unreachable; Silo warns and asks you to rename them. Built-in subcommands always win.</p>
+        </section>
+
+        <section id="validation">
+          <h2><a href="#validation">Validation and diagnostics</a></h2>
+          <p><code>silo config check</code> validates the effective configuration without creating a container. It checks:</p>
+          <ul>
+            <li>TOML structure and field types.</li>
+            <li>CPU, memory, forward names, ports, mount names, and path syntax.</li>
+            <li>Required fields for enabled mounts.</li>
+            <li>The configured Dockerfile's existence and file type.</li>
+            <li>Custom-image and home-relative mount incompatibilities.</li>
+          </ul>
+          <p>Host mount source existence is checked again at <code>silo run</code>, because the filesystem can change after validation. Unknown config keys are warnings rather than hard errors, with both the file and ignored key named.</p>
+        </section>
+
+        <nav class="page-links" aria-label="Adjacent documentation pages">
+          <a class="page-link" href="../concepts/"><span>Previous</span>Core concepts</a>
+          <a class="page-link" href="../how-it-works/"><span>Next</span>How Silo works</a>
+        </nav>
+      </article>
+    </main>
+
+    <footer class="site-footer"><div class="footer-shell"><p>Silo documentation</p><div class="footer-links"><a href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a><a href="https://github.com/serg-cs/silo/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License</a></div></div></footer>
+  </body>
+</html>

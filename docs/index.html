@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Silo creates project-scoped Linux workspaces for coding agents and developer tools on macOS.">
+    <meta name="theme-color" content="#fcc010">
+    <meta property="og:title" content="Silo — a workspace for every project">
+    <meta property="og:description" content="Persistent where it matters. Isolated where it counts. Project-scoped Linux workspaces for agents and developer tools on macOS.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://serg-cs.github.io/silo/">
+    <link rel="canonical" href="https://serg-cs.github.io/silo/">
+    <link rel="icon" href="./assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="./assets/styles.css">
+    <script src="./assets/site.js" defer></script>
+    <title>Silo — a workspace for every project</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <div class="nav-shell">
+        <a class="brand" href="./" aria-label="Silo home">
+          <img src="./assets/favicon.svg" alt="" width="32" height="32">
+          <span>Silo</span>
+        </a>
+        <button class="menu-button" type="button" aria-expanded="false" aria-controls="site-navigation" data-menu-button>Menu</button>
+        <nav class="site-nav" id="site-navigation" aria-label="Primary navigation" data-site-navigation>
+          <a href="./" aria-current="page">Home</a>
+          <a href="./docs/">Docs</a>
+          <a href="./docs/commands/">Commands</a>
+          <a class="github-link" href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Project-scoped Linux workspaces</p>
+          <h1>Some things shouldn’t see the outside.</h1>
+          <p class="hero-lede">Silo gives coding agents and developer tools a focused container on macOS—persistent where it helps, isolated when it matters, and clear about what crosses the boundary.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="./docs/">Read the documentation</a>
+            <a class="button" href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">View on GitHub</a>
+          </div>
+        </div>
+
+        <div class="terminal" role="group" aria-label="Moving from a macOS project into its Silo workspace">
+          <div class="terminal-bar">
+            <div class="terminal-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+          </div>
+          <div class="terminal-phase">
+            <div class="terminal-context">macOS host</div>
+            <pre><span class="prompt">$</span> cd ~/code/my-project
+<span class="prompt">$</span> uname -s
+<span class="output">Darwin</span>
+<span class="prompt">$</span> silo run</pre>
+          </div>
+          <div class="terminal-phase">
+            <div class="terminal-context">Silo workspace · my-project</div>
+            <pre><span class="prompt">%</span> uname -s
+<span class="output">Linux</span>
+<span class="prompt">%</span> pwd
+<span class="output">/home/silo/my-project</span></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="content-section" id="features">
+        <div class="section-intro">
+          <h2>Boundaries without busywork.</h2>
+          <p>Silo wraps Apple's native container runtime with a project model built for real development sessions. Source stays close, durable state is deliberate, and the disposable parts disappear when the work is done.</p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature">
+            <span class="feature-number">01</span>
+            <h3>Agent-ready image</h3>
+            <p>Start with popular coding agents, shells, browser tooling, language runtimes, and everyday CLI utilities already in the built-in image.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-number">02</span>
+            <h3>One project, one workspace</h3>
+            <p>A canonical project path creates a stable identity, working directory, and shared container that later sessions can reuse.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-number">03</span>
+            <h3>Concurrent by design</h3>
+            <p>Run a shell, an agent, and a test command together. Session leases prevent the shared container from stopping underneath active work.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-number">04</span>
+            <h3>Durable state, chosen explicitly</h3>
+            <p>Keep caches per project, share selected credentials across projects, or expose host directories with read-only access by default.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-number">05</span>
+            <h3>Shared or isolated</h3>
+            <p>Reuse the project container for normal work, or start a one-shot environment when a task should have a clean runtime boundary.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-number">06</span>
+            <h3>Host services, named</h3>
+            <p>Opt into loopback forwarding for databases and local APIs. Silo supplies explicit host and port variables inside each session.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="content-section" id="workflow">
+        <div class="section-intro">
+          <h2>A small mental model.</h2>
+          <p>Build the workspace image, enter a project, and run the tools you need. Configuration stays layered and inspectable instead of becoming another environment manager.</p>
+        </div>
+        <div class="workflow">
+          <article class="workflow-step">
+            <h3>Build once</h3>
+            <p><code>silo image build</code> produces the built-in agent and development image, or builds the custom Dockerfile selected in configuration.</p>
+          </article>
+          <article class="workflow-step">
+            <h3>Work together</h3>
+            <p><code>silo run</code> opens a shared shell. Run additional commands or agents concurrently against the same mounted project.</p>
+          </article>
+          <article class="workflow-step">
+            <h3>Leave cleanly</h3>
+            <p>The shared container stops after its last session. Managed mounts keep only the caches, credentials, and tool state you asked Silo to retain.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="closing-panel">
+        <div>
+          <h2>Know exactly what Silo does.</h2>
+          <p>Explore the lifecycle, every command, the full TOML schema, forwarding, storage, custom images, and practical agent workflows.</p>
+        </div>
+        <a class="button button-primary" href="./docs/">Open the docs</a>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-shell">
+        <p>Project-scoped Linux workspaces for macOS.</p>
+        <div class="footer-links">
+          <a href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a>
+          <a href="https://github.com/serg-cs/silo/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

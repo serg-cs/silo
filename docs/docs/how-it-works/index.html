@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="How Silo discovers projects, identifies containers, coordinates sessions, resolves mounts, and forwards host services.">
+    <meta name="theme-color" content="#fcc010">
+    <link rel="canonical" href="https://serg-cs.github.io/silo/docs/how-it-works/">
+    <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <script src="../../assets/site.js" defer></script>
+    <title>How it works — Silo</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header"><div class="nav-shell">
+      <a class="brand" href="../../" aria-label="Silo home"><img src="../../assets/favicon.svg" alt="" width="32" height="32"><span>Silo</span></a>
+      <button class="menu-button" type="button" aria-expanded="false" aria-controls="site-navigation" data-menu-button>Menu</button>
+      <nav class="site-nav" id="site-navigation" aria-label="Primary navigation" data-site-navigation><a href="../../">Home</a><a href="../" aria-current="page">Docs</a><a href="../commands/">Commands</a><a class="github-link" href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a></nav>
+    </div></header>
+
+    <main class="docs-layout" id="main">
+      <aside class="docs-sidebar" aria-label="Documentation navigation"><p class="docs-sidebar-title">Documentation</p><nav aria-label="Documentation sections">
+        <a href="../">Start here</a><a href="../concepts/">Concepts</a><a href="../configuration/">Configuration</a><a href="./" aria-current="page">How it works</a><a href="../tips/">Tips &amp; troubleshooting</a>
+      </nav></aside>
+
+      <article class="doc-content">
+        <header class="doc-header">
+          <p class="eyebrow">Under the hood</p>
+          <h1>How Silo works.</h1>
+          <p>Silo is a focused host-side coordinator. It delegates virtual machines and OCI images to Apple's runtime while making project identity, concurrent sessions, storage, and host access deterministic.</p>
+        </header>
+
+        <section id="run-flow">
+          <h2><a href="#run-flow">From command to workspace</a></h2>
+          <ol>
+            <li><strong>Discover.</strong> Canonicalize the current directory and select a <code>.silo.toml</code> marker, Git root, or the current directory itself.</li>
+            <li><strong>Configure.</strong> Load built-in defaults, global TOML, and the project TOML; warn about unknown or unreachable entries; then apply invocation resource flags.</li>
+            <li><strong>Validate.</strong> Resolve the lifecycle, image contract, named mounts, configured Git metadata access, resource limits, and enabled forwards.</li>
+            <li><strong>Prepare.</strong> Confirm the image/runtime state and establish managed storage or a forwarding lease where needed.</li>
+            <li><strong>Run.</strong> Reuse or create the shared project container, or create a one-shot isolated container, then attach the requested shell or command.</li>
+            <li><strong>Clean up.</strong> Restore the terminal, release session and forwarding leases, and remove isolated runtime resources.</li>
+          </ol>
+          <p>Silo has no persistent host daemon. The forwarding broker is a short-lived internal helper started only when forwarding is active and exits after its leases become idle.</p>
+        </section>
+
+        <section id="identity">
+          <h2><a href="#identity">Identity and ownership</a></h2>
+          <p>A shared container name begins with <code>silo-</code> and ends with the first 24 hexadecimal characters of a SHA-256 digest of the canonical project path. The stable name makes concurrent Silo processes converge on the same workspace.</p>
+          <p>Silo also writes ownership, schema, project, project-root, lifecycle, and specification labels. Before it starts, stops, replaces, or deletes a resource, it inspects those labels and rejects anything that does not match the expected identity.</p>
+          <div class="note"><p>A matching name alone is never sufficient evidence that Silo owns a container or network.</p></div>
+          <p>Management commands inventory only unambiguously Silo-owned resources. They report malformed entries as warnings rather than guessing.</p>
+        </section>
+
+        <section id="specification">
+          <h2><a href="#specification">The container specification</a></h2>
+          <p>Shared-container reuse depends on more than its project ID. Silo hashes creation-time inputs into a specification label, including:</p>
+          <ul>
+            <li>The image digest and lifecycle.</li>
+            <li>Host user and group IDs.</li>
+            <li>Project root and working directory.</li>
+            <li>Git overlay, named mount sources, targets, and access modes.</li>
+            <li>Forward network, CPU count, memory, and creation command.</li>
+          </ul>
+          <p>If the running or stopped container does not match the desired specification, Silo coordinates replacement rather than silently reusing the wrong environment. Image changes during creation are detected and retried within a bounded window.</p>
+          <p>Ephemeral state inside the old container is lost on replacement. The source tree and configured managed mounts are host-backed and remain available.</p>
+        </section>
+
+        <section id="shared-lifecycle">
+          <h2><a href="#shared-lifecycle">Shared session handoff</a></h2>
+          <p>The built-in image runs a small Silo supervisor as PID 1. Before starting an arbitrary user command, the host waits for an explicit guest readiness marker and reserves a session token through a safe helper.</p>
+          <p>The reservation closes a subtle race: without it, the supervisor could decide the container was idle after host inspection but just before the command attached. Only the reservation helper is retried; Silo never replays the user's command automatically.</p>
+          <p>Once attached, a guest wrapper owns the session lease for the command and its children. The supervisor observes reservations and active leases and exits only when both reach zero. This allows shells, tests, and agents to overlap without one process shutting down another's container.</p>
+          <p>When Silo receives an interrupt, termination, hangup, or quit signal, it forwards the signal to the attached runtime process, waits for cleanup, and restores the host terminal state.</p>
+        </section>
+
+        <section id="isolated-lifecycle">
+          <h2><a href="#isolated-lifecycle">Isolated lifecycle</a></h2>
+          <p>An isolated run creates a unique container, starts it in the foreground, forwards relevant signals, and deletes the container after the child exits. Interrupted or failed creation paths also attempt cleanup.</p>
+          <p>The built-in isolated mode uses the same project mount, Git overlay, named host mounts, and managed storage as shared mode. Its container filesystem is disposable, but configured mount state is not.</p>
+          <p>Custom images use the same one-shot host lifecycle but preserve their own image-defined command and user. Silo skips private managed mounts and rejects <code>~/</code> host targets because those features depend on the built-in image's user contract.</p>
+        </section>
+
+        <section id="mount-resolution">
+          <h2><a href="#mount-resolution">Mount resolution and storage</a></h2>
+          <p>Enabled host sources are expanded, canonicalized, and verified as directories at run time. Managed mounts receive deterministic host paths and opaque IDs. Silo creates their parent directories with private permissions, guards mutations with file locks, and stores project-path metadata beside project mounts.</p>
+          <p>Before using or deleting managed state, Silo checks that directories are real rather than symlinks, ownership metadata matches the expected project, and the derived ID/path are consistent. Deletion additionally asks the runtime whether any container still references the directory.</p>
+          <p>Mounts are sorted from shallower to deeper targets so nested overrides are deterministic. A later duplicate target wins, and potentially surprising overlaps—especially writable paths under the read-only Git target—produce warnings.</p>
+        </section>
+
+        <section id="git-overlay">
+          <h2><a href="#git-overlay">Git metadata overlay</a></h2>
+          <p>When enabled, Silo canonicalizes <code>&lt;project&gt;/.git</code> and mounts it separately at the corresponding path inside the writable project tree. It applies the overlay only when the resolved path remains inside the canonical project root; a missing directory or a symlink escaping the project is not mounted.</p>
+          <p>This is a focused guardrail, not a full sandbox policy. Tools can still edit source files, and another explicitly writable mount can overlap the protected destination. Silo warns about known overlap but preserves the user's configured mount order.</p>
+        </section>
+
+        <section id="forwarding">
+          <h2><a href="#forwarding">Host loopback forwarding</a></h2>
+          <p>A container cannot reach a service bound only to the host's <code>127.0.0.1</code> through normal container networking. For each project with enabled forwards, Silo:</p>
+          <ol>
+            <li>Checks that Apple's <code>container</code> runtime is at least version 1.2.1.</li>
+            <li>Creates or validates a labeled, project-specific IPv4 network.</li>
+            <li>Acquires relay listeners from a per-user local broker.</li>
+            <li>Limits accepted relay sources to leased project-network subnets.</li>
+            <li>Passes the network gateway and leased port into the session environment.</li>
+          </ol>
+          <pre><code>[forward]
+postgres = { port = 5432 }
+
+# Available inside the container:
+SILO_POSTGRES_HOST=&lt;project-network-gateway&gt;
+SILO_POSTGRES_PORT=&lt;leased-relay-port&gt;</code></pre>
+          <p>The relay connects each accepted request to <code>127.0.0.1:5432</code> on the host. Listener ports are implementation details, so programs should always read both generated variables rather than assuming the configured destination port.</p>
+          <p>The broker caps concurrent relay work, shares listeners safely across active sessions, and removes idle networks only after their leases close. Startup and cleanup are serialized per project to avoid deleting a network while another session is acquiring it.</p>
+        </section>
+
+        <section id="runtime-boundary">
+          <h2><a href="#runtime-boundary">Runtime boundary</a></h2>
+          <p>Apple's <code>container</code> CLI owns Linux kernels, image storage, networking, VM execution, and low-level mount behavior. Silo owns only the resources carrying its validated labels and delegates commands through the CLI.</p>
+          <p>Image building is the exception where Silo intentionally treats Apple's user-global builder and dangling build images as disposable storage. Container and mount management remains ownership-scoped and conservative.</p>
+        </section>
+
+        <nav class="page-links" aria-label="Adjacent documentation pages">
+          <a class="page-link" href="../configuration/"><span>Previous</span>Configuration</a>
+          <a class="page-link" href="../tips/"><span>Next</span>Tips &amp; troubleshooting</a>
+        </nav>
+      </article>
+    </main>
+
+    <footer class="site-footer"><div class="footer-shell"><p>Silo documentation</p><div class="footer-links"><a href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a><a href="https://github.com/serg-cs/silo/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License</a></div></div></footer>
+  </body>
+</html>

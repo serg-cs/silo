@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Practical Silo workflows for coding agents, caches, host services, cleanup, custom images, and troubleshooting.">
+    <meta name="theme-color" content="#fcc010">
+    <link rel="canonical" href="https://serg-cs.github.io/silo/docs/tips/">
+    <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="../../assets/styles.css">
+    <script src="../../assets/site.js" defer></script>
+    <title>Tips and troubleshooting — Silo</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header"><div class="nav-shell">
+      <a class="brand" href="../../" aria-label="Silo home"><img src="../../assets/favicon.svg" alt="" width="32" height="32"><span>Silo</span></a>
+      <button class="menu-button" type="button" aria-expanded="false" aria-controls="site-navigation" data-menu-button>Menu</button>
+      <nav class="site-nav" id="site-navigation" aria-label="Primary navigation" data-site-navigation><a href="../../">Home</a><a href="../" aria-current="page">Docs</a><a href="../commands/">Commands</a><a class="github-link" href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a></nav>
+    </div></header>
+
+    <main class="docs-layout" id="main">
+      <aside class="docs-sidebar" aria-label="Documentation navigation"><p class="docs-sidebar-title">Documentation</p><nav aria-label="Documentation sections">
+        <a href="../">Start here</a><a href="../concepts/">Concepts</a><a href="../configuration/">Configuration</a><a href="../how-it-works/">How it works</a><a href="./" aria-current="page">Tips &amp; troubleshooting</a>
+      </nav></aside>
+
+      <article class="doc-content">
+        <header class="doc-header">
+          <p class="eyebrow">Field guide</p>
+          <h1>Useful patterns, clear fixes.</h1>
+          <p>Keep agent sessions convenient without blurring boundaries, and diagnose the effective workspace before reaching for destructive cleanup.</p>
+        </header>
+
+        <section id="agent-workspace">
+          <h2><a href="#agent-workspace">Build a practical agent workspace</a></h2>
+          <p>Keep dependency and build caches private to the project. Share only the agent state that genuinely needs to follow you:</p>
+          <pre data-copy><code>[mounts.project]
+cargo-home = { target = "~/.cargo" }
+cargo-target = { target = "./target" }
+
+[mounts.shared]
+codex = { target = "~/.codex" }
+
+[quick]
+codex = ["codex"]
+check = ["cargo", "test", "--workspace"]</code></pre>
+          <p>This layout lets an agent reuse credentials while keeping compiled dependencies specific to one canonical project.</p>
+          <div class="warning"><p>A shared mount is visible to every project that enables the same logical name. Do not put project secrets there merely for convenience.</p></div>
+        </section>
+
+        <section id="multiple-agents">
+          <h2><a href="#multiple-agents">Run cooperating tools concurrently</a></h2>
+          <p>Open separate host terminals in the same project and start each tool normally:</p>
+          <pre data-copy><code># Terminal one
+silo run -- codex
+
+# Terminal two
+silo run -- cargo watch -x test
+
+# Terminal three
+silo run</code></pre>
+          <p>All three sessions share the same container processes, project mount, and ephemeral filesystem. Closing one does not stop the others. Use isolated mode instead when tools should not observe each other's processes or temporary container state.</p>
+        </section>
+
+        <section id="quick-commands">
+          <h2><a href="#quick-commands">Use quick commands as a project vocabulary</a></h2>
+          <p>Quick commands are most useful for stable entry points, not every shell expression:</p>
+          <pre data-copy><code>[quick]
+test = ["just", "test"]
+lint = ["just", "lint"]
+agent = ["codex", "--full-auto"]</code></pre>
+          <p>Arguments append naturally—<code>silo test api</code> becomes <code>just test api</code>. Since Silo executes an argument vector rather than a shell string, pipes, redirects, and environment assignments need an explicit shell:</p>
+          <pre data-copy><code>[quick]
+logs = ["sh", "-lc", "just logs | tail -n 100"]</code></pre>
+        </section>
+
+        <section id="host-services">
+          <h2><a href="#host-services">Connect to a host service</a></h2>
+          <p>Name only the loopback service the project needs:</p>
+          <pre data-copy><code>[forward]
+postgres = { port = 5432 }
+api = { port = 8080 }</code></pre>
+          <p>Read the generated values inside the container:</p>
+          <pre data-copy><code>psql -h "$SILO_POSTGRES_HOST" -p "$SILO_POSTGRES_PORT"
+curl "http://$SILO_API_HOST:$SILO_API_PORT/health"</code></pre>
+          <p>Do not hard-code the relay port. Silo may lease a different listener while still forwarding to the configured destination on host loopback.</p>
+        </section>
+
+        <section id="resources">
+          <h2><a href="#resources">Tune resources deliberately</a></h2>
+          <p>Put stable limits in configuration and use flags for exceptional runs:</p>
+          <pre data-copy><code>container.cpus = 4
+container.memory = "6G"</code></pre>
+          <pre data-copy><code>silo run --cpus 8 --memory 12G -- cargo test</code></pre>
+          <p>Resource settings apply when a container is created. Because they are part of its specification, changing them can replace the shared project container on the next session. Durable mounts remain, but unmounted container-local state does not.</p>
+        </section>
+
+        <section id="git-writes">
+          <h2><a href="#git-writes">Choose Git access for the workflow</a></h2>
+          <p>Silo defaults to read-only Git metadata while leaving the working tree writable. If agents or other tools should stage, commit, switch branches, or manage repository configuration, set this in the project file:</p>
+          <pre data-copy><code>read_only_git = false</code></pre>
+          <p>Set <code>read_only_git = true</code> when tools should inspect repository state without changing Git metadata. This is a project-level workflow choice.</p>
+        </section>
+
+        <section id="inspect-first">
+          <h2><a href="#inspect-first">Inspect before cleanup</a></h2>
+          <pre data-copy><code>silo config path
+silo config list
+silo config check
+silo containers
+silo mounts</code></pre>
+          <p>This sequence answers which files contributed, what Silo actually sees, whether the result is valid, which containers are active, and which durable directories exist.</p>
+          <p>Delete runtime containers independently from durable state:</p>
+          <pre data-copy><code>silo containers delete my-project
+silo mounts delete silo-mount-p-&lt;id&gt;</code></pre>
+          <div class="warning"><p>Container deletion is recoverable from source and configuration. Managed mount deletion removes its data permanently.</p></div>
+        </section>
+
+        <section id="custom-images">
+          <h2><a href="#custom-images">Design custom images for isolation</a></h2>
+          <p>Use a custom Dockerfile when the entire image contract should belong to the project. Keep host-mount targets absolute or project-relative and make their permissions compatible with the image-defined user.</p>
+          <pre data-copy><code>image.dockerfile = "./Dockerfile.silo"
+
+[mounts.host]
+artifacts = { source = "./artifacts", target = "./artifacts", writable = true }</code></pre>
+          <p>Do not expect shared sessions, Silo's built-in shells, <code>/home/silo</code>, or project/shared managed mounts. Silo warns when managed entries are skipped.</p>
+        </section>
+
+        <section id="troubleshooting">
+          <h2><a href="#troubleshooting">Troubleshooting</a></h2>
+
+          <h3 id="image-not-built"><a href="#image-not-built">“image silo:latest not built yet”</a></h3>
+          <p>Build the currently configured image:</p>
+          <pre data-copy><code>silo image build</code></pre>
+          <p>If a project selects a custom Dockerfile, run the build from that project so its configuration and relative path are active.</p>
+
+          <h3 id="runtime-not-started"><a href="#runtime-not-started">The Apple container system is unavailable</a></h3>
+          <p>Check the runtime directly with <code>container system status</code>. Silo attempts to start the system for image builds and first-use paths that require it, but kernels and service failures belong to Apple's CLI.</p>
+
+          <h3 id="forward-version"><a href="#forward-version">Forwarding requires a newer runtime</a></h3>
+          <p>Enabled forwards require Apple <code>container</code> 1.2.1 or newer. Check <code>container system version --format json</code>, update the runtime through its supported channel, or temporarily set the affected forward to <code>enabled = false</code>.</p>
+
+          <h3 id="unknown-config"><a href="#unknown-config">An unknown config key is ignored</a></h3>
+          <p>Read the warning's full dotted key and file path, fix the likely typo, then run <code>silo config check</code>. Unknown values never participate in the effective configuration.</p>
+
+          <h3 id="mount-source"><a href="#mount-source">A host mount source cannot be resolved</a></h3>
+          <p>Confirm that the source exists and is a directory. Relative global sources resolve from the global config directory; relative project sources resolve from the project root; <code>~</code> expands from the host home. Broken symlinks are rejected.</p>
+
+          <h3 id="custom-home"><a href="#custom-home">A custom image rejects a home-relative target</a></h3>
+          <p>Replace <code>~/path</code> with <code>./path</code> for a destination below the mounted project, or with an absolute container path appropriate for the image.</p>
+
+          <h3 id="active-container"><a href="#active-container">A container cannot be deleted because it is active</a></h3>
+          <p>Let its sessions exit and retry. Use <code>--force</code> only when terminating those shells, commands, or agents is intentional.</p>
+
+          <h3 id="mount-in-use"><a href="#mount-in-use">A managed mount is still referenced</a></h3>
+          <p>List containers, end active sessions, and delete stopped containers that still reference the mount. Silo intentionally offers no force-delete path for in-use durable storage.</p>
+
+          <h3 id="quick-name"><a href="#quick-name">A quick command is unknown or unusable</a></h3>
+          <p>Inspect the effective <code>[quick]</code> table with <code>silo config list</code>. Remember that a project table replaces the global table and that names cannot shadow built-ins or start with <code>-</code>.</p>
+        </section>
+
+        <nav class="page-links page-links-previous" aria-label="Previous documentation page">
+          <a class="page-link" href="../how-it-works/"><span>Previous</span>How Silo works</a>
+        </nav>
+      </article>
+    </main>
+
+    <footer class="site-footer"><div class="footer-shell"><p>Silo documentation</p><div class="footer-links"><a href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">GitHub</a><a href="https://github.com/serg-cs/silo/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License</a></div></div></footer>
+  </body>
+</html>
