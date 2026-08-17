@@ -1,42 +1,31 @@
-### Silo configuration. All settings are optional; omitted settings use defaults.
-### Project settings in `.silo.toml` override this file.
+# https://serg-cs.github.io/silo/docs/
 
-### Use a custom Dockerfile instead of the built-in image.
-# image.dockerfile = "/path/to/Dockerfile"
-
-### Container resources. Omit either setting to use Apple container's default.
+# https://serg-cs.github.io/silo/docs/configuration/#image-options
+# image.dockerfile = "/absolute/path/to/Dockerfile"
 # container.cpus = 4
-# container.memory = "4G"
-
-### Shell for the built-in image: "bash", "zsh", "fish", or "nu".
-### When omitted, use a supported host $SHELL and fall back to Zsh.
+# container.memory = "6G"
 # shell = "zsh"
-
-### Prevent the container from modifying the project's Git metadata.
 read_only_git = true
 
-### Forward host loopback TCP ports into project containers. Entries are
-### enabled by default and project config may add or override them by name.
+# https://serg-cs.github.io/silo/docs/configuration/#forwards
 [forward]
 # postgres = { port = 5432, enabled = true }
+# redis = { port = 6379, enabled = false }
 
-### Targets use `./` for the project directory, `~/` for the container home,
-### or `/` for an absolute container path. Host mounts default to read-only.
+# https://serg-cs.github.io/silo/docs/configuration/#host-mounts
 [mounts.host]
-# docs = { source = "~/docs", target = "~/docs" }
-# output = { source = "./output", target = "/output", writable = true }
+# docs = { source = "~/Documents/docs", target = "~/docs" }
+# output = { source = "./output", target = "./output", writable = true }
 
-### Project mounts are writable Silo-managed state private to one project and
-### survive automatic container removal after the final session exits.
+# https://serg-cs.github.io/silo/docs/configuration/#managed-mounts
 [mounts.project]
 # cargo = { target = "~/.cargo" }
 # cargo-target = { target = "./target" }
 
-### Shared mounts are durable writable state reused by every project with the
-### same name. Managed mounts are skipped for custom images.
 [mounts.shared]
 # codex = { target = "~/.codex" }
 
-### Run shortcuts as `silo <name> [args...]`.
+# https://serg-cs.github.io/silo/docs/configuration/#quick
 [quick]
-# name = ["command"]
+# test = ["cargo", "test"]
+# agent = ["codex"]

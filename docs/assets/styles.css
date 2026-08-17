@@ -1062,7 +1062,16 @@ tr:last-child td {
   }
 
   .docs-sidebar nav {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: 1fr;
+  }
+
+  .command-layout > .docs-sidebar {
+    display: none;
+  }
+
+  /* Preserve readable columns and let the existing wrapper handle overflow. */
+  .table-wrap table {
+    min-width: 40rem;
   }
 
   .page-links {
