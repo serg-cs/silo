@@ -48,8 +48,31 @@ const MAX_RELAY_CONNECTIONS: usize = 64;
 /// Host forwarding state held for the full lifetime of one Silo session.
 pub(crate) struct Session {
     network: Option<ProjectNetwork>,
-    environment: Vec<(String, String)>,
+    built_in_environment: Vec<(String, String)>,
+    custom_environment: Vec<(String, String)>,
+    guest: Option<GuestForwarding>,
     lease: Option<UnixStream>,
+}
+
+/// Guest-side loopback listeners and their host-broker destinations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuestForwarding {
+    gateway: Ipv4Addr,
+    ports: BTreeMap<u16, u16>,
+}
+
+impl GuestForwarding {
+    pub(crate) fn new(gateway: Ipv4Addr, ports: BTreeMap<u16, u16>) -> Self {
+        Self { gateway, ports }
+    }
+
+    pub(crate) const fn gateway(&self) -> Ipv4Addr {
+        self.gateway
+    }
+
+    pub(crate) fn ports(&self) -> &BTreeMap<u16, u16> {
+        &self.ports
+    }
 }
 
 impl Session {
@@ -59,7 +82,9 @@ impl Session {
         if enabled.is_empty() {
             return Ok(Self {
                 network: None,
-                environment: Vec::new(),
+                built_in_environment: Vec::new(),
+                custom_environment: Vec::new(),
+                guest: None,
                 lease: None,
             });
         }
@@ -90,22 +115,12 @@ impl Session {
                 return Err(err);
             }
         };
-        let gateway = network.gateway.to_string();
-        let mut environment = Vec::with_capacity(enabled.len() * 2);
-        for (name, entry) in enabled {
-            let prefix = format!("SILO_{}", name.to_ascii_uppercase());
-            let exposed_port = lease.ports.get(&entry.port).ok_or_else(|| {
-                anyhow!(
-                    "host-forward relay omitted the listener for port {}",
-                    entry.port
-                )
-            })?;
-            environment.push((format!("{prefix}_HOST"), gateway.clone()));
-            environment.push((format!("{prefix}_PORT"), exposed_port.to_string()));
-        }
+        let details = forward_details(enabled, network.gateway, &lease.ports)?;
         Ok(Self {
             network: Some(network),
-            environment,
+            built_in_environment: details.built_in_environment,
+            custom_environment: details.custom_environment,
+            guest: Some(details.guest),
             lease: Some(lease.stream),
         })
     }
@@ -114,8 +129,16 @@ impl Session {
         self.network.as_ref().map(|network| network.name.as_str())
     }
 
-    pub(crate) fn environment(&self) -> &[(String, String)] {
-        &self.environment
+    pub(crate) fn environment(&self, custom_image: bool) -> &[(String, String)] {
+        if custom_image {
+            &self.custom_environment
+        } else {
+            &self.built_in_environment
+        }
+    }
+
+    pub(crate) fn guest(&self) -> Option<&GuestForwarding> {
+        self.guest.as_ref()
     }
 }
 
@@ -133,6 +156,43 @@ fn enabled_forwards(forwards: &BTreeMap<String, Forward>) -> BTreeMap<String, Fo
         .filter(|(_, entry)| entry.is_enabled())
         .map(|(name, entry)| (name.clone(), entry.clone()))
         .collect()
+}
+
+#[derive(Debug)]
+struct ForwardDetails {
+    built_in_environment: Vec<(String, String)>,
+    custom_environment: Vec<(String, String)>,
+    guest: GuestForwarding,
+}
+
+/// Resolves the public image contracts and the private guest listener map.
+fn forward_details(
+    enabled: BTreeMap<String, Forward>,
+    gateway: Ipv4Addr,
+    relay_ports: &BTreeMap<u16, u16>,
+) -> Result<ForwardDetails> {
+    let gateway_text = gateway.to_string();
+    let mut built_in_environment = Vec::with_capacity(enabled.len());
+    let mut custom_environment = Vec::with_capacity(enabled.len() * 2);
+    let mut guest_ports = BTreeMap::new();
+    for (name, entry) in enabled {
+        let prefix = format!("SILO_{}", name.to_ascii_uppercase());
+        let exposed_port = relay_ports.get(&entry.port).ok_or_else(|| {
+            anyhow!(
+                "host-forward relay omitted the listener for port {}",
+                entry.port
+            )
+        })?;
+        built_in_environment.push((format!("{prefix}_PORT"), entry.port.to_string()));
+        custom_environment.push((format!("{prefix}_HOST"), gateway_text.clone()));
+        custom_environment.push((format!("{prefix}_PORT"), exposed_port.to_string()));
+        guest_ports.insert(entry.port, *exposed_port);
+    }
+    Ok(ForwardDetails {
+        built_in_environment,
+        custom_environment,
+        guest: GuestForwarding::new(gateway, guest_ports),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

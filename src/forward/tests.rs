@@ -197,6 +197,68 @@ fn enabled_forward_selection_respects_default_true() {
 }
 
 #[test]
+fn forward_details_separate_builtin_and_custom_image_contracts() {
+    let enabled = BTreeMap::from([
+        (
+            "database".to_string(),
+            Forward {
+                port: 5432,
+                enabled: None,
+            },
+        ),
+        (
+            "postgres".to_string(),
+            Forward {
+                port: 5432,
+                enabled: None,
+            },
+        ),
+    ]);
+    let gateway = Ipv4Addr::new(192, 168, 64, 1);
+    let details = forward_details(enabled, gateway, &BTreeMap::from([(5432, 15432)]))
+        .expect("forward details resolve");
+
+    assert_eq!(
+        details.built_in_environment,
+        [
+            ("SILO_DATABASE_PORT".to_string(), "5432".to_string()),
+            ("SILO_POSTGRES_PORT".to_string(), "5432".to_string()),
+        ]
+    );
+    assert_eq!(
+        details.custom_environment,
+        [
+            ("SILO_DATABASE_HOST".to_string(), "192.168.64.1".to_string(),),
+            ("SILO_DATABASE_PORT".to_string(), "15432".to_string()),
+            ("SILO_POSTGRES_HOST".to_string(), "192.168.64.1".to_string(),),
+            ("SILO_POSTGRES_PORT".to_string(), "15432".to_string()),
+        ]
+    );
+    assert_eq!(details.guest.gateway(), gateway);
+    assert_eq!(details.guest.ports(), &BTreeMap::from([(5432, 15432)]));
+}
+
+#[test]
+fn forward_details_reject_a_missing_broker_listener() {
+    let enabled = BTreeMap::from([(
+        "postgres".to_string(),
+        Forward {
+            port: 5432,
+            enabled: None,
+        },
+    )]);
+
+    let error = forward_details(enabled, Ipv4Addr::LOCALHOST, &BTreeMap::new())
+        .expect_err("missing listener is rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("omitted the listener for port 5432")
+    );
+}
+
+#[test]
 fn duplicate_port_aliases_release_one_listener_reference() {
     let gateway = Ipv4Addr::new(192, 168, 64, 1);
     let subnet = subnet("192.168.64.0/24");

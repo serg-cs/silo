@@ -42,6 +42,9 @@ const STATUS_HELPER: &str = include_str!("silo-status.sh");
 /// Stop guard embedded alongside the built-in Dockerfile.
 const STOP_GUARD: &str = include_str!("silo-stop-guard.sh");
 
+/// Loopback forwarding wrapper embedded alongside the built-in Dockerfile.
+const FORWARD_WRAPPER: &str = include_str!("silo-forward.sh");
+
 const CONTAINER_BIN: &str = "container";
 
 /// Fixed parent for the per-user lock guarding Apple's user-global builder.
@@ -68,6 +71,9 @@ const DEFAULT_SHELL: Shell = Shell::Zsh;
 /// PID 1 for shared containers; it exits when the final guest-side session
 /// lease closes.
 const SHARED_INIT_COMMAND: &str = "/usr/local/bin/silo-supervisor";
+
+/// Guest wrapper that exposes configured host services on local loopback.
+const FORWARD_WRAPPER_COMMAND: &str = "/usr/local/bin/silo-forward";
 
 /// Guest wrapper that holds a shared lease for the command and all children.
 const SESSION_WRAPPER_COMMAND: &str = "/usr/local/bin/silo-session";
@@ -411,13 +417,13 @@ fn effective_mounts(mounts: &[ResolvedMount]) -> impl Iterator<Item = &ResolvedM
     })
 }
 
-/// Config-driven mounts applied on top of the shared project directory: the
-/// optional read-only `.git` and the configured shared mounts.
+/// Creation-time project setup shared by identity and command construction.
 #[derive(Default)]
 struct ConfigMounts {
     git: Option<PathBuf>,
     named: Vec<ResolvedMount>,
     network: Option<String>,
+    guest_forwarding: Option<forward::GuestForwarding>,
 }
 
 /// Stable identity and container path for the current project.
@@ -849,6 +855,10 @@ impl BuildDir {
     fn stop_guard(&self) -> PathBuf {
         self.0.join("silo-stop-guard.sh")
     }
+
+    fn forward_wrapper(&self) -> PathBuf {
+        self.0.join("silo-forward.sh")
+    }
 }
 
 impl Drop for BuildDir {
@@ -919,6 +929,8 @@ fn build_configured_image(config: &Config) -> Result<ExitCode> {
     fs::write(build_dir.status_helper(), STATUS_HELPER)
         .context("failed to write session status helper")?;
     fs::write(build_dir.stop_guard(), STOP_GUARD).context("failed to write stop guard")?;
+    fs::write(build_dir.forward_wrapper(), FORWARD_WRAPPER)
+        .context("failed to write forwarding wrapper")?;
     execute_build(&mut build_command(
         &build_dir.dockerfile(),
         build_dir.path(),
@@ -1170,6 +1182,11 @@ fn run_isolated(
         git: git_mount,
         named,
         network: forwarding.network_name().map(ToString::to_string),
+        guest_forwarding: if custom_image {
+            None
+        } else {
+            forwarding.guest().cloned()
+        },
     };
     for (scope, name) in skipped {
         eprintln!(
@@ -1189,7 +1206,7 @@ fn run_isolated(
         &id,
         command,
         shell,
-        forwarding.environment(),
+        forwarding.environment(custom_image),
     )?;
     // Warn about shared mounts whose intent a later mount defeats, e.g. a
     // read-write shared mount overlapping the read-only `.git`.
@@ -1315,7 +1332,7 @@ fn run_shared(
                 project.id
             ));
         }
-        ensure_shared_container(project, config, forwarding.network_name())?;
+        ensure_shared_container(project, config, forwarding)?;
         if !wait_for_guest_ready(project)? {
             continue;
         }
@@ -1332,7 +1349,7 @@ fn run_shared(
         &reservation,
         command,
         shell,
-        forwarding.environment(),
+        forwarding.environment(false),
     );
     install_signal_handlers()?;
     let terminal = SavedTerminal::capture();
@@ -1349,7 +1366,7 @@ fn run_shared(
 fn resolve_config_mounts(
     config: &Config,
     project_root: &Path,
-    network: Option<&str>,
+    forwarding: &forward::Session,
 ) -> Result<ConfigMounts> {
     Ok(ConfigMounts {
         git: git_mount_host(project_root, config.read_only_git),
@@ -1359,7 +1376,8 @@ fn resolve_config_mounts(
             std::env::var_os("HOME").as_deref().map(Path::new),
             std::env::var_os("XDG_STATE_HOME").as_deref().map(Path::new),
         )?,
-        network: network.map(ToString::to_string),
+        network: forwarding.network_name().map(ToString::to_string),
+        guest_forwarding: forwarding.guest().cloned(),
     })
 }
 
@@ -2637,6 +2655,21 @@ fn container_identity(
             .unwrap_or_default()
             .as_bytes(),
     );
+    if let Some(forwarding) = &config_mounts.guest_forwarding {
+        hash_spec_field(
+            &mut hasher,
+            b"forward-gateway",
+            forwarding.gateway().to_string().as_bytes(),
+        );
+        for (port, relay_port) in forwarding.ports() {
+            hash_spec_field(&mut hasher, b"forward-port", port.to_string().as_bytes());
+            hash_spec_field(
+                &mut hasher,
+                b"forward-relay-port",
+                relay_port.to_string().as_bytes(),
+            );
+        }
+    }
     for mount in effective_mounts(&config_mounts.named) {
         hash_spec_field(&mut hasher, b"mount-name", mount.name.as_bytes());
         match &mount.source {
@@ -2814,10 +2847,10 @@ fn session_reservation_token(project: &Project) -> String {
 fn ensure_shared_container(
     project: &Project,
     config: &Config,
-    network: Option<&str>,
+    forwarding: &forward::Session,
 ) -> Result<()> {
     let ids = host_ids()?;
-    let config_mounts = resolve_config_mounts(config, &project.root, network)?;
+    let config_mounts = resolve_config_mounts(config, &project.root, forwarding)?;
     warn_mount_conflicts(project, &config_mounts);
     let deadline = Instant::now() + CONFLICT_RETRY_TIMEOUT;
     let mut last_conflict = None;
@@ -2835,7 +2868,7 @@ fn ensure_shared_container(
         let inspection = inspect_container(&project.id)?;
         match inspection.state {
             ContainerState::Absent => {
-                if network.is_none() {
+                if forwarding.network_name().is_none() {
                     // A previous forwarding configuration may have left its
                     // now-unneeded project network behind after the container
                     // exited or was interrupted.
@@ -3848,6 +3881,7 @@ fn isolated_create_command_with_forward(
         run.arg("--env").arg(format!("SHELL={}", shell.path()));
     }
     run.arg(IMAGE_TAG);
+    append_forward_wrapper(&mut run, config_mounts.guest_forwarding.as_ref());
     if command.is_empty() {
         if let Some(shell) = shell {
             run.arg(shell.path());
@@ -3898,8 +3932,23 @@ fn create_command(
     append_host_ids(&mut run, host_ids);
     // Creation verifies the tag immediately before and the resolved digest
     // immediately after this command, closing concurrent retag races.
-    run.arg(IMAGE_TAG).arg(SHARED_INIT_COMMAND);
+    run.arg(IMAGE_TAG);
+    append_forward_wrapper(&mut run, config_mounts.guest_forwarding.as_ref());
+    run.arg(SHARED_INIT_COMMAND);
     Ok(run)
+}
+
+/// Wraps the image command with the private guest-side forwarding setup.
+fn append_forward_wrapper(run: &mut Command, forwarding: Option<&forward::GuestForwarding>) {
+    let Some(forwarding) = forwarding else {
+        return;
+    };
+    run.arg(FORWARD_WRAPPER_COMMAND)
+        .arg(forwarding.gateway().to_string());
+    for (port, relay_port) in forwarding.ports() {
+        run.arg(format!("{port}:{relay_port}"));
+    }
+    run.arg("--");
 }
 
 /// Adds only explicitly configured limits, preserving Apple container's

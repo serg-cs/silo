@@ -119,8 +119,8 @@ web_api = { port = 8080, enabled = true }</code></pre>
               <tr><td><code>enabled</code></td><td>Optional boolean; defaults to <code>true</code>.</td></tr>
             </tbody>
           </table></div>
-          <p>Inside the session, each enabled name becomes an uppercase environment prefix. The example supplies <code>SILO_POSTGRES_HOST</code>, <code>SILO_POSTGRES_PORT</code>, <code>SILO_WEB_API_HOST</code>, and <code>SILO_WEB_API_PORT</code>.</p>
-          <p>The configured port is where the service listens on the host, so PostgreSQL may stay on host <code>localhost:5432</code>. Inside the container, connect to <code>$SILO_POSTGRES_HOST:$SILO_POSTGRES_PORT</code>; container-local <code>localhost</code> is not the host.</p>
+          <p>In the built-in image, the configured port is available on container loopback too. The example supplies <code>SILO_POSTGRES_PORT=5432</code> and <code>SILO_WEB_API_PORT=8080</code>, so programs may connect directly to <code>localhost:$SILO_POSTGRES_PORT</code>.</p>
+          <p>Custom images keep their own image contract and do not receive the guest loopback relay. Their sessions instead receive both <code>SILO_POSTGRES_HOST</code> and <code>SILO_POSTGRES_PORT</code> with the internal gateway and leased relay port.</p>
           <p>Silo forwards only the named host loopback ports. It creates a private project network and relays traffic through bounded listeners rather than exposing every host service.</p>
         </section>
 

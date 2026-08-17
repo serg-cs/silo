@@ -77,6 +77,7 @@ RUN brew install \
         rust \
         rust-analyzer \
         shellcheck \
+        socat \
         tmux \
         uv \
         vim \
@@ -112,12 +113,14 @@ COPY silo-session.sh /usr/local/bin/silo-session
 COPY silo-reserve.sh /usr/local/bin/silo-reserve
 COPY silo-status.sh /usr/local/bin/silo-status
 COPY silo-stop-guard.sh /usr/local/bin/silo-stop-guard
+COPY silo-forward.sh /usr/local/bin/silo-forward
 RUN chmod 0755 \
         /usr/local/bin/silo-supervisor \
         /usr/local/bin/silo-session \
         /usr/local/bin/silo-reserve \
         /usr/local/bin/silo-status \
-        /usr/local/bin/silo-stop-guard
+        /usr/local/bin/silo-stop-guard \
+        /usr/local/bin/silo-forward
 
 RUN cat > /usr/local/bin/silo-entrypoint <<'EOF'
 #!/bin/sh
@@ -141,9 +144,11 @@ if [ "$(stat -c %u /home/linuxbrew/.linuxbrew)" != "$(id -u silo)" ]; then
     chown -R silo:silo /home/linuxbrew
 fi
 
-# Published only after all entrypoint initialization is complete. The host
-# waits for this before attempting the session reservation handshake.
-touch /run/silo/ready
+# The forwarding wrapper publishes readiness after claiming every loopback
+# listener. Runs without forwarding are ready after entrypoint initialization.
+if [ "${1:-}" != /usr/local/bin/silo-forward ]; then
+    touch /run/silo/ready
+fi
 
 exec setpriv --reuid "$(id -u silo)" --regid "$(id -g silo)" --init-groups \
     env HOME=/home/silo "$@"

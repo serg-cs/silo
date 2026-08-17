@@ -80,10 +80,10 @@ logs = ["sh", "-lc", "just logs | tail -n 100"]</code></pre>
           <pre data-copy><code>[forward]
 postgres = { port = 5432 }
 api = { port = 8080 }</code></pre>
-          <p>Read the generated values inside the container:</p>
-          <pre data-copy><code>psql -h "$SILO_POSTGRES_HOST" -p "$SILO_POSTGRES_PORT"
-curl "http://$SILO_API_HOST:$SILO_API_PORT/health"</code></pre>
-          <p>Do not hard-code the relay port. Silo may lease a different listener while still forwarding to the configured destination on host loopback.</p>
+          <p>Use the same ports on <code>localhost</code> inside the built-in container:</p>
+          <pre data-copy><code>psql -h localhost -p "$SILO_POSTGRES_PORT"
+curl "http://localhost:$SILO_API_PORT/health"</code></pre>
+          <p>The named port variables are useful when a tool should follow configuration instead of hard-coding a service port. Custom images receive both host and port variables because their image-defined startup does not include Silo's loopback listener.</p>
         </section>
 
         <section id="resources">

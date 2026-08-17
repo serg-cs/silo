@@ -102,15 +102,16 @@
             <li>Creates or validates a labeled, project-specific IPv4 network.</li>
             <li>Acquires relay listeners from a per-user local broker.</li>
             <li>Limits accepted relay sources to leased project-network subnets.</li>
-            <li>Passes the network gateway and leased port into the session environment.</li>
+            <li>Starts built-in-image listeners on the configured IPv4 and IPv6 loopback ports before declaring the container ready.</li>
           </ol>
           <pre><code>[forward]
 postgres = { port = 5432 }
 
-# Available inside the container:
-SILO_POSTGRES_HOST=&lt;project-network-gateway&gt;
-SILO_POSTGRES_PORT=&lt;leased-relay-port&gt;</code></pre>
-          <p>The relay connects each accepted request to <code>127.0.0.1:5432</code> on the host. Listener ports are implementation details, so programs should always read both generated variables rather than assuming the configured destination port.</p>
+# Available in the built-in image:
+localhost:5432
+SILO_POSTGRES_PORT=5432</code></pre>
+          <p>The guest listener crosses the project network through a leased broker port, and the broker connects each accepted request to <code>127.0.0.1:5432</code> on the host. Those internal addresses remain implementation details.</p>
+          <p>Custom images do not use Silo's guest listener. They retain the gateway and leased port as <code>SILO_POSTGRES_HOST</code> and <code>SILO_POSTGRES_PORT</code>.</p>
           <p>The broker caps concurrent relay work, shares listeners safely across active sessions, and removes idle networks only after their leases close. Startup and cleanup are serialized per project to avoid deleting a network while another session is acquiring it.</p>
         </section>
 

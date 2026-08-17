@@ -1083,6 +1083,7 @@ fn run_command_mounts_git_read_only() {
             git: Some(PathBuf::from("/tmp/project/.git")),
             named: vec![],
             network: None,
+            guest_forwarding: None,
         },
         &Container::default(),
         "silo-123",
@@ -1147,6 +1148,7 @@ fn run_command_mounts_configured_named_mounts() {
             git: None,
             named,
             network: None,
+            guest_forwarding: None,
         },
         &Container::default(),
         "silo-123",
@@ -1184,6 +1186,7 @@ fn run_command_orders_git_then_named_mounts() {
             git: Some(PathBuf::from("/tmp/project/.git")),
             named,
             network: None,
+            guest_forwarding: None,
         },
         &Container::default(),
         "silo-123",
@@ -1230,6 +1233,7 @@ fn shared_create_bind_mounts_all_managed_storage() {
             },
         ],
         network: None,
+        guest_forwarding: None,
     };
     let command = create_command(
         &test_project("/tmp/project"),
@@ -1308,6 +1312,7 @@ fn built_in_isolated_mount_filter_keeps_all_managed_mounts() {
             git: None,
             named: mounts,
             network: None,
+            guest_forwarding: None,
         },
         &Container::default(),
         "silo-123",
@@ -2343,12 +2348,13 @@ fn forward_network_and_environment_reach_container_commands() {
     };
     let mounts = ConfigMounts {
         network: Some("silo-net-test".to_string()),
+        guest_forwarding: Some(forward::GuestForwarding::new(
+            "192.168.64.1".parse().expect("gateway parses"),
+            BTreeMap::from([(5432, 15432)]),
+        )),
         ..ConfigMounts::default()
     };
-    let environment = [
-        ("SILO_POSTGRES_HOST".to_string(), "192.168.64.1".to_string()),
-        ("SILO_POSTGRES_PORT".to_string(), "5432".to_string()),
-    ];
+    let environment = [("SILO_POSTGRES_PORT".to_string(), "5432".to_string())];
 
     let isolated = isolated_create_command_with_forward(
         false,
@@ -2368,8 +2374,20 @@ fn forward_network_and_environment_reach_container_commands() {
             .windows(2)
             .any(|pair| pair == ["--network", "silo-net-test"])
     );
-    assert!(isolated_args.contains(&"SILO_POSTGRES_HOST=192.168.64.1"));
     assert!(isolated_args.contains(&"SILO_POSTGRES_PORT=5432"));
+    assert!(
+        !isolated_args
+            .iter()
+            .any(|arg| arg.starts_with("SILO_POSTGRES_HOST="))
+    );
+    assert!(isolated_args.ends_with(&[
+        IMAGE_TAG,
+        FORWARD_WRAPPER_COMMAND,
+        "192.168.64.1",
+        "5432:15432",
+        "--",
+        ZSH_PATH,
+    ]));
 
     let shared = create_command(
         &project,
@@ -2380,19 +2398,64 @@ fn forward_network_and_environment_reach_container_commands() {
         Path::new("/tmp/project.cid"),
     )
     .expect("shared command builds");
+    let shared_args = args_without_labels(&shared);
     assert!(
-        args_without_labels(&shared)
+        shared_args
             .windows(2)
             .any(|pair| pair == ["--network", "silo-net-test"])
     );
+    assert!(shared_args.ends_with(&[
+        IMAGE_TAG,
+        FORWARD_WRAPPER_COMMAND,
+        "192.168.64.1",
+        "5432:15432",
+        "--",
+        SHARED_INIT_COMMAND,
+    ]));
 
     let exec = exec_command_with_forward(false, &project, "abc123", &[], Shell::Zsh, &environment);
     let exec_args: Vec<_> = exec
         .get_args()
         .map(|arg| arg.to_str().expect("argument is UTF-8"))
         .collect();
-    assert!(exec_args.contains(&"SILO_POSTGRES_HOST=192.168.64.1"));
     assert!(exec_args.contains(&"SILO_POSTGRES_PORT=5432"));
+    assert!(
+        !exec_args
+            .iter()
+            .any(|arg| arg.starts_with("SILO_POSTGRES_HOST="))
+    );
+}
+
+#[test]
+fn custom_image_forwarding_keeps_gateway_environment_without_guest_wrapper() {
+    let project = test_project("/tmp/project");
+    let environment = [
+        ("SILO_POSTGRES_HOST".to_string(), "192.168.64.1".to_string()),
+        ("SILO_POSTGRES_PORT".to_string(), "15432".to_string()),
+    ];
+    let command = isolated_create_command_with_forward(
+        false,
+        &project.root,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts {
+            network: Some("silo-net-test".to_string()),
+            ..ConfigMounts::default()
+        },
+        &Container::default(),
+        "silo-isolated",
+        &[],
+        None,
+        &environment,
+    )
+    .expect("custom image command builds");
+    let args = args_without_labels(&command);
+
+    assert!(args.contains(&"SILO_POSTGRES_HOST=192.168.64.1"));
+    assert!(args.contains(&"SILO_POSTGRES_PORT=15432"));
+    assert!(!args.contains(&FORWARD_WRAPPER_COMMAND));
 }
 
 #[test]
@@ -2939,7 +3002,7 @@ fn inspect_identity_distinguishes_owned_spec_drift() {
 }
 
 #[test]
-fn forward_network_changes_the_container_specification() {
+fn forward_network_and_guest_mapping_change_the_container_specification() {
     let project = test_project("/tmp/project");
     let without_network = shared_identity(&project);
     let with_network = container_identity(
@@ -2957,8 +3020,28 @@ fn forward_network_changes_the_container_specification() {
         LABEL_SHARED_VALUE,
         &[OsString::from(SHARED_INIT_COMMAND)],
     );
+    let with_guest_mapping = container_identity(
+        &project,
+        TEST_IMAGE_DIGEST,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts {
+            network: Some("silo-net-test".to_string()),
+            guest_forwarding: Some(forward::GuestForwarding::new(
+                "192.168.64.1".parse().expect("gateway parses"),
+                BTreeMap::from([(5432, 15432)]),
+            )),
+            ..ConfigMounts::default()
+        },
+        &Container::default(),
+        LABEL_SHARED_VALUE,
+        &[OsString::from(SHARED_INIT_COMMAND)],
+    );
 
     assert_ne!(without_network.spec, with_network.spec);
+    assert_ne!(with_network.spec, with_guest_mapping.spec);
 }
 
 #[test]
@@ -3373,6 +3456,7 @@ fn embedded_image_contains_guest_lifecycle_programs() {
     assert!(DOCKERFILE.contains("COPY silo-reserve.sh"));
     assert!(DOCKERFILE.contains("COPY silo-status.sh"));
     assert!(DOCKERFILE.contains("COPY silo-stop-guard.sh"));
+    assert!(DOCKERFILE.contains("COPY silo-forward.sh"));
     assert!(DOCKERFILE.contains("util-linux"));
     assert!(SUPERVISOR.contains("flock --exclusive --nonblock"));
     assert!(SUPERVISOR.contains("-ge 100"));
@@ -3381,10 +3465,28 @@ fn embedded_image_contains_guest_lifecycle_programs() {
     assert!(SESSION_RESERVER.contains("flock --shared"));
     assert!(STATUS_HELPER.contains("count=$((count + 1))"));
     assert!(STOP_GUARD.contains("flock --exclusive --nonblock"));
+    assert!(FORWARD_WRAPPER.contains("TCP4-LISTEN"));
+    assert!(FORWARD_WRAPPER.contains("TCP6-LISTEN"));
+    assert!(FORWARD_WRAPPER.contains("touch \"$runtime/ready\""));
     assert!(SESSION_WRAPPER.contains("exec \"$@\""));
     assert!(!DOCKERFILE.contains("SILO_STATE_TARGETS"));
     assert!(!DOCKERFILE.contains("silo-init-state"));
     assert!(!DOCKERFILE.contains("os.lchown"));
+}
+
+#[test]
+fn forwarding_wrapper_has_valid_posix_shell_syntax() {
+    let dir = TestDir::new("forward-wrapper-syntax");
+    let path = dir.path().join("silo-forward");
+    fs::write(&path, FORWARD_WRAPPER).expect("forwarding wrapper is written");
+
+    let status = Command::new("sh")
+        .arg("-n")
+        .arg(path)
+        .status()
+        .expect("POSIX shell starts");
+
+    assert!(status.success());
 }
 
 #[test]
@@ -3428,6 +3530,7 @@ fn embedded_image_installs_developer_tooling_and_yazi_dependencies() {
         "qwen-code",
         "ruff",
         "shellcheck",
+        "socat",
         "tmux",
         "uv",
         "vim",
