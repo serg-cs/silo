@@ -1202,6 +1202,7 @@ fn run_isolated(
 ) -> Result<ExitCode> {
     let ids = host_ids()?;
     let custom_image = config.image.dockerfile.is_some();
+    let container = effective_container_settings(&config.container, custom_image);
     let ResolvedIsolatedMounts { named, skipped } = resolve_isolated_named_mounts(
         &config.mounts,
         &project.root,
@@ -1236,7 +1237,7 @@ fn run_isolated(
         &project.root,
         &ids,
         &config_mounts,
-        &config.container,
+        &container,
         &id,
         command,
         shell,
@@ -1280,6 +1281,13 @@ fn run_isolated(
     }
     cleanup_isolated_container(&id, &project.root);
     status.map(exit_code)
+}
+
+/// Leaves custom images in full control of their own privilege policy.
+fn effective_container_settings(container: &Container, custom_image: bool) -> Container {
+    let mut effective = container.clone();
+    effective.sudo &= !custom_image;
+    effective
 }
 
 /// Applies the image compatibility policy before resolving mount sources, so
@@ -2747,6 +2755,15 @@ fn container_identity(
     if let Some(memory) = &resources.memory {
         hash_spec_field(&mut hasher, b"memory", memory.as_bytes());
     }
+    hash_spec_field(
+        &mut hasher,
+        b"sudo",
+        if resources.sudo {
+            b"enabled"
+        } else {
+            b"disabled"
+        },
+    );
     for argument in command {
         hash_spec_field(&mut hasher, b"command", argument.as_os_str().as_bytes());
     }
@@ -3917,6 +3934,7 @@ fn isolated_create_command_with_forward(
     append_identity_labels(&mut run, &identity, LABEL_ISOLATED_VALUE);
     append_creation_mounts(&mut run, project_root, &shared_dir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
+    append_sudo_access(&mut run, resources.sudo);
     append_environment(&mut run, forward_environment);
     if let Some(shell) = shell {
         run.arg("--env").arg(format!("SHELL={}", shell.path()));
@@ -3971,6 +3989,7 @@ fn create_command(
     append_identity_labels(&mut run, &identity, LABEL_SHARED_VALUE);
     append_creation_mounts(&mut run, &project.root, &project.workdir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
+    append_sudo_access(&mut run, resources.sudo);
     // Creation verifies the tag immediately before and the resolved digest
     // immediately after this command, closing concurrent retag races.
     run.arg(IMAGE_TAG);
@@ -4059,6 +4078,13 @@ fn append_host_ids(run: &mut Command, host_ids: &HostIds) {
         .arg(format!("SILO_UID={}", host_ids.uid))
         .arg("--env")
         .arg(format!("SILO_GID={}", host_ids.gid));
+}
+
+/// Grants the built-in user elevation only for containers that request it.
+fn append_sudo_access(run: &mut Command, enabled: bool) {
+    if enabled {
+        run.arg("--env").arg("SILO_SUDO=1");
+    }
 }
 
 /// Builds one session attachment command for the running shared container.

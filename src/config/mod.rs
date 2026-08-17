@@ -31,8 +31,7 @@ const DEFAULT_CONFIG: &str = include_str!("default.toml");
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub image: Image,
-    /// Resource limits for containers created by Silo. Omitted limits are
-    /// left to Apple container's configured defaults.
+    /// Creation settings for containers managed by Silo.
     pub container: Container,
     /// Named host loopback ports exposed to this project's container.
     /// Project config may add entries or overlay global entries by name and
@@ -141,13 +140,14 @@ struct ProjectImage {
     dockerfile: Option<PathBuf>,
 }
 
-/// Container resource overrides supplied by a project. Each omitted limit
-/// inherits the corresponding global setting.
+/// Container overrides supplied by a project. Each omitted value inherits
+/// the corresponding global setting.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ProjectContainer {
     cpus: Option<usize>,
     memory: Option<String>,
+    sudo: Option<bool>,
 }
 
 /// Partial forward supplied by a project configuration.
@@ -159,14 +159,22 @@ struct ProjectForward {
 }
 
 impl Config {
-    /// Applies invocation-specific resource limits after global and project
-    /// configuration have been merged.
-    pub fn apply_container_overrides(&mut self, cpus: Option<usize>, memory: Option<String>) {
+    /// Applies invocation-specific container settings after global and
+    /// project configuration have been merged.
+    pub fn apply_container_overrides(
+        &mut self,
+        cpus: Option<usize>,
+        memory: Option<String>,
+        sudo: bool,
+    ) {
         if let Some(cpus) = cpus {
             self.container.cpus = Some(cpus);
         }
         if let Some(memory) = memory {
             self.container.memory = Some(memory);
+        }
+        if sudo {
+            self.container.sudo = true;
         }
     }
 
@@ -190,6 +198,9 @@ impl Config {
         }
         if let Some(memory) = &self.container.memory {
             append_toml_value(&mut output, "container.memory", memory)?;
+        }
+        if self.container.sudo {
+            append_toml_value(&mut output, "container.sudo", &true)?;
         }
         if let Some(shell) = self.shell {
             append_toml_value(&mut output, "shell", &shell)?;
@@ -294,7 +305,7 @@ pub struct Image {
     pub dockerfile: Option<PathBuf>,
 }
 
-/// Resource limits passed to Apple container when creating a container.
+/// Settings applied when creating a container.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct Container {
@@ -304,6 +315,8 @@ pub struct Container {
     /// Memory allocated to the container, using Apple container's accepted
     /// syntax (for example `4G`). `None` uses its configured default.
     pub memory: Option<String>,
+    /// Grants the built-in image's `silo` user passwordless sudo access.
+    pub sudo: bool,
 }
 
 /// Settings for the project workspace mounted into the container.
@@ -660,6 +673,9 @@ impl Config {
         }
         if let Some(memory) = project.container.memory {
             self.container.memory = Some(memory);
+        }
+        if let Some(sudo) = project.container.sudo {
+            self.container.sudo = sudo;
         }
         if let Some(forwards) = project.forward {
             for (name, overlay) in forwards {

@@ -372,6 +372,7 @@ fn run_command_applies_configured_resources() {
     let resources = Container {
         cpus: Some(8),
         memory: Some("32G".to_string()),
+        sudo: false,
     };
     let command = isolated_create_command(
         false,
@@ -387,6 +388,53 @@ fn run_command_applies_configured_resources() {
     let args = args_without_labels(&command);
 
     assert_eq!(&args[5..9], ["--cpus", "8", "--memory", "32G"],);
+}
+
+#[test]
+fn run_command_grants_only_configured_sudo_access() {
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let enabled = isolated_create_command(
+        false,
+        Path::new("/tmp/project"),
+        &ids,
+        &ConfigMounts::default(),
+        &Container {
+            sudo: true,
+            ..Container::default()
+        },
+        "silo-123",
+        &[],
+        Some(Shell::Zsh),
+    )
+    .expect("sudo command builds");
+    let disabled = isolated_create_command(
+        false,
+        Path::new("/tmp/project"),
+        &ids,
+        &ConfigMounts::default(),
+        &Container::default(),
+        "silo-123",
+        &[],
+        Some(Shell::Zsh),
+    )
+    .expect("default command builds");
+
+    assert!(args_without_labels(&enabled).contains(&"SILO_SUDO=1"));
+    assert!(!args_without_labels(&disabled).contains(&"SILO_SUDO=1"));
+}
+
+#[test]
+fn custom_images_ignore_configured_sudo_access() {
+    let configured = Container {
+        sudo: true,
+        ..Container::default()
+    };
+
+    assert!(effective_container_settings(&configured, false).sudo);
+    assert!(!effective_container_settings(&configured, true).sudo);
 }
 
 #[test]
@@ -2447,6 +2495,7 @@ fn shared_create_command_applies_configured_resources() {
     let resources = Container {
         cpus: Some(6),
         memory: Some("12G".to_string()),
+        sudo: false,
     };
     let command = create_command(
         &project,
@@ -2460,6 +2509,30 @@ fn shared_create_command_applies_configured_resources() {
     let args = args_without_labels(&command);
 
     assert_eq!(&args[7..11], ["--cpus", "6", "--memory", "12G"],);
+}
+
+#[test]
+fn shared_create_command_applies_configured_sudo_access() {
+    let project = test_project("/tmp/project");
+    let ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let resources = Container {
+        sudo: true,
+        ..Container::default()
+    };
+    let command = create_command(
+        &project,
+        TEST_IMAGE_DIGEST,
+        &ids,
+        &ConfigMounts::default(),
+        &resources,
+        Path::new("/tmp/project.cid"),
+    )
+    .expect("command builds");
+
+    assert!(args_without_labels(&command).contains(&"SILO_SUDO=1"));
 }
 
 #[test]
@@ -3556,7 +3629,7 @@ fn specification_digest_tracks_the_built_image() {
 }
 
 #[test]
-fn specification_digest_tracks_resource_limits() {
+fn specification_digest_tracks_container_settings() {
     let project = test_project("/tmp/project");
     let ids = HostIds {
         uid: "501".into(),
@@ -3581,6 +3654,7 @@ fn specification_digest_tracks_resource_limits() {
         &Container {
             cpus: Some(8),
             memory: None,
+            sudo: false,
         },
         LABEL_SHARED_VALUE,
         &command,
@@ -3593,6 +3667,19 @@ fn specification_digest_tracks_resource_limits() {
         &Container {
             cpus: None,
             memory: Some("8G".to_string()),
+            sudo: false,
+        },
+        LABEL_SHARED_VALUE,
+        &command,
+    );
+    let with_sudo = container_identity(
+        &project,
+        TEST_IMAGE_DIGEST,
+        &ids,
+        &mounts,
+        &Container {
+            sudo: true,
+            ..Container::default()
         },
         LABEL_SHARED_VALUE,
         &command,
@@ -3600,6 +3687,7 @@ fn specification_digest_tracks_resource_limits() {
 
     assert_ne!(defaults.spec, with_cpus.spec);
     assert_ne!(defaults.spec, with_memory.spec);
+    assert_ne!(defaults.spec, with_sudo.spec);
     assert_ne!(with_cpus.spec, with_memory.spec);
 }
 
@@ -3612,6 +3700,9 @@ fn embedded_image_contains_guest_lifecycle_programs() {
     assert!(DOCKERFILE.contains("COPY silo-stop-guard.sh"));
     assert!(DOCKERFILE.contains("COPY silo-forward.sh"));
     assert!(DOCKERFILE.contains("util-linux"));
+    assert!(DOCKERFILE.contains("sudo"));
+    assert!(DOCKERFILE.contains("${SILO_SUDO:-0}"));
+    assert!(DOCKERFILE.contains("rm -f /etc/sudoers.d/silo"));
     assert!(SUPERVISOR.contains("flock --exclusive --nonblock"));
     assert!(SUPERVISOR.contains("-ge 100"));
     assert!(SESSION_WRAPPER.contains("flock --shared"));
@@ -3709,6 +3800,7 @@ fn embedded_image_installs_developer_tooling_and_yazi_dependencies() {
 fn embedded_image_installs_playwright_cli_with_chromium() {
     assert!(DOCKERFILE.contains("PLAYWRIGHT_BROWSERS_PATH=/home/silo/.cache/ms-playwright"));
     assert!(DOCKERFILE.contains("playwright-cli install-browser --with-deps"));
+    assert!(DOCKERFILE.contains("sudo rm -f /etc/sudoers.d/silo"));
     assert!(!DOCKERFILE.contains("npm install --global @playwright/test"));
 }
 

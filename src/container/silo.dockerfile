@@ -35,10 +35,11 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # ---- User --------------------------------------------------------------------
-# Single user with passwordless sudo.
+# Temporary build-time sudo lets Playwright install system dependencies. The
+# grant is removed before the image is finalized and restored only on request.
 RUN useradd --create-home --shell /bin/bash silo \
     && printf '%s\n' 'silo ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/silo \
-    && chmod 440 /etc/sudoers.d/silo
+    && chmod 0440 /etc/sudoers.d/silo
 
 USER silo
 
@@ -93,7 +94,8 @@ RUN brew install \
 # screenshots, and interactive agent sessions without a first-run download.
 RUN playwright-cli install-browser --with-deps \
     && sudo apt-get clean \
-    && sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+    && sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
+    && sudo rm -f /etc/sudoers.d/silo
 
 # ---- Entrypoint / shell ------------------------------------------------------
 # Starts as root only to remap silo; drops to silo and execs the command
@@ -132,6 +134,13 @@ if [ -n "${SILO_UID:-}" ]; then
 fi
 if [ -n "${SILO_GID:-}" ]; then
     groupmod -o -g "$SILO_GID" silo
+fi
+
+# Sudo is installed for opt-in sessions but grants no access by default.
+rm -f /etc/sudoers.d/silo
+if [ "${SILO_SUDO:-0}" = 1 ]; then
+    printf '%s\n' 'silo ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/silo
+    chmod 0440 /etc/sudoers.d/silo
 fi
 
 # Runtime-only coordination belongs to the container, not the host config.

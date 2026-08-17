@@ -36,7 +36,7 @@
           <ol>
             <li><strong>Discover.</strong> Canonicalize the current directory and select a <code>.silo.toml</code> marker, the nearest Git or Jujutsu root, or the current directory itself.</li>
             <li><strong>Configure.</strong> Load built-in defaults, global TOML, and the project TOML; warn about unknown or unreachable entries; then apply invocation resource flags.</li>
-            <li><strong>Validate.</strong> Resolve the lifecycle, image contract, binds, managed state, configured read-only workspace paths, resource limits, and enabled forwards.</li>
+            <li><strong>Validate.</strong> Resolve the lifecycle, image contract, binds, managed state, configured read-only workspace paths, container settings, and enabled forwards.</li>
             <li><strong>Prepare.</strong> Confirm the image/runtime state and establish managed storage or a forwarding lease where needed.</li>
             <li><strong>Run.</strong> Reuse or create the shared project container, or create a one-shot isolated container, then attach the requested shell or command.</li>
             <li><strong>Clean up.</strong> Restore the terminal, release session and forwarding leases, and remove isolated runtime resources.</li>

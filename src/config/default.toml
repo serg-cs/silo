@@ -4,6 +4,7 @@
 # image.dockerfile = "/absolute/path/to/Dockerfile"
 # container.cpus = 4
 # container.memory = "6G"
+# container.sudo = true
 # shell = "zsh"
 workspace.read_only = [".git"]
 

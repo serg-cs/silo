@@ -38,6 +38,9 @@ pub(crate) enum Command {
         /// Override the memory allocated to the container (for example `4G`).
         #[arg(long, value_parser = parse_memory)]
         memory: Option<String>,
+        /// Grant passwordless sudo access in the built-in container.
+        #[arg(long)]
+        sudo: bool,
         /// Command to run inside the container; empty runs the default shell.
         #[arg(value_name = "COMMAND", last = true)]
         command: Vec<OsString>,

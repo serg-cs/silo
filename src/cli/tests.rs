@@ -75,6 +75,7 @@ fn run_accepts_resource_overrides() {
         isolated: false,
         cpus: Some(cpus),
         memory: Some(memory),
+        sudo: false,
         command,
     } = parse(&[
         "silo", "run", "--cpus", "4", "--memory", "8G", "--", "codex",
@@ -116,6 +117,20 @@ fn run_accepts_independent_resource_overrides_without_a_command() {
 }
 
 #[test]
+fn run_accepts_sudo_override() {
+    let Command::Run {
+        sudo: true,
+        command,
+        ..
+    } = parse(&["silo", "run", "--sudo", "--", "id"])
+    else {
+        panic!("expected sudo override");
+    };
+
+    assert_eq!(command, [OsString::from("id")]);
+}
+
+#[test]
 fn run_rejects_invalid_resource_overrides() {
     for arguments in [
         &["silo", "run", "--cpus", "0"][..],
@@ -129,13 +144,15 @@ fn run_rejects_invalid_resource_overrides() {
 }
 
 #[test]
-fn resource_flags_after_double_dash_are_command_arguments() {
+fn run_flags_after_double_dash_are_command_arguments() {
     let Command::Run {
         cpus: None,
         memory: None,
         command,
         ..
-    } = parse(&["silo", "run", "--", "tool", "--cpus", "3", "--memory", "6G"])
+    } = parse(&[
+        "silo", "run", "--", "tool", "--cpus", "3", "--memory", "6G", "--sudo",
+    ])
     else {
         panic!("expected run command");
     };
@@ -148,6 +165,7 @@ fn resource_flags_after_double_dash_are_command_arguments() {
             OsString::from("3"),
             OsString::from("--memory"),
             OsString::from("6G"),
+            OsString::from("--sudo"),
         ]
     );
 }

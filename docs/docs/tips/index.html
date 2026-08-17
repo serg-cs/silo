@@ -95,6 +95,13 @@ container.memory = "6G"</code></pre>
           <p>Resource settings apply when a container is created. Because they are part of its specification, changing them can replace the shared project container on the next session. Binds and managed state remain, but container-local state does not.</p>
         </section>
 
+        <section id="sudo">
+          <h2><a href="#sudo">Enable elevation deliberately</a></h2>
+          <p>The built-in image keeps sudo access disabled by default. Enable it persistently for a project with <code>container.sudo = true</code>, or opt in for one invocation:</p>
+          <pre data-copy><code>silo run --sudo -- apt-get update</code></pre>
+          <p>Sudo is a container creation setting. In shared mode, concurrent sessions use the same <code>silo</code> user and therefore share the enabled access until a later run reconciles the container back to its configured setting. Use <code>--isolated --sudo</code> when elevation must be confined to a one-shot container. Custom images retain their own user and privilege policy.</p>
+        </section>
+
         <section id="project-writes">
           <h2><a href="#project-writes">Choose protected paths for the workflow</a></h2>
           <p>Silo leaves the working tree writable while protecting existing Git metadata by default. If agents or other tools should modify Git metadata, disable the project overlays in the project file:</p>

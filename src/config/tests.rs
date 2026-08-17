@@ -34,19 +34,21 @@ fn empty_config_uses_builtin_image() {
 }
 
 #[test]
-fn container_resources_default_to_apple_container_settings() {
+fn container_settings_default_to_safe_runtime_values() {
     let config = Config::parse("").expect("empty config parses");
     assert_eq!(config.container, Container::default());
     assert_eq!(config.container.cpus, None);
     assert_eq!(config.container.memory, None);
+    assert!(!config.container.sudo);
 }
 
 #[test]
-fn container_resources_are_configurable() {
-    let config = Config::parse("[container]\ncpus = 8\nmemory = \"32G\"\n")
+fn container_settings_are_configurable() {
+    let config = Config::parse("[container]\ncpus = 8\nmemory = \"32G\"\nsudo = true\n")
         .expect("container resources parse");
     assert_eq!(config.container.cpus, Some(8));
     assert_eq!(config.container.memory.as_deref(), Some("32G"));
+    assert!(config.container.sudo);
 }
 
 #[test]
@@ -63,17 +65,18 @@ fn container_resources_reject_impossible_values() {
 }
 
 #[test]
-fn container_resource_overrides_replace_only_supplied_values() {
+fn container_overrides_replace_only_supplied_values() {
     let mut config = Config::parse("[container]\ncpus = 8\nmemory = \"32G\"\n")
         .expect("container resources parse");
 
-    config.apply_container_overrides(Some(4), None);
+    config.apply_container_overrides(Some(4), None, false);
     assert_eq!(config.container.cpus, Some(4));
     assert_eq!(config.container.memory.as_deref(), Some("32G"));
 
-    config.apply_container_overrides(None, Some("16G".to_string()));
+    config.apply_container_overrides(None, Some("16G".to_string()), true);
     assert_eq!(config.container.cpus, Some(4));
     assert_eq!(config.container.memory.as_deref(), Some("16G"));
+    assert!(config.container.sudo);
 }
 
 #[test]
@@ -272,6 +275,7 @@ fn effective_toml_matches_starter_style_and_round_trips() {
         "image.dockerfile = \"/tmp/Dockerfile\"\n\
          container.cpus = 4\n\
          container.memory = \"4G\"\n\
+         container.sudo = true\n\
          shell = \"fish\"\n\
          workspace.read_only = [\"policy\"]\n\
          [binds.docs]\n\
@@ -295,6 +299,7 @@ fn effective_toml_matches_starter_style_and_round_trips() {
         "image.dockerfile = \"/tmp/Dockerfile\"\n\
          container.cpus = 4\n\
          container.memory = \"4G\"\n\
+         container.sudo = true\n\
          shell = \"fish\"\n\
          workspace.read_only = [\"policy\"]\n\
          \n\
@@ -319,6 +324,7 @@ fn effective_toml_matches_starter_style_and_round_trips() {
     );
     assert_eq!(reparsed.container.cpus, Some(4));
     assert_eq!(reparsed.container.memory.as_deref(), Some("4G"));
+    assert!(reparsed.container.sudo);
     assert_eq!(reparsed.shell, Some(Shell::Fish));
     assert_eq!(reparsed.mounts.len(), 3);
     assert_eq!(reparsed.mounts["docs"].kind(), Some(MountKind::Host));
@@ -884,20 +890,36 @@ fn omitted_project_shell_inherits_global_shell() {
 }
 
 #[test]
-fn project_container_resources_override_independently() {
+fn project_container_settings_override_independently() {
     let dir = TestDir::new("project-container-resources");
     fs::write(
         dir.path().join(".silo.toml"),
-        "[container]\nmemory = \"16G\"\n",
+        "[container]\nmemory = \"16G\"\nsudo = false\n",
     )
     .expect("project config writes");
-    let global =
-        Config::parse("[container]\ncpus = 6\nmemory = \"8G\"\n").expect("global config parses");
+    let global = Config::parse("[container]\ncpus = 6\nmemory = \"8G\"\nsudo = true\n")
+        .expect("global config parses");
 
     let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
 
     assert_eq!(merged.container.cpus, Some(6));
     assert_eq!(merged.container.memory.as_deref(), Some("16G"));
+    assert!(!merged.container.sudo);
+}
+
+#[test]
+fn omitted_project_sudo_inherits_global_setting() {
+    let dir = TestDir::new("project-inherits-sudo");
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "[container]\nmemory = \"16G\"\n",
+    )
+    .expect("project config writes");
+    let global = Config::parse("container.sudo = true\n").expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+
+    assert!(merged.container.sudo);
 }
 
 #[test]

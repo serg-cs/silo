@@ -59,9 +59,10 @@ fn main() -> ExitCode {
             isolated,
             cpus,
             memory,
+            sudo,
             command,
         } => {
-            config.apply_container_overrides(cpus.map(std::num::NonZeroUsize::get), memory);
+            config.apply_container_overrides(cpus.map(std::num::NonZeroUsize::get), memory, sudo);
             container::run_image(&config, &project, &command, isolated)
         }
         Command::Containers { .. } | Command::State { .. } => {
@@ -179,6 +180,7 @@ mod tests {
             isolated: false,
             cpus: None,
             memory: None,
+            sudo: false,
             command,
         } = parse(&["silo", "run", "--", "codex", "--model", "compact"])
         else {
@@ -219,6 +221,7 @@ mod tests {
             isolated: false,
             cpus: None,
             memory: None,
+            sudo: false,
             command,
         } = parse(&["silo", "run", "--", "-t", "--model", "compact"])
         else {
@@ -240,6 +243,7 @@ mod tests {
             isolated: false,
             cpus: None,
             memory: None,
+            sudo: false,
             command,
         } = parse(&["silo", "run"])
         else {
@@ -254,6 +258,7 @@ mod tests {
             isolated: false,
             cpus: None,
             memory: None,
+            sudo: false,
             command,
         } = parse(&["silo", "run", "--"])
         else {
@@ -268,6 +273,7 @@ mod tests {
             isolated: false,
             cpus: None,
             memory: None,
+            sudo: false,
             command,
         } = parse(&["silo", "run", "--", "codex", "--", "--flag"])
         else {
@@ -441,6 +447,7 @@ mod tests {
             isolated: true,
             cpus: None,
             memory: None,
+            sudo: false,
             command,
         } = parse(&["silo", "run", "--isolated", "--", "nu", "-c", "version"])
         else {
