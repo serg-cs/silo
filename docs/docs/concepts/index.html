@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Understand Silo projects, images, sessions, containers, persistent mounts, and custom image boundaries.">
+    <meta name="description" content="Understand Silo projects, images, sessions, containers, persistent state, binds, and custom image boundaries.">
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/concepts/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
@@ -28,19 +28,19 @@
         <header class="doc-header">
           <p class="eyebrow">Concepts</p>
           <h1>The Silo mental model.</h1>
-          <p>A project selects a workspace. The image supplies the tools. Sessions decide how long a container lives, and mounts decide which state outlives it.</p>
+          <p>A project selects a workspace. The image supplies the tools. Sessions decide how long a container lives, while binds and managed state decide which data outlives it.</p>
         </header>
 
         <section id="projects">
           <h2><a href="#projects">Projects are the unit of identity</a></h2>
           <p>Every command that runs a container starts by resolving the current directory to a canonical path and discovering a project root:</p>
           <ol>
-            <li>The nearest ancestor containing a <code>.silo.toml</code> file wins. An explicit Silo marker takes precedence over every Git directory in the ancestor chain.</li>
-            <li>Without a Silo marker, the nearest ancestor containing a real <code>.git</code> directory becomes the root.</li>
+            <li>The nearest ancestor containing a <code>.silo.toml</code> file wins. An explicit Silo marker takes precedence over every VCS directory in the ancestor chain.</li>
+            <li>Without a Silo marker, the nearest ancestor containing a real <code>.git</code> or <code>.jj</code> directory becomes the root.</li>
             <li>Without either marker, the exact current directory is the project.</li>
           </ol>
           <p>The canonical root determines the mounted source tree, the container working directory, the shared container ID, project-scoped state, and ownership labels. Two directories with the same basename remain separate projects when their canonical paths differ.</p>
-          <div class="note"><p>Put an empty or partial <code>.silo.toml</code> at a monorepo boundary when you want Silo's project root to differ from Git's root.</p></div>
+          <div class="note"><p>Put an empty or partial <code>.silo.toml</code> at a monorepo boundary when you want Silo's project root to differ from the VCS root.</p></div>
         </section>
 
         <section id="image">
@@ -74,25 +74,28 @@
 
         <section id="state">
           <h2><a href="#state">State has an explicit lifetime</a></h2>
-          <p>The project root is always a host bind mount and therefore survives every container. Additional named mounts let you choose where other state lives:</p>
+          <p>The project root is always a host bind and therefore survives every container. Binds and managed state make the lifetime and ownership of other data explicit:</p>
           <div class="table-wrap"><table>
-            <thead><tr><th>Mount type</th><th>Source</th><th>Typical use</th></tr></thead>
+            <thead><tr><th>Configuration</th><th>Source</th><th>Typical use</th></tr></thead>
             <tbody>
-              <tr><td>Host</td><td>An existing host directory</td><td>Documents, local output, or data owned outside Silo</td></tr>
-              <tr><td>Project</td><td>Private Silo-managed host storage keyed by project and name</td><td>Build caches and dependencies that should not cross projects</td></tr>
-              <tr><td>Shared</td><td>Private Silo-managed host storage keyed only by name</td><td>Agent credentials or tool state intentionally reused by projects</td></tr>
+              <tr><td><code>binds</code></td><td>An existing host directory, with explicit access</td><td>Documents, local output, or data owned outside Silo</td></tr>
+              <tr><td><code>state.project</code></td><td>Private Silo-managed storage keyed by project and name</td><td>Build caches and dependencies that should not cross projects</td></tr>
+              <tr><td><code>state.user</code></td><td>Private Silo-managed storage keyed by name</td><td>Agent credentials or tool state intentionally reused across this user's projects</td></tr>
             </tbody>
           </table></div>
-          <p>Host mounts default to read-only and may opt into writes. Managed mounts are writable. Relative targets beginning with <code>./</code> anchor to the project directory; <code>~/</code> anchors to the built-in container home; absolute targets stay absolute.</p>
-          <p>Managed state lives below <code>$XDG_STATE_HOME/silo/mounts</code>, or <code>~/.local/state/silo/mounts</code> when <code>XDG_STATE_HOME</code> is unavailable. Use <code>silo mounts</code> to inspect it and <code>silo mounts delete</code> to remove an unused mount safely.</p>
+          <p>Every bind declares <code>access = "read-only"</code> or <code>access = "read-write"</code>. Managed state is always writable. Relative targets beginning with <code>./</code> anchor to the project directory; <code>~/</code> anchors to the built-in container home; absolute targets stay absolute.</p>
+          <p>Managed state lives below <code>$XDG_STATE_HOME/silo/state</code>, or <code>~/.local/state/silo/state</code> when <code>XDG_STATE_HOME</code> is unavailable. Use <code>silo state</code> to inspect it and <code>silo state delete</code> to remove an unused entry safely.</p>
         </section>
 
-        <section id="git-boundary">
-          <h2><a href="#git-boundary">Choose how tools access Git metadata</a></h2>
-          <p>The whole project tree is mounted read-write so editors, builds, formatters, and agents can change working files. By default, Silo overlays the project's real <code>.git</code> directory read-only; tools can still inspect the index, refs, history, and worktree status.</p>
-          <p>Projects that expect agents or other containerized tools to stage, commit, switch branches, or otherwise manage the repository can enable Git metadata writes:</p>
-          <pre data-copy><code>read_only_git = false</code></pre>
-          <p>This setting does not change source-file access. A writable named mount that overlaps <code>.git</code> can also make metadata writable, and Silo warns when it detects that overlap.</p>
+        <section id="read-only-boundary">
+          <h2><a href="#read-only-boundary">Choose which project paths tools may change</a></h2>
+          <p>The whole project tree is mounted read-write so editors, builds, formatters, and agents can change working files. By default, Silo overlays an existing <code>.git</code> directory read-only; tools can inspect Git repository state without changing its metadata.</p>
+          <p>Jujutsu metadata remains writable because even inspection commands acquire locks and may update <code>.jj</code>. Adding <code>.jj</code> to <code>workspace.read_only</code> prevents normal Jujutsu operation.</p>
+          <p>Projects that expect containerized tools to manage repository metadata can remove that path or disable the <code>workspace.read_only</code> overlays. Other project directories can be protected with the same literal, project-relative list:</p>
+          <pre data-copy><code>workspace.read_only = [".github"]</code></pre>
+          <p>Use <code>workspace.read_only = []</code> instead to disable every read-only project overlay. Separately configured binds retain their own access modes.</p>
+          <p>A read-write bind that overlaps a protected path can make it writable again, and Silo warns when it detects that overlap.</p>
+          <div class="warning"><p>Read-only overlays cannot target individual files because Apple container accepts only directories as bind-mount sources.</p></div>
         </section>
 
         <section id="custom-images">
@@ -100,9 +103,9 @@
           <p>Setting <code>image.dockerfile</code> changes more than the packages. Silo preserves the image's user, entrypoint, command, and filesystem expectations instead of injecting the built-in supervisor and <code>/home/silo</code> contract.</p>
           <ul>
             <li>Custom-image runs always use the isolated lifecycle.</li>
-            <li>Project and shared managed mounts are skipped because Silo cannot safely grant the image user access to private host-owned storage.</li>
-            <li>Enabled host mounts remain available, but their target must be project-relative or absolute; <code>~/</code> has no Silo-defined meaning for a custom image.</li>
-            <li>The project root and configured Git metadata overlay remain available.</li>
+            <li>Project and user state entries are skipped because Silo cannot safely grant the image user access to private host-owned storage.</li>
+            <li>Enabled binds remain available, but their target must be project-relative or absolute; <code>~/</code> has no Silo-defined meaning for a custom image.</li>
+            <li>The project root and configured read-only project overlays remain available.</li>
           </ul>
           <div class="warning"><p>A custom Dockerfile is therefore an environment escape hatch, not a drop-in extension of the built-in shared image.</p></div>
         </section>

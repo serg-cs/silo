@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Complete Silo TOML configuration reference, including precedence, mounts, forwards, quick commands, and custom images.">
+    <meta name="description" content="Complete Silo TOML configuration reference, including precedence, workspaces, binds, state, forwards, quick commands, and custom images.">
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/configuration/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
@@ -52,10 +52,11 @@ silo config check    # validate the merged result</code></pre>
 
         <section id="merging">
           <h2><a href="#merging">How layers merge</a></h2>
-          <p>Most project values replace the same global value only when present. Omitted values inherit. Three collections have explicit rules:</p>
+          <p>Most project values replace the same global value only when present. Omitted values inherit. Four collections have explicit rules:</p>
           <ul>
             <li><strong>Forwards merge by name and field.</strong> A project may change only <code>enabled</code> or <code>port</code> on an inherited forward. A new project forward must provide <code>port</code>.</li>
-            <li><strong>Mounts merge by name and field.</strong> A project may retarget or disable an inherited mount. Moving the same name to another category resets category-specific fields before applying the project entry.</li>
+            <li><strong>Binds and state merge by name and field.</strong> A project may retarget or disable an inherited entry. Moving the same name between <code>binds</code>, <code>state.project</code>, and <code>state.user</code> resets fields that do not apply to the new category.</li>
+            <li><strong>Read-only paths replace as a collection.</strong> A project <code>workspace.read_only</code> array replaces the global array; an empty array disables inherited read-only workspace overlays without changing bind permissions.</li>
             <li><strong>Quick commands replace as a collection.</strong> If the project contains a <code>[quick]</code> table, it replaces the global table. An empty project table clears all global quick commands.</li>
           </ul>
           <div class="note"><p>A project can inherit a global custom Dockerfile or replace it with another path, but there is no project-level sentinel that resets a global custom image back to the built-in image.</p></div>
@@ -68,21 +69,21 @@ silo config check    # validate the merged result</code></pre>
 container.cpus = 4
 container.memory = "6G"
 shell = "zsh"
-read_only_git = true
+workspace.read_only = [".git"]
 
 [forward]
 postgres = { port = 5432, enabled = true }
 redis = { port = 6379, enabled = false }
 
-[mounts.host]
-docs = { source = "~/Documents/docs", target = "~/docs" }
-output = { source = "./output", target = "./output", writable = true }
+[binds]
+docs = { source = "~/Documents/docs", target = "~/docs", access = "read-only" }
+output = { source = "./output", target = "./output", access = "read-write" }
 
-[mounts.project]
+[state.project]
 cargo = { target = "~/.cargo" }
 cargo-target = { target = "./target" }
 
-[mounts.shared]
+[state.user]
 codex = { target = "~/.codex" }
 
 [quick]
@@ -100,10 +101,12 @@ agent = ["codex"]</code></pre>
               <tr><td><code>container.cpus</code></td><td>Positive integer; runtime default</td><td>Passes the CPU limit to containers at creation time.</td></tr>
               <tr><td><code>container.memory</code></td><td>Non-empty string; runtime default</td><td>Passes Apple's accepted memory syntax, such as <code>4G</code>.</td></tr>
               <tr><td><code>shell</code></td><td><code>bash</code>, <code>zsh</code>, <code>fish</code>, or <code>nu</code>; automatic</td><td>Selects the interactive shell in the built-in image. Automatic mode mirrors a supported host <code>$SHELL</code> and otherwise uses Zsh.</td></tr>
-              <tr><td><code>read_only_git</code></td><td>Boolean; <code>true</code></td><td>Overlays the real project <code>.git</code> directory read-only when it resolves safely inside the project.</td></tr>
+              <tr><td><code>workspace.read_only</code></td><td>Relative directory array; <code>[".git"]</code></td><td>Overlays each existing workspace directory read-only. Paths are literal, may be nested, and must remain inside the project root; use <code>[]</code> to disable these overlays.</td></tr>
             </tbody>
           </table></div>
-          <p>CPU and memory values participate in shared-container identity. A changed limit causes the next run to replace a mismatched stopped workspace or coordinate safe replacement when possible.</p>
+          <p>CPU, memory, and resolved read-only paths participate in shared-container identity. A changed value causes the next run to replace a mismatched stopped workspace or coordinate safe replacement when possible. Missing read-only paths are ignored; <code>workspace.read_only = [".git", ".github"]</code> additionally protects a project directory, while <code>workspace.read_only = ["."]</code> protects the entire project.</p>
+          <div class="warning"><p>Do not add <code>.jj</code> when Jujutsu commands need to run in the container. Even inspection commands such as <code>jj status</code> acquire locks and may update Jujutsu metadata, so a read-only <code>.jj</code> overlay prevents normal operation.</p></div>
+          <div class="warning"><p>Apple container supports only directories as bind-mount sources. An existing <code>workspace.read_only</code> entry that resolves to a regular file, such as <code>AGENTS.md</code>, prevents container creation with a clear error. Protect its containing directory or use a different enforcement mechanism for individual files.</p></div>
         </section>
 
         <section id="forwards">
@@ -124,11 +127,11 @@ web_api = { port = 8080, enabled = true }</code></pre>
           <p>Silo forwards only the named host loopback ports. It creates a private project network and relays traffic through bounded listeners rather than exposing every host service.</p>
         </section>
 
-        <section id="host-mounts">
-          <h2><a href="#host-mounts">Host mounts</a></h2>
-          <pre data-copy><code>[mounts.host]
-reference = { source = "~/Documents/reference", target = "~/reference" }
-artifacts = { source = "./artifacts", target = "./artifacts", writable = true }
+        <section id="binds">
+          <h2><a href="#binds">Host binds</a></h2>
+          <pre data-copy><code>[binds]
+reference = { source = "~/Documents/reference", target = "~/reference", access = "read-only" }
+artifacts = { source = "./artifacts", target = "./artifacts", access = "read-write" }
 disabled = { enabled = false }</code></pre>
           <div class="table-wrap"><table>
             <thead><tr><th>Field</th><th>Default</th><th>Behavior</th></tr></thead>
@@ -136,27 +139,27 @@ disabled = { enabled = false }</code></pre>
               <tr><td><code>enabled</code></td><td><code>true</code></td><td>Disabled entries may omit source and target and are not resolved at run time.</td></tr>
               <tr><td><code>source</code></td><td>Required when enabled</td><td>An existing host directory. <code>~</code> expands from host home; relative file paths resolve from the containing config's base.</td></tr>
               <tr><td><code>target</code></td><td>Required when enabled</td><td>Destination inside the container.</td></tr>
-              <tr><td><code>writable</code></td><td><code>false</code></td><td>Host mounts are read-only unless writes are explicitly enabled.</td></tr>
+              <tr><td><code>access</code></td><td>Required when enabled</td><td>Explicitly selects <code>read-only</code> or <code>read-write</code>.</td></tr>
             </tbody>
           </table></div>
-          <p>Sources are canonicalized when a session starts. Missing paths, broken symlinks, and non-directory sources fail loudly instead of creating an unexpected mount.</p>
+          <p>Sources are canonicalized when a session starts. Missing paths, broken symlinks, and non-directory sources fail loudly instead of creating an unexpected bind.</p>
         </section>
 
-        <section id="managed-mounts">
-          <h2><a href="#managed-mounts">Project and shared mounts</a></h2>
-          <pre data-copy><code>[mounts.project]
+        <section id="managed-state">
+          <h2><a href="#managed-state">Managed state</a></h2>
+          <pre data-copy><code>[state.project]
 dependencies = { target = "~/.cache/dependencies" }
 build = { target = "./target" }
 
-[mounts.shared]
+[state.user]
 agent-state = { target = "~/.agent" }
 disabled = { enabled = false }</code></pre>
-          <p>Managed entries accept only <code>target</code> and optional <code>enabled</code>. Silo creates private writable host storage:</p>
+          <p>State entries accept only <code>target</code> and optional <code>enabled</code>. Silo creates private writable host storage:</p>
           <ul>
-            <li><strong>Project</strong> storage is keyed by canonical project path and mount name.</li>
-            <li><strong>Shared</strong> storage is keyed by mount name and is intentionally reused across projects.</li>
+            <li><strong>Project</strong> state is keyed by canonical project path and entry name.</li>
+            <li><strong>User</strong> state is keyed by entry name and is intentionally reused across this user's projects.</li>
           </ul>
-          <p>Mount names must start with an ASCII letter or digit and then contain only letters, digits, <code>_</code>, or <code>-</code>. One name cannot appear in more than one mount category in the same file.</p>
+          <p>Bind and state names must start with an ASCII letter or digit and then contain only letters, digits, <code>_</code>, or <code>-</code>. One name cannot appear in more than one bind or state category in the same file.</p>
         </section>
 
         <section id="target-paths">
@@ -170,7 +173,7 @@ disabled = { enabled = false }</code></pre>
             </tbody>
           </table></div>
           <p>Targets must be non-empty UTF-8, may not contain commas, equals signs, or newlines, and may not use <code>..</code> to escape a relative anchor. Custom images reject home-relative host targets because they do not define Silo's <code>/home/silo</code> contract.</p>
-          <p>Nested mounts are ordered from parent to child. If two entries resolve to the same target, the deterministic later entry wins and Silo emits a warning.</p>
+          <p>Runtime mounts are ordered from parent to child. If two configured entries resolve to the same target, the deterministic later entry wins and Silo emits a warning.</p>
         </section>
 
         <section id="quick">
@@ -187,12 +190,12 @@ cx = ["codex", "--model", "gpt-5"]</code></pre>
           <p><code>silo config check</code> validates the effective configuration without creating a container. It checks:</p>
           <ul>
             <li>TOML structure and field types.</li>
-            <li>CPU, memory, forward names, ports, mount names, and path syntax.</li>
-            <li>Required fields for enabled mounts.</li>
+            <li>CPU, memory, forward names, ports, bind and state names, and path syntax.</li>
+            <li>Required fields for enabled binds and state entries.</li>
             <li>The configured Dockerfile's existence and file type.</li>
-            <li>Custom-image and home-relative mount incompatibilities.</li>
+            <li>Custom-image and home-relative bind incompatibilities.</li>
           </ul>
-          <p>Host mount source existence is checked again at <code>silo run</code>, because the filesystem can change after validation. Unknown config keys are warnings rather than hard errors, with both the file and ignored key named.</p>
+          <p>Bind source existence is checked again at <code>silo run</code>, because the filesystem can change after validation. Unknown config keys are warnings rather than hard errors, with both the file and ignored key named.</p>
         </section>
 
         <nav class="page-links" aria-label="Adjacent documentation pages">

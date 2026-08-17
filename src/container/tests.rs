@@ -17,12 +17,19 @@ fn resolved_host(name: &str, host: &str, dest: &str, access: Permission) -> Reso
     }
 }
 
+fn read_only_path(host: &str, relative: &str) -> ReadOnlyProjectPath {
+    ReadOnlyProjectPath {
+        host: PathBuf::from(host),
+        relative: PathBuf::from(relative),
+    }
+}
+
 fn test_managed_mount(scope: StateScope, name: &str, project: Option<&Path>) -> ManagedMount {
     managed_mount_at_root(
         scope,
         name,
         project,
-        Path::new("/home/user/.local/state/silo/mounts"),
+        Path::new("/home/user/.local/state/silo/state"),
     )
 }
 
@@ -884,9 +891,9 @@ fn effective_config_validation_rejects_custom_image_home_mounts() {
     );
 
     let message = validate_effective_config(&config)
-        .expect_err("custom image has no defined home for an enabled host mount")
+        .expect_err("custom image has no defined home for an enabled bind")
         .to_string();
-    assert!(message.contains("host mount `docs`"), "{message}");
+    assert!(message.contains("bind `docs`"), "{message}");
     assert!(
         message.contains("custom images have no Silo-defined home"),
         "{message}"
@@ -903,9 +910,9 @@ fn effective_config_validation_rejects_custom_image_home_mounts() {
     validate_effective_config(&config).expect("project-relative host target is supported");
 
     let mount = config.mounts.get_mut("docs").expect("mount exists");
-    mount.kind = Some(MountKind::SharedState);
+    mount.kind = Some(MountKind::UserState);
     mount.target = Some(PathBuf::from("~/.cache"));
-    validate_effective_config(&config).expect("managed mounts are skipped for custom images");
+    validate_effective_config(&config).expect("managed state is skipped for custom images");
 }
 
 #[test]
@@ -1062,15 +1069,14 @@ fn mount_specs(command: &Command) -> Vec<String> {
         .collect()
 }
 
-/// The canonical form of a path, as `git_mount_host` emits it: the tests
-/// must compare against the resolved path, since e.g. macOS `/var` is a
-/// symlink to `/private/var` while `dir.path()` is the lexical path.
+/// Canonicalizes expected host paths because e.g. macOS `/var` resolves to
+/// `/private/var` before Silo builds a mount.
 fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path).expect("path resolves")
 }
 
 #[test]
-fn run_command_mounts_git_read_only() {
+fn run_command_mounts_project_paths_read_only() {
     let ids = HostIds {
         uid: "501".into(),
         gid: "20".into(),
@@ -1080,7 +1086,10 @@ fn run_command_mounts_git_read_only() {
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts {
-            git: Some(PathBuf::from("/tmp/project/.git")),
+            read_only: vec![
+                read_only_path("/tmp/project/.git", ".git"),
+                read_only_path("/tmp/project/.jj", ".jj"),
+            ],
             named: vec![],
             network: None,
             guest_forwarding: None,
@@ -1096,12 +1105,13 @@ fn run_command_mounts_git_read_only() {
         [
             "/tmp/project:/home/silo/project",
             "/tmp/project/.git:/home/silo/project/.git:ro",
+            "/tmp/project/.jj:/home/silo/project/.jj:ro",
         ]
     );
 }
 
 #[test]
-fn run_command_omits_git_mount_when_absent() {
+fn run_command_omits_read_only_mounts_when_absent() {
     let ids = HostIds {
         uid: "501".into(),
         gid: "20".into(),
@@ -1118,6 +1128,35 @@ fn run_command_omits_git_mount_when_absent() {
     )
     .expect("command builds");
     assert_eq!(bind_specs(&command), ["/tmp/project:/home/silo/project"]);
+}
+
+#[test]
+fn run_command_can_mount_the_project_root_read_only() {
+    let command = isolated_create_command(
+        false,
+        Path::new("/tmp/project"),
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &ConfigMounts {
+            read_only: vec![read_only_path("/tmp/project", ".")],
+            ..ConfigMounts::default()
+        },
+        &Container::default(),
+        "silo-123",
+        &[],
+        None,
+    )
+    .expect("command builds");
+
+    assert_eq!(
+        bind_specs(&command),
+        [
+            "/tmp/project:/home/silo/project",
+            "/tmp/project:/home/silo/project:ro"
+        ]
+    );
 }
 
 #[test]
@@ -1145,7 +1184,7 @@ fn run_command_mounts_configured_named_mounts() {
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts {
-            git: None,
+            read_only: vec![],
             named,
             network: None,
             guest_forwarding: None,
@@ -1167,7 +1206,7 @@ fn run_command_mounts_configured_named_mounts() {
 }
 
 #[test]
-fn run_command_orders_git_then_named_mounts() {
+fn run_command_orders_read_only_then_named_mounts() {
     let ids = HostIds {
         uid: "501".into(),
         gid: "20".into(),
@@ -1183,7 +1222,7 @@ fn run_command_orders_git_then_named_mounts() {
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts {
-            git: Some(PathBuf::from("/tmp/project/.git")),
+            read_only: vec![read_only_path("/tmp/project/.git", ".git")],
             named,
             network: None,
             guest_forwarding: None,
@@ -1215,9 +1254,9 @@ fn shared_create_bind_mounts_all_managed_storage() {
     };
     let project = Path::new("/tmp/project");
     let writable = test_managed_mount(StateScope::Project, "cargo", Some(project));
-    let readonly = test_managed_mount(StateScope::Shared, "codex", None);
+    let readonly = test_managed_mount(StateScope::User, "codex", None);
     let mounts = ConfigMounts {
-        git: None,
+        read_only: vec![],
         named: vec![
             ResolvedMount {
                 name: "cargo".into(),
@@ -1282,7 +1321,7 @@ fn built_in_isolated_mount_filter_keeps_all_managed_mounts() {
         ResolvedMount {
             name: "codex".into(),
             source: ResolvedMountSource::Managed(test_managed_mount(
-                StateScope::Shared,
+                StateScope::User,
                 "codex",
                 None,
             )),
@@ -1309,7 +1348,7 @@ fn built_in_isolated_mount_filter_keeps_all_managed_mounts() {
             gid: "20".into(),
         },
         &ConfigMounts {
-            git: None,
+            read_only: vec![],
             named: mounts,
             network: None,
             guest_forwarding: None,
@@ -1319,10 +1358,13 @@ fn built_in_isolated_mount_filter_keeps_all_managed_mounts() {
         &[],
         None,
     )
-    .expect("built-in isolated command accepts managed mounts");
-    assert!(mount_specs(&command).iter().any(
-        |spec| spec.contains("/mounts/projects/") && spec.ends_with("target=/home/silo/.cargo")
-    ));
+    .expect("built-in isolated command accepts managed state");
+    assert!(
+        mount_specs(&command)
+            .iter()
+            .any(|spec| spec.contains("/state/project/")
+                && spec.ends_with("target=/home/silo/.cargo"))
+    );
 }
 
 #[test]
@@ -1340,7 +1382,7 @@ fn custom_image_mount_filter_skips_all_managed_mounts() {
         (
             "codex".into(),
             Mount {
-                kind: Some(MountKind::SharedState),
+                kind: Some(MountKind::UserState),
                 target: Some(PathBuf::from("~/.codex")),
                 ..Mount::default()
             },
@@ -1348,7 +1390,7 @@ fn custom_image_mount_filter_skips_all_managed_mounts() {
         (
             "tools".into(),
             Mount {
-                kind: Some(MountKind::SharedState),
+                kind: Some(MountKind::UserState),
                 target: Some(PathBuf::from("/tools")),
                 ..Mount::default()
             },
@@ -1373,8 +1415,8 @@ fn custom_image_mount_filter_skips_all_managed_mounts() {
         skipped,
         [
             ("project", "cargo".into()),
-            ("shared", "codex".into()),
-            ("shared", "tools".into()),
+            ("user", "codex".into()),
+            ("user", "tools".into()),
         ]
     );
     assert_eq!(
@@ -1405,7 +1447,7 @@ fn custom_image_mount_filter_rejects_home_relative_host_targets() {
         .expect("custom images have no defined home for a home-relative target")
         .to_string();
 
-    assert!(message.contains("host mount `docs`"), "{message}");
+    assert!(message.contains("bind `docs`"), "{message}");
     assert!(
         message.contains("custom images have no Silo-defined home"),
         "{message}"
@@ -1451,7 +1493,7 @@ fn isolated_start_attaches_input_and_output() {
 fn mount_conflicts_reports_read_write_shared_over_git() {
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
-        true,
+        &[read_only_path("/project/.git", ".git")],
         &[resolved_host(
             "git-state",
             "/home/user/git",
@@ -1461,17 +1503,17 @@ fn mount_conflicts_reports_read_write_shared_over_git() {
     );
     assert_eq!(conflicts.len(), 1);
     let msg = &conflicts[0];
-    assert!(msg.contains("read-write mount"), "{msg}");
+    assert!(msg.contains("read-write entry"), "{msg}");
     assert!(msg.contains("`.git`"), "{msg}");
 }
 
 #[test]
 fn mount_conflicts_reports_read_write_shared_under_git() {
-    // A read-write mount at `.git/objects` is a deeper, independent mount
+    // A read-write entry at `.git/objects` is a deeper, independent mount
     // and really is writable, so the `.git` protection is defeated.
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
-        true,
+        &[read_only_path("/project/.git", ".git")],
         &[resolved_host(
             "git-objects",
             "/home/user/git",
@@ -1481,11 +1523,28 @@ fn mount_conflicts_reports_read_write_shared_under_git() {
     );
     assert_eq!(conflicts.len(), 1);
     assert!(
-        conflicts[0].contains("read-write mount"),
+        conflicts[0].contains("read-write entry"),
         "{}",
         conflicts[0]
     );
     assert!(conflicts[0].contains(".git"), "{}", conflicts[0]);
+}
+
+#[test]
+fn mount_conflicts_reports_custom_protected_directories() {
+    let conflicts = mount_conflicts(
+        Path::new("/home/silo/project"),
+        &[read_only_path("/project/policy", "policy")],
+        &[resolved_host(
+            "policy",
+            "/home/user/policy",
+            "/home/silo/project/policy",
+            Permission::ReadWrite,
+        )],
+    );
+
+    assert_eq!(conflicts.len(), 1);
+    assert!(conflicts[0].contains("`policy`"), "{}", conflicts[0]);
 }
 
 #[test]
@@ -1494,7 +1553,7 @@ fn mount_conflicts_keeps_gitignore_silent() {
     // comparison must not flag it.
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
-        true,
+        &[read_only_path("/project/.git", ".git")],
         &[resolved_host(
             "gitignore",
             "/home/user/gitignore",
@@ -1511,7 +1570,7 @@ fn mount_conflicts_keeps_ancestor_shared_silent() {
     // read-only protection stays in place, so no warning.
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
-        true,
+        &[read_only_path("/project/.git", ".git")],
         &[resolved_host(
             "project",
             "/home/user/project",
@@ -1528,7 +1587,7 @@ fn mount_conflicts_keeps_read_only_shared_over_git_silent() {
     // intact either way.
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
-        true,
+        &[read_only_path("/project/.git", ".git")],
         &[resolved_host(
             "git",
             "/home/user/git",
@@ -1543,7 +1602,7 @@ fn mount_conflicts_keeps_read_only_shared_over_git_silent() {
 fn mount_conflicts_is_silent_without_overlaps() {
     let conflicts = mount_conflicts(
         Path::new("/home/silo/project"),
-        true,
+        &[read_only_path("/project/.git", ".git")],
         &[resolved_host(
             "data",
             "/home/user/data",
@@ -1560,7 +1619,7 @@ fn mount_conflicts_reports_duplicate_target_and_deterministic_winner() {
         resolved_host("alpha", "/a", "/target", Permission::ReadOnly),
         resolved_host("beta", "/b", "/target", Permission::ReadWrite),
     ];
-    let conflicts = mount_conflicts(Path::new("/home/silo/project"), false, &mounts);
+    let conflicts = mount_conflicts(Path::new("/home/silo/project"), &[], &mounts);
     assert_eq!(conflicts.len(), 1);
     assert!(conflicts[0].contains("`alpha`"), "{}", conflicts[0]);
     assert!(
@@ -1577,41 +1636,76 @@ fn mount_conflicts_reports_duplicate_target_and_deterministic_winner() {
 }
 
 #[test]
-fn git_mount_host_returns_canonical_git_when_enabled() {
-    let dir = TestDir::new("git-mount");
+fn read_only_paths_resolve_directories_in_order() {
+    let dir = TestDir::new("read-only-paths");
     fs::create_dir_all(dir.path().join(".git")).expect("mkdir succeeds");
+    fs::create_dir_all(dir.path().join("config/policy")).expect("nested mkdir succeeds");
     assert_eq!(
-        git_mount_host(dir.path(), true),
-        Some(canonical(&dir.path().join(".git")))
+        resolve_read_only_paths(
+            dir.path(),
+            &[PathBuf::from(".git"), PathBuf::from("config/policy")]
+        )
+        .expect("directories resolve"),
+        [
+            ReadOnlyProjectPath {
+                host: canonical(&dir.path().join(".git")),
+                relative: PathBuf::from(".git"),
+            },
+            ReadOnlyProjectPath {
+                host: canonical(&dir.path().join("config/policy")),
+                relative: PathBuf::from("config/policy"),
+            }
+        ]
     );
 }
 
 #[test]
-fn git_mount_host_disabled_returns_none() {
-    let dir = TestDir::new("git-off");
-    fs::create_dir_all(dir.path().join(".git")).expect("mkdir succeeds");
-    assert!(git_mount_host(dir.path(), false).is_none());
+fn read_only_paths_reject_regular_files() {
+    let dir = TestDir::new("read-only-file");
+    fs::write(dir.path().join("AGENTS.md"), "instructions").expect("file write succeeds");
+
+    let error = resolve_read_only_paths(dir.path(), &[PathBuf::from("AGENTS.md")])
+        .expect_err("Apple container cannot bind-mount a regular file")
+        .to_string();
+
+    assert!(error.contains("`AGENTS.md`"), "{error}");
+    assert!(error.contains("must be a directory"), "{error}");
+    assert!(error.contains("Apple container"), "{error}");
 }
 
 #[test]
-fn git_mount_host_returns_none_without_git() {
-    let dir = TestDir::new("no-git");
-    assert!(git_mount_host(dir.path(), true).is_none());
+fn read_only_paths_omit_missing_entries() {
+    let dir = TestDir::new("read-only-missing");
+    assert!(
+        resolve_read_only_paths(dir.path(), &[PathBuf::from(".git"), PathBuf::from(".jj")])
+            .expect("missing paths are omitted")
+            .is_empty()
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn git_mount_host_skips_git_escaping_the_project() {
+fn read_only_paths_allow_internal_symlinks_and_skip_escaping_symlinks() {
     use std::os::unix::fs::symlink;
 
-    let dir = TestDir::new("git-escape");
+    let dir = TestDir::new("read-only-symlinks");
+    fs::create_dir(dir.path().join("policy")).expect("directory creates");
+    symlink("policy", dir.path().join("protected")).expect("internal symlink succeeds");
     let outside = std::env::temp_dir().join(format!("silo-test-outside-{}", std::process::id()));
     let _ = fs::remove_dir_all(&outside);
     fs::create_dir_all(&outside).expect("mkdir succeeds");
     symlink(&outside, dir.path().join(".git")).expect("symlink succeeds");
-    assert!(
-        git_mount_host(dir.path(), true).is_none(),
-        "an escaping .git symlink must not become a mount"
+    assert_eq!(
+        resolve_read_only_paths(
+            dir.path(),
+            &[PathBuf::from("protected"), PathBuf::from(".git")]
+        )
+        .expect("safe directories resolve"),
+        [ReadOnlyProjectPath {
+            host: canonical(&dir.path().join("policy")),
+            relative: PathBuf::from("protected"),
+        }],
+        "an escaping symlink must not become a mount"
     );
     let _ = fs::remove_dir_all(&outside);
 }
@@ -1669,7 +1763,7 @@ fn resolve_named_builds_stable_host_backed_managed_mounts() {
         (
             "codex".to_string(),
             Mount {
-                kind: Some(MountKind::SharedState),
+                kind: Some(MountKind::UserState),
                 target: Some(PathBuf::from("~/.codex")),
                 ..Mount::default()
             },
@@ -1697,28 +1791,28 @@ fn resolve_named_builds_stable_host_backed_managed_mounts() {
         panic!("project state becomes a managed mount");
     };
     let ResolvedMountSource::Managed(codex_mount) = &codex.source else {
-        panic!("shared state becomes a managed mount");
+        panic!("user state becomes a managed mount");
     };
     assert_eq!(cargo_mount.scope, StateScope::Project);
     assert_eq!(cargo_mount.project.as_deref(), Some(project));
-    assert_eq!(codex_mount.scope, StateScope::Shared);
+    assert_eq!(codex_mount.scope, StateScope::User);
     assert_eq!(codex_mount.project, None);
     assert_eq!(target.dest, PathBuf::from("/home/silo/project/target"));
     assert_eq!(
         cargo_mount.path,
         PathBuf::from(format!(
-            "/home/user/.local/state/silo/mounts/projects/{}/mounts/cargo",
+            "/home/user/.local/state/silo/state/project/{}/entries/cargo",
             project_digest(project)
         ))
     );
     assert_eq!(
         codex_mount.path,
-        PathBuf::from("/home/user/.local/state/silo/mounts/shared/codex")
+        PathBuf::from("/home/user/.local/state/silo/state/user/codex")
     );
     assert_eq!(cargo.access, Permission::ReadWrite);
     assert_eq!(codex.access, Permission::ReadWrite);
     assert_eq!(
-        test_managed_mount(StateScope::Shared, "codex", None).id,
+        test_managed_mount(StateScope::User, "codex", None).id,
         codex_mount.id
     );
 }
@@ -1739,7 +1833,7 @@ fn resolve_named_errors_on_missing_host_source() {
         .expect_err("missing source errors");
     let msg = err.to_string();
     assert!(msg.contains("cannot resolve source"), "{msg}");
-    assert!(msg.contains("host mount `nope`"), "{msg}");
+    assert!(msg.contains("bind `nope`"), "{msg}");
 }
 
 #[test]
@@ -1758,9 +1852,9 @@ fn resolve_named_rejects_regular_file_host_sources() {
     )]);
 
     let message = resolve_named_mounts(&mounts, dir.path(), Some(dir.path()), None)
-        .expect_err("regular files are not supported host mounts")
+        .expect_err("regular files are not supported bind sources")
         .to_string();
-    assert!(message.contains("host mount `settings`"), "{message}");
+    assert!(message.contains("bind `settings`"), "{message}");
     assert!(message.contains("must be a directory"), "{message}");
 }
 
@@ -1770,7 +1864,7 @@ fn resolve_named_orders_parents_before_children_then_names() {
         (
             "later".to_string(),
             Mount {
-                kind: Some(MountKind::SharedState),
+                kind: Some(MountKind::UserState),
                 target: Some(PathBuf::from("/same")),
                 ..Mount::default()
             },
@@ -1778,7 +1872,7 @@ fn resolve_named_orders_parents_before_children_then_names() {
         (
             "earlier".to_string(),
             Mount {
-                kind: Some(MountKind::SharedState),
+                kind: Some(MountKind::UserState),
                 target: Some(PathBuf::from("/same")),
                 ..Mount::default()
             },
@@ -1861,12 +1955,12 @@ fn managed_mount_root_prefers_absolute_xdg_and_falls_back_to_home() {
     assert_eq!(
         managed_mount_root(Some(Path::new("/var/state")), Some(Path::new("/home/user")))
             .expect("absolute XDG state home works"),
-        PathBuf::from("/var/state/silo/mounts")
+        PathBuf::from("/var/state/silo/state")
     );
     assert_eq!(
         managed_mount_root(Some(Path::new("relative")), Some(Path::new("/home/user")))
             .expect("relative XDG state home is ignored"),
-        PathBuf::from("/home/user/.local/state/silo/mounts")
+        PathBuf::from("/home/user/.local/state/silo/state")
     );
     assert!(managed_mount_root(None, Some(Path::new("relative"))).is_err());
     assert!(managed_mount_root(Some(Path::new("relative")), Some(Path::new("relative"))).is_err());
@@ -1900,11 +1994,11 @@ fn managed_mounts_are_created_private_and_reject_symlinks() {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     let dir = TestDir::new("managed-mount");
-    let mount = managed_mount_at_root(StateScope::Shared, "codex", None, dir.path());
+    let mount = managed_mount_at_root(StateScope::User, "codex", None, dir.path());
     ensure_managed_mount(&mount).expect("managed directory is created");
     for path in [
         dir.path().to_path_buf(),
-        dir.path().join("shared"),
+        dir.path().join("user"),
         mount.path.clone(),
     ] {
         assert_eq!(
@@ -1919,7 +2013,7 @@ fn managed_mounts_are_created_private_and_reject_symlinks() {
 
     let target = dir.path().join("target");
     fs::create_dir(&target).expect("target exists");
-    let link = managed_mount_at_root(StateScope::Shared, "linked", None, dir.path());
+    let link = managed_mount_at_root(StateScope::User, "linked", None, dir.path());
     symlink(&target, &link.path).expect("symlink exists");
     assert!(ensure_managed_mount(&link).is_err());
 }
@@ -1933,7 +2027,7 @@ fn project_mount_metadata_round_trips_raw_paths_and_drives_inventory() {
     let dir = TestDir::new("project-mount-metadata");
     let project = Path::new(OsStr::from_bytes(b"/work/non-utf8-\xFF"));
     let mount = managed_mount_at_root(StateScope::Project, "cargo", Some(project), dir.path());
-    ensure_managed_mount(&mount).expect("project mount is created");
+    ensure_managed_mount(&mount).expect("project state is created");
 
     let project_dir = mount.path.parent().unwrap().parent().unwrap();
     let metadata = project_dir.join(PROJECT_ROOT_METADATA);
@@ -1943,7 +2037,7 @@ fn project_mount_metadata_round_trips_raw_paths_and_drives_inventory() {
     );
     for path in [
         dir.path(),
-        &dir.path().join("projects"),
+        &dir.path().join("project"),
         project_dir,
         mount.path.parent().unwrap(),
         &mount.path,
@@ -1970,7 +2064,7 @@ fn project_mount_inventory_rejects_metadata_digest_mismatches() {
     let dir = TestDir::new("project-mount-bad-metadata");
     let project = Path::new("/work/project");
     let mount = managed_mount_at_root(StateScope::Project, "cargo", Some(project), dir.path());
-    ensure_managed_mount(&mount).expect("project mount is created");
+    ensure_managed_mount(&mount).expect("project state is created");
     let project_dir = mount.path.parent().unwrap().parent().unwrap();
     fs::write(
         project_dir.join(PROJECT_ROOT_METADATA),
@@ -1992,14 +2086,14 @@ fn project_mount_inventory_rejects_metadata_digest_mismatches() {
 }
 
 #[test]
-fn final_project_mount_cleanup_removes_metadata_directory() {
-    let dir = TestDir::new("project-mount-cleanup");
+fn final_project_state_cleanup_removes_metadata_directory() {
+    let dir = TestDir::new("project-state-cleanup");
     let project = Path::new("/work/project");
     let mount = managed_mount_at_root(StateScope::Project, "cargo", Some(project), dir.path());
-    ensure_managed_mount(&mount).expect("project mount is created");
+    ensure_managed_mount(&mount).expect("project state is created");
     let project_dir = mount.path.parent().unwrap().parent().unwrap().to_path_buf();
     fs::remove_dir_all(&mount.path).expect("mount data is deleted");
-    prune_empty_project_mount_directory(&mount.path).expect("empty project metadata is pruned");
+    prune_empty_project_state_directory(&mount.path).expect("empty project metadata is pruned");
     assert!(!project_dir.exists());
 }
 
@@ -2123,7 +2217,7 @@ fn project_prefers_the_nearest_silo_marker() {
 }
 
 #[test]
-fn project_silo_marker_outranks_a_closer_git_directory() {
+fn project_silo_marker_outranks_closer_vcs_directories() {
     let dir = TestDir::new("project-silo-before-git");
     let silo_root = dir.path().join("workspace");
     let git_root = silo_root.join("package");
@@ -2131,6 +2225,7 @@ fn project_silo_marker_outranks_a_closer_git_directory() {
     fs::create_dir_all(cwd.as_path()).expect("nested project creates");
     fs::write(silo_root.join(PROJECT_MARKER), "").expect("silo marker creates");
     fs::create_dir(git_root.join(GIT_DIR)).expect("git directory creates");
+    fs::create_dir(git_root.join(JJ_DIR)).expect("jj directory creates");
 
     let project = Project::from_path(&cwd).expect("project resolves");
 
@@ -2152,6 +2247,33 @@ fn project_uses_the_nearest_git_directory_without_a_silo_marker() {
 
     assert_eq!(project.root, canonical(&inner));
     assert_eq!(project.workdir, PathBuf::from("/home/silo/inner"));
+}
+
+#[test]
+fn project_uses_the_nearest_jj_directory_without_a_silo_marker() {
+    let dir = TestDir::new("project-nearest-jj");
+    let workspace = dir.path().join("workspace");
+    let cwd = workspace.join("src");
+    fs::create_dir_all(&cwd).expect("nested project creates");
+    fs::create_dir(workspace.join(JJ_DIR)).expect("jj directory creates");
+
+    let project = Project::from_path(&cwd).expect("project resolves");
+
+    assert_eq!(project.root, canonical(&workspace));
+    assert_eq!(project.workdir, PathBuf::from("/home/silo/workspace"));
+}
+
+#[test]
+fn project_uses_the_nearest_vcs_directory_regardless_of_kind() {
+    let dir = TestDir::new("project-nearest-vcs");
+    let git_root = dir.path().join("git-root");
+    let jj_root = git_root.join("jj-root");
+    let cwd = jj_root.join("src");
+    fs::create_dir_all(&cwd).expect("nested project creates");
+    fs::create_dir(git_root.join(GIT_DIR)).expect("git directory creates");
+    fs::create_dir(jj_root.join(JJ_DIR)).expect("jj directory creates");
+
+    assert_eq!(discover_project_root(&cwd), jj_root);
 }
 
 #[test]
@@ -2187,6 +2309,7 @@ fn project_ignores_markers_with_the_wrong_entry_type() {
     fs::write(dir.path().join(PROJECT_MARKER), "").expect("outer marker creates");
     fs::create_dir(candidate.join(PROJECT_MARKER)).expect("marker directory creates");
     fs::write(candidate.join(GIT_DIR), "gitdir: elsewhere").expect("git file creates");
+    fs::write(candidate.join(JJ_DIR), "not a workspace").expect("jj file creates");
 
     let project = Project::from_path(&cwd).expect("project resolves");
 
@@ -2717,8 +2840,8 @@ fn inspect_parser_reads_bind_sources_for_safe_mount_deletion() {
     let json = br#"[{
         "id":"silo-test",
         "configuration":{"mounts":[
-            {"type":"bind","source":"/home/user/.local/state/silo/mounts/shared/codex","destination":"/home/silo/.codex"},
-            {"type":"bind","source":"/home/user/.local/state/silo/mounts/projects/abc/mounts/cache","destination":"/cache"}
+            {"type":"bind","source":"/home/user/.local/state/silo/state/user/codex","destination":"/home/silo/.codex"},
+            {"type":"bind","source":"/home/user/.local/state/silo/state/project/abc/entries/cache","destination":"/cache"}
         ]},
         "status":{"state":"running"}
     }]"#;
@@ -2726,8 +2849,8 @@ fn inspect_parser_reads_bind_sources_for_safe_mount_deletion() {
     assert_eq!(
         inspection.mount_sources,
         [
-            PathBuf::from("/home/user/.local/state/silo/mounts/shared/codex"),
-            PathBuf::from("/home/user/.local/state/silo/mounts/projects/abc/mounts/cache")
+            PathBuf::from("/home/user/.local/state/silo/state/user/codex"),
+            PathBuf::from("/home/user/.local/state/silo/state/project/abc/entries/cache")
         ]
     );
 }
@@ -2796,7 +2919,7 @@ fn mount_selectors_support_ids_names_paths_and_report_ambiguity() {
         "cargo",
         Some(Path::new("/two/project")),
     ));
-    let shared = MountInfo(test_managed_mount(StateScope::Shared, "codex", None));
+    let shared = MountInfo(test_managed_mount(StateScope::User, "codex", None));
     let items = [first, second, shared];
 
     assert_eq!(
@@ -2835,7 +2958,7 @@ fn mount_selector_reports_project_and_logical_name_collisions() {
         "cargo",
         Some(Path::new("/work/codex")),
     ));
-    let shared = MountInfo(test_managed_mount(StateScope::Shared, "codex", None));
+    let shared = MountInfo(test_managed_mount(StateScope::User, "codex", None));
     let items = [project, shared];
 
     let message = select_mount(&items, "codex")
@@ -2865,7 +2988,7 @@ fn mount_table_shows_identity_scope_name_project_and_source() {
         "SOURCE",
         "project",
         "cargo",
-        "silo/mounts",
+        "silo/state",
     ] {
         assert!(
             rendered.contains(expected),
@@ -3379,6 +3502,37 @@ fn specification_digest_is_deterministic_and_creation_sensitive() {
     assert_eq!(base, shared_identity(&project));
     assert_ne!(base.spec, changed.spec);
     assert_eq!(base.project.len(), 64);
+}
+
+#[test]
+fn specification_digest_tracks_read_only_sources_and_targets() {
+    let project = test_project("/tmp/project");
+    let base = shared_identity(&project);
+    let identity_with = |host: &str, relative: &str| {
+        container_identity(
+            &project,
+            TEST_IMAGE_DIGEST,
+            &HostIds {
+                uid: "501".into(),
+                gid: "20".into(),
+            },
+            &ConfigMounts {
+                read_only: vec![read_only_path(host, relative)],
+                ..ConfigMounts::default()
+            },
+            &Container::default(),
+            LABEL_SHARED_VALUE,
+            &[OsString::from(SHARED_INIT_COMMAND)],
+        )
+    };
+
+    let git = identity_with("/tmp/project/.git", ".git");
+    let jj = identity_with("/tmp/project/.jj", ".jj");
+    let aliased_git = identity_with("/tmp/project/.git", "metadata");
+
+    assert_ne!(base.spec, git.spec);
+    assert_ne!(git.spec, jj.spec);
+    assert_ne!(git.spec, aliased_git.spec);
 }
 
 #[test]

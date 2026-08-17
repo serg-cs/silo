@@ -6,16 +6,15 @@
 //! every key has a default, so a missing or partial file always yields a
 //! usable [`Config`]. Project settings are partial and replace explicitly
 //! present global options. Precedence is `defaults < global config < project
-//! config < CLI flags`. Named mounts and forwards are the exceptions to
-//! whole-collection replacement: project entries overlay global entries by
-//! name and field.
+//! config < CLI flags`. Named binds, state entries, and forwards are the
+//! exceptions to whole-collection replacement: project entries overlay global
+//! entries by name and field.
 //!
-//! On top of the built-in mounts (the shared project directory and the
-//! optional read-only `.git`), the `mounts` table provides named host mounts
-//! and managed project- or user-scoped state that survives automatic
-//! container removal.
+//! `workspace.read_only` protects selected project directories. `binds`
+//! exposes existing host directories with explicit access, while `state`
+//! provides Silo-managed writable storage with project or user scope.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
@@ -23,14 +22,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Contents of the concise starter config file created on first use.
 const DEFAULT_CONFIG: &str = include_str!("default.toml");
 
 /// User configuration, loaded once at startup and passed to commands.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     pub image: Image,
     /// Resource limits for containers created by Silo. Omitted limits are
@@ -43,13 +41,10 @@ pub struct Config {
     /// Interactive shell used by the built-in image. When omitted, Silo
     /// mirrors a supported host `$SHELL` and falls back to Zsh.
     pub shell: Option<Shell>,
-    /// Whether the project's `.git` directory is mounted read-only in the
-    /// container, so tools inside it cannot modify version control state.
-    pub read_only_git: bool,
-    /// Named configurable mounts, grouped under `mounts.host`,
-    /// `mounts.project`, and `mounts.shared`. Project configuration overlays
-    /// these by name and field.
-    #[serde(default, deserialize_with = "deserialize_mounts")]
+    /// Settings for the project workspace mounted into the container.
+    pub workspace: Workspace,
+    /// Normalized binds and managed state used by the container layer.
+    /// Project configuration overlays entries by logical name and field.
     pub mounts: BTreeMap<String, Mount>,
     /// Quick commands: `silo <name>` runs this command inside the container
     /// without typing `silo run --` every time. The key is what you type;
@@ -61,18 +56,81 @@ pub struct Config {
 /// Partial configuration read from a project's `.silo.toml`.
 ///
 /// Collection fields are optional so omission can inherit the global value.
-/// Quick commands replace as a collection; named mounts merge by entry.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+/// Quick commands replace as a collection; binds and state merge by entry.
+#[derive(Debug, Default)]
 struct ProjectConfig {
     image: ProjectImage,
     container: ProjectContainer,
     forward: Option<BTreeMap<String, ProjectForward>>,
     shell: Option<Shell>,
-    read_only_git: Option<bool>,
-    #[serde(default, deserialize_with = "deserialize_optional_mounts")]
-    mounts: Option<BTreeMap<String, Mount>>,
+    workspace: ProjectWorkspace,
+    mounts: BTreeMap<String, Mount>,
     quick: Option<BTreeMap<String, Vec<String>>>,
+}
+
+/// User-facing global configuration before binds and scoped state are
+/// normalized for runtime processing.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ConfigDocument {
+    image: Image,
+    container: Container,
+    forward: BTreeMap<String, Forward>,
+    shell: Option<Shell>,
+    workspace: Workspace,
+    binds: BTreeMap<String, Bind>,
+    state: StateTables,
+    quick: BTreeMap<String, Vec<String>>,
+}
+
+/// User-facing project overrides before named entries are normalized.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ProjectDocument {
+    image: ProjectImage,
+    container: ProjectContainer,
+    forward: Option<BTreeMap<String, ProjectForward>>,
+    shell: Option<Shell>,
+    workspace: ProjectWorkspace,
+    binds: BTreeMap<String, Bind>,
+    state: StateTables,
+    quick: Option<BTreeMap<String, Vec<String>>>,
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let document = ConfigDocument::deserialize(deserializer)?;
+        Ok(Self {
+            image: document.image,
+            container: document.container,
+            forward: document.forward,
+            shell: document.shell,
+            workspace: document.workspace,
+            mounts: normalize_mounts(document.binds, document.state)?,
+            quick: document.quick,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ProjectConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let document = ProjectDocument::deserialize(deserializer)?;
+        Ok(Self {
+            image: document.image,
+            container: document.container,
+            forward: document.forward,
+            shell: document.shell,
+            workspace: document.workspace,
+            mounts: normalize_mounts(document.binds, document.state)?,
+            quick: document.quick,
+        })
+    }
 }
 
 /// Image overrides supplied by a project. An omitted Dockerfile inherits the
@@ -100,21 +158,6 @@ struct ProjectForward {
     enabled: Option<bool>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            image: Image::default(),
-            container: Container::default(),
-            forward: BTreeMap::new(),
-            shell: None,
-            // Protection on by default; disable it in the config file.
-            read_only_git: true,
-            mounts: BTreeMap::new(),
-            quick: BTreeMap::new(),
-        }
-    }
-}
-
 impl Config {
     /// Applies invocation-specific resource limits after global and project
     /// configuration have been merged.
@@ -129,11 +172,11 @@ impl Config {
 
     /// Renders the merged configuration in the compact style used by the
     /// starter file. Runtime-delegated values and empty sections are omitted,
-    /// while concrete mount defaults are made explicit.
+    /// while concrete bind and state defaults are made explicit.
     ///
     /// # Errors
     ///
-    /// Returns an error if an internal mount has no user-facing category or
+    /// Returns an error if an internal entry has no user-facing category or
     /// a TOML value cannot be serialized.
     pub(crate) fn effective_toml(&self) -> Result<String> {
         // Keep scalar settings in the same order and dotted form as the
@@ -151,9 +194,13 @@ impl Config {
         if let Some(shell) = self.shell {
             append_toml_value(&mut output, "shell", &shell)?;
         }
-        append_toml_value(&mut output, "read_only_git", &self.read_only_git)?;
+        append_toml_value(
+            &mut output,
+            "workspace.read_only",
+            &self.workspace.read_only,
+        )?;
 
-        // Keep forwards compact and aligned with named mount syntax.
+        // Keep forwards compact and aligned with named-entry syntax.
         let forwards = self
             .forward
             .iter()
@@ -169,34 +216,34 @@ impl Config {
             .collect();
         append_toml_section(&mut output, "forward", &forwards)?;
 
-        // Group normalized mounts back into their user-facing categories.
-        let mut mounts = EffectiveMountTables::default();
+        // Group normalized runtime entries back into the user-facing model.
+        let mut entries = EffectiveEntryTables::default();
         for (name, entry) in &self.mounts {
             match entry.kind() {
                 Some(MountKind::Host) => {
-                    mounts.host.insert(
+                    entries.binds.insert(
                         name.clone(),
-                        EffectiveHostMount {
+                        EffectiveBind {
                             enabled: entry.is_enabled(),
                             source: entry.source.clone(),
                             target: entry.target.clone(),
-                            writable: entry.writable.unwrap_or(false),
+                            access: entry.access.unwrap_or(Permission::ReadOnly),
                         },
                     );
                 }
                 Some(MountKind::ProjectState) => {
-                    mounts.project.insert(
+                    entries.project.insert(
                         name.clone(),
-                        EffectiveManagedMount {
+                        EffectiveStateEntry {
                             enabled: entry.is_enabled(),
                             target: entry.target.clone(),
                         },
                     );
                 }
-                Some(MountKind::SharedState) => {
-                    mounts.shared.insert(
+                Some(MountKind::UserState) => {
+                    entries.user.insert(
                         name.clone(),
-                        EffectiveManagedMount {
+                        EffectiveStateEntry {
                             enabled: entry.is_enabled(),
                             target: entry.target.clone(),
                         },
@@ -204,14 +251,14 @@ impl Config {
                 }
                 None => {
                     return Err(anyhow!(
-                        "cannot print mount `{name}` because it has no config category"
+                        "cannot print entry `{name}` because it has no config category"
                     ));
                 }
             }
         }
-        append_toml_section(&mut output, "mounts.host", &mounts.host)?;
-        append_toml_section(&mut output, "mounts.project", &mounts.project)?;
-        append_toml_section(&mut output, "mounts.shared", &mounts.shared)?;
+        append_toml_section(&mut output, "binds", &entries.binds)?;
+        append_toml_section(&mut output, "state.project", &entries.project)?;
+        append_toml_section(&mut output, "state.user", &entries.user)?;
 
         // Use the document serializer for arbitrary quick-command keys while
         // suppressing its otherwise-empty table.
@@ -259,6 +306,29 @@ pub struct Container {
     pub memory: Option<String>,
 }
 
+/// Settings for the project workspace mounted into the container.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Workspace {
+    /// Project-relative directories overlaid read-only in the container.
+    pub read_only: Vec<PathBuf>,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            read_only: vec![PathBuf::from(".git")],
+        }
+    }
+}
+
+/// Partial workspace settings supplied by a project configuration.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ProjectWorkspace {
+    read_only: Option<Vec<PathBuf>>,
+}
+
 /// One named host loopback port exposed to a container.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -283,7 +353,7 @@ pub enum Shell {
     Nu,
 }
 
-/// One normalized layer of a named mount definition. The config-facing
+/// One normalized layer of a named bind or state definition. The config-facing
 /// category selects `kind`; this representation keeps the container layer and
 /// global/project merging independent of TOML layout.
 #[derive(Debug, Clone, Default)]
@@ -292,7 +362,7 @@ pub struct Mount {
     pub kind: Option<MountKind>,
     pub source: Option<PathBuf>,
     pub target: Option<PathBuf>,
-    pub writable: Option<bool>,
+    pub access: Option<Permission>,
 }
 
 impl Mount {
@@ -327,59 +397,57 @@ impl Mount {
 
     pub fn effective_access(&self) -> Permission {
         match self.kind() {
-            Some(MountKind::Host) | None if !self.writable.unwrap_or(false) => Permission::ReadOnly,
-            Some(MountKind::Host | MountKind::ProjectState | MountKind::SharedState) | None => {
-                Permission::ReadWrite
-            }
+            Some(MountKind::Host) | None => self.access.unwrap_or(Permission::ReadOnly),
+            Some(MountKind::ProjectState | MountKind::UserState) => Permission::ReadWrite,
         }
     }
 }
 
-/// Config-facing mount categories. Keeping the category outside each entry
-/// makes `source` and `target` mean the same thing everywhere they appear.
+/// Config-facing managed state grouped by its persistence scope.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct MountTables {
-    host: BTreeMap<String, HostMount>,
-    project: BTreeMap<String, ManagedMount>,
-    shared: BTreeMap<String, ManagedMount>,
+struct StateTables {
+    project: BTreeMap<String, StateEntry>,
+    user: BTreeMap<String, StateEntry>,
 }
 
+/// One existing host directory exposed inside the container.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct HostMount {
+struct Bind {
     enabled: Option<bool>,
     source: Option<PathBuf>,
     target: Option<PathBuf>,
-    writable: Option<bool>,
+    access: Option<Permission>,
 }
 
+/// One Silo-managed writable state directory.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct ManagedMount {
+struct StateEntry {
     enabled: Option<bool>,
     target: Option<PathBuf>,
 }
 
 #[derive(Default)]
-struct EffectiveMountTables {
-    host: BTreeMap<String, EffectiveHostMount>,
-    project: BTreeMap<String, EffectiveManagedMount>,
-    shared: BTreeMap<String, EffectiveManagedMount>,
+struct EffectiveEntryTables {
+    binds: BTreeMap<String, EffectiveBind>,
+    project: BTreeMap<String, EffectiveStateEntry>,
+    user: BTreeMap<String, EffectiveStateEntry>,
 }
 
 #[derive(Serialize)]
-struct EffectiveHostMount {
+struct EffectiveBind {
     enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<PathBuf>,
-    writable: bool,
+    access: Permission,
 }
 
 #[derive(Serialize)]
-struct EffectiveManagedMount {
+struct EffectiveStateEntry {
     enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<PathBuf>,
@@ -438,15 +506,15 @@ fn start_toml_section(output: &mut String) {
     }
 }
 
-fn deserialize_mounts<'de, D>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<String, Mount>, D::Error>
+fn normalize_mounts<E>(
+    binds: BTreeMap<String, Bind>,
+    state: StateTables,
+) -> std::result::Result<BTreeMap<String, Mount>, E>
 where
-    D: Deserializer<'de>,
+    E: serde::de::Error,
 {
-    let tables = MountTables::deserialize(deserializer)?;
     let mut mounts = BTreeMap::new();
-    for (name, entry) in tables.host {
+    for (name, entry) in binds {
         mounts.insert(
             name,
             Mount {
@@ -454,18 +522,18 @@ where
                 kind: Some(MountKind::Host),
                 source: entry.source,
                 target: entry.target,
-                writable: entry.writable,
+                access: entry.access,
             },
         );
     }
     for (kind, entries) in [
-        (MountKind::ProjectState, tables.project),
-        (MountKind::SharedState, tables.shared),
+        (MountKind::ProjectState, state.project),
+        (MountKind::UserState, state.user),
     ] {
         for (name, entry) in entries {
             if mounts.contains_key(&name) {
-                return Err(D::Error::custom(format!(
-                    "mount `{name}` is defined in more than one category"
+                return Err(E::custom(format!(
+                    "entry `{name}` is defined in more than one bind or state category"
                 )));
             }
             mounts.insert(
@@ -475,7 +543,7 @@ where
                     kind: Some(kind),
                     source: None,
                     target: entry.target,
-                    writable: None,
+                    access: None,
                 },
             );
         }
@@ -483,16 +551,7 @@ where
     Ok(mounts)
 }
 
-fn deserialize_optional_mounts<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<BTreeMap<String, Mount>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_mounts(deserializer).map(Some)
-}
-
-/// The source and sharing lifetime of a named mount.
+/// The source and persistence scope of a normalized runtime mount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MountKind {
@@ -500,12 +559,12 @@ pub enum MountKind {
     Host,
     /// Silo-managed storage private to one canonical project path.
     ProjectState,
-    /// Silo-managed storage reused by every project with the same mount name.
-    SharedState,
+    /// Silo-managed storage reused by this user across projects.
+    UserState,
 }
 
 /// Effective access passed to the container runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Permission {
     /// The container can read the source but not modify it.
@@ -630,16 +689,14 @@ impl Config {
         if let Some(shell) = project.shell {
             self.shell = Some(shell);
         }
-        if let Some(read_only_git) = project.read_only_git {
-            self.read_only_git = read_only_git;
+        if let Some(read_only) = project.workspace.read_only {
+            self.workspace.read_only = read_only;
         }
-        if let Some(mounts) = project.mounts {
-            for (name, overlay) in mounts {
-                match self.mounts.get_mut(&name) {
-                    Some(base) => merge_mount(base, overlay),
-                    None => {
-                        self.mounts.insert(name, overlay);
-                    }
+        for (name, overlay) in project.mounts {
+            match self.mounts.get_mut(&name) {
+                Some(base) => merge_mount(base, overlay),
+                None => {
+                    self.mounts.insert(name, overlay);
                 }
             }
         }
@@ -719,13 +776,12 @@ impl Config {
     }
 
     /// Rejects impossible resource limits and incomplete or malformed enabled
-    /// mounts. Host source existence is checked later at `silo run`, since the
-    /// file system can change between commands.
+    /// binds and state. Bind source existence is checked later at `silo run`,
+    /// since the file system can change between commands.
     ///
     /// # Errors
     ///
-    /// Returns an error describing an invalid resource or every invalid
-    /// shared entry.
+    /// Returns an error describing an invalid resource or configured entry.
     fn validate(&self) -> Result<()> {
         if self.container.cpus == Some(0) {
             return Err(anyhow!(
@@ -742,6 +798,9 @@ impl Config {
                 "invalid `container.memory` config option: memory must not be empty"
             ));
         }
+
+        validate_read_only_paths(&self.workspace.read_only)?;
+
         let mut forward_problems = Vec::new();
         for (name, entry) in &self.forward {
             let valid_name = name.bytes().enumerate().all(|(index, byte)| {
@@ -772,7 +831,7 @@ impl Config {
 
         let mut problems: Vec<String> = Vec::new();
         for (name, entry) in &self.mounts {
-            let label = format!("mount `{name}`");
+            let label = format!("bind or state entry `{name}`");
             if !valid_mount_name(name) {
                 problems.push(format!(
                     "{label}: name must start with an ASCII letter or number and contain only ASCII letters, numbers, `_`, or `-`"
@@ -792,14 +851,17 @@ impl Config {
                 continue;
             }
             let Some(kind) = entry.kind else {
-                problems.push(format!("{label}: enabled entry has no mount category"));
+                problems.push(format!("{label}: enabled entry has no config category"));
                 continue;
             };
             if entry.target.is_none() {
                 problems.push(format!("{label}: enabled entry is missing `target`"));
             }
             if kind == MountKind::Host && entry.source.is_none() {
-                problems.push(format!("{label}: host entry is missing `source`"));
+                problems.push(format!("{label}: bind is missing `source`"));
+            }
+            if kind == MountKind::Host && entry.access.is_none() {
+                problems.push(format!("{label}: bind is missing `access`"));
             }
         }
         if problems.is_empty() {
@@ -811,10 +873,81 @@ impl Config {
             "entries"
         };
         Err(anyhow!(
-            "invalid mount {noun} in the `mounts` config option: {}",
+            "invalid bind or state {noun}: {}",
             problems.join("; ")
         ))
     }
+}
+
+/// Rejects unsafe or equivalent read-only targets as one config error.
+fn validate_read_only_paths(paths: &[PathBuf]) -> Result<()> {
+    // Compare normalized targets so equivalent entries do not produce
+    // repeated overlay mounts.
+    let mut normalized_paths = BTreeSet::new();
+    let mut problems = Vec::new();
+    for path in paths {
+        match normalize_read_only_path(path) {
+            Ok(normalized) if !normalized_paths.insert(normalized.clone()) => {
+                problems.push(format!(
+                    "path `{}` duplicates `{}` after normalization",
+                    path.display(),
+                    normalized.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(reason) => problems.push(format!("path `{}` {reason}", path.display())),
+        }
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    let noun = if problems.len() == 1 {
+        "entry"
+    } else {
+        "entries"
+    };
+    Err(anyhow!(
+        "invalid {noun} in the `workspace.read_only` config option: {}",
+        problems.join("; ")
+    ))
+}
+
+/// Normalizes a project-relative read-only target without consulting the
+/// filesystem. Parent components may cancel an earlier normal component but
+/// must never escape the project root.
+pub(crate) fn normalize_read_only_path(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    if path.as_os_str().is_empty() {
+        return Err(anyhow!("is empty"));
+    }
+    if path.is_absolute() {
+        return Err(anyhow!("must be relative to the project root"));
+    }
+
+    let text = path.to_str().ok_or_else(|| anyhow!("is not valid UTF-8"))?;
+    if text.contains([':', '\n', '\r']) {
+        return Err(anyhow!(
+            "must not contain `:`, a newline, or a carriage return"
+        ));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if normalized.pop() => {}
+            Component::ParentDir => return Err(anyhow!("must not escape the project root")),
+            Component::Normal(component) => normalized.push(component),
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(anyhow!("must be relative to the project root"));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    Ok(normalized)
 }
 
 /// Deserializes one TOML document and records every key ignored by the target
@@ -861,9 +994,7 @@ impl ProjectConfig {
         {
             *dockerfile = project_root.join(&*dockerfile);
         }
-        if let Some(mounts) = &mut self.mounts {
-            resolve_mount_sources(mounts, project_root);
-        }
+        resolve_mount_sources(&mut self.mounts, project_root);
     }
 }
 
@@ -872,7 +1003,7 @@ fn merge_mount(base: &mut Mount, overlay: Mount) {
     if overlay_kind.is_some() && overlay_kind != base.kind() {
         base.source = None;
         base.target = None;
-        base.writable = None;
+        base.access = None;
     }
     if overlay.enabled.is_some() {
         base.enabled = overlay.enabled;
@@ -886,8 +1017,8 @@ fn merge_mount(base: &mut Mount, overlay: Mount) {
     if overlay.target.is_some() {
         base.target = overlay.target;
     }
-    if overlay.writable.is_some() {
-        base.writable = overlay.writable;
+    if overlay.access.is_some() {
+        base.access = overlay.access;
     }
 }
 

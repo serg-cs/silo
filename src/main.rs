@@ -9,7 +9,7 @@ mod config;
 mod container;
 mod forward;
 
-use cli::{Cli, Command, ConfigCommand, ContainersCommand, ImageCommand, MountsCommand};
+use cli::{Cli, Command, ConfigCommand, ContainersCommand, ImageCommand, StateCommand};
 
 fn main() -> ExitCode {
     if let Some(result) = forward::run_internal_broker() {
@@ -29,11 +29,11 @@ fn main() -> ExitCode {
             };
             return result.unwrap_or_else(|err| fail(&err));
         }
-        Command::Mounts { command } => {
+        Command::State { command } => {
             let result = match command {
-                None | Some(MountsCommand::List) => container::print_mounts(),
-                Some(MountsCommand::Delete { selector }) => {
-                    container::delete_selected_mount(selector)
+                None | Some(StateCommand::List) => container::print_state(),
+                Some(StateCommand::Delete { selector }) => {
+                    container::delete_selected_state(selector)
                 }
             };
             return result.unwrap_or_else(|err| fail(&err));
@@ -64,7 +64,7 @@ fn main() -> ExitCode {
             config.apply_container_overrides(cpus.map(std::num::NonZeroUsize::get), memory);
             container::run_image(&config, &project, &command, isolated)
         }
-        Command::Containers { .. } | Command::Mounts { .. } => {
+        Command::Containers { .. } | Command::State { .. } => {
             unreachable!("management commands returned before config")
         }
         Command::Quick(args) => quick_command(&config, &args)
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn builtin_commands_covers_the_project_command_set() {
         let names = builtin_commands();
-        for expected in ["config", "run", "containers", "mounts", "image", "help"] {
+        for expected in ["config", "run", "containers", "state", "image", "help"] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "missing {expected}"
@@ -361,34 +361,34 @@ mod tests {
     }
 
     #[test]
-    fn mounts_defaults_to_list_and_parses_delete_alias() {
+    fn state_defaults_to_list_and_parses_delete_alias() {
         assert!(matches!(
-            parse(&["silo", "mounts"]),
-            Command::Mounts { command: None }
+            parse(&["silo", "state"]),
+            Command::State { command: None }
         ));
         assert!(matches!(
-            parse(&["silo", "mounts", "list"]),
-            Command::Mounts {
-                command: Some(MountsCommand::List)
+            parse(&["silo", "state", "list"]),
+            Command::State {
+                command: Some(StateCommand::List)
             }
         ));
         for command in ["delete", "rm"] {
-            let Command::Mounts {
-                command: Some(MountsCommand::Delete { selector }),
-            } = parse(&["silo", "mounts", command, "cargo"])
+            let Command::State {
+                command: Some(StateCommand::Delete { selector }),
+            } = parse(&["silo", "state", command, "cargo"])
             else {
-                panic!("expected mount delete");
+                panic!("expected state delete");
             };
             assert_eq!(selector, "cargo");
         }
     }
 
     #[test]
-    fn state_is_not_retained_as_a_management_alias() {
-        let Command::Quick(arguments) = parse(&["silo", "state"]) else {
-            panic!("state should no longer be a built-in command");
+    fn mounts_is_not_retained_as_a_management_alias() {
+        let Command::Quick(arguments) = parse(&["silo", "mounts"]) else {
+            panic!("mounts should no longer be a built-in command");
         };
-        assert_eq!(arguments, ["state"]);
+        assert_eq!(arguments, ["mounts"]);
     }
 
     #[test]

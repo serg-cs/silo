@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="How Silo discovers projects, identifies containers, coordinates sessions, resolves mounts, and forwards host services.">
+    <meta name="description" content="How Silo discovers projects, identifies containers, coordinates sessions, resolves storage, and forwards host services.">
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/how-it-works/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
@@ -34,9 +34,9 @@
         <section id="run-flow">
           <h2><a href="#run-flow">From command to workspace</a></h2>
           <ol>
-            <li><strong>Discover.</strong> Canonicalize the current directory and select a <code>.silo.toml</code> marker, Git root, or the current directory itself.</li>
+            <li><strong>Discover.</strong> Canonicalize the current directory and select a <code>.silo.toml</code> marker, the nearest Git or Jujutsu root, or the current directory itself.</li>
             <li><strong>Configure.</strong> Load built-in defaults, global TOML, and the project TOML; warn about unknown or unreachable entries; then apply invocation resource flags.</li>
-            <li><strong>Validate.</strong> Resolve the lifecycle, image contract, named mounts, configured Git metadata access, resource limits, and enabled forwards.</li>
+            <li><strong>Validate.</strong> Resolve the lifecycle, image contract, binds, managed state, configured read-only workspace paths, resource limits, and enabled forwards.</li>
             <li><strong>Prepare.</strong> Confirm the image/runtime state and establish managed storage or a forwarding lease where needed.</li>
             <li><strong>Run.</strong> Reuse or create the shared project container, or create a one-shot isolated container, then attach the requested shell or command.</li>
             <li><strong>Clean up.</strong> Restore the terminal, release session and forwarding leases, and remove isolated runtime resources.</li>
@@ -59,11 +59,11 @@
             <li>The image digest and lifecycle.</li>
             <li>Host user and group IDs.</li>
             <li>Project root and working directory.</li>
-            <li>Git overlay, named mount sources, targets, and access modes.</li>
+            <li>Read-only workspace overlays, bind and state sources, targets, and access modes.</li>
             <li>Forward network, CPU count, memory, and creation command.</li>
           </ul>
           <p>If the running or stopped container does not match the desired specification, Silo coordinates replacement rather than silently reusing the wrong environment. Image changes during creation are detected and retried within a bounded window.</p>
-          <p>Ephemeral state inside the old container is lost on replacement. The source tree and configured managed mounts are host-backed and remain available.</p>
+          <p>Ephemeral state inside the old container is lost on replacement. The source tree, binds, and configured managed state are host-backed and remain available.</p>
         </section>
 
         <section id="shared-lifecycle">
@@ -77,21 +77,21 @@
         <section id="isolated-lifecycle">
           <h2><a href="#isolated-lifecycle">Isolated lifecycle</a></h2>
           <p>An isolated run creates a unique container, starts it in the foreground, forwards relevant signals, and deletes the container after the child exits. Interrupted or failed creation paths also attempt cleanup.</p>
-          <p>The built-in isolated mode uses the same project mount, Git overlay, named host mounts, and managed storage as shared mode. Its container filesystem is disposable, but configured mount state is not.</p>
-          <p>Custom images use the same one-shot host lifecycle but preserve their own image-defined command and user. Silo skips private managed mounts and rejects <code>~/</code> host targets because those features depend on the built-in image's user contract.</p>
+          <p>The built-in isolated mode uses the same project mount, read-only overlays, binds, and managed state as shared mode. Its container filesystem is disposable, but configured state is not.</p>
+          <p>Custom images use the same one-shot host lifecycle but preserve their own image-defined command and user. Silo skips private managed state and rejects <code>~/</code> bind targets because those features depend on the built-in image's user contract.</p>
         </section>
 
         <section id="mount-resolution">
           <h2><a href="#mount-resolution">Mount resolution and storage</a></h2>
-          <p>Enabled host sources are expanded, canonicalized, and verified as directories at run time. Managed mounts receive deterministic host paths and opaque IDs. Silo creates their parent directories with private permissions, guards mutations with file locks, and stores project-path metadata beside project mounts.</p>
+          <p>Enabled bind sources are expanded, canonicalized, and verified as directories at run time. Managed state receives deterministic host paths and opaque IDs. Silo creates parent directories with private permissions, guards mutations with file locks, and stores project-path metadata beside project-scoped state.</p>
           <p>Before using or deleting managed state, Silo checks that directories are real rather than symlinks, ownership metadata matches the expected project, and the derived ID/path are consistent. Deletion additionally asks the runtime whether any container still references the directory.</p>
-          <p>Mounts are sorted from shallower to deeper targets so nested overrides are deterministic. A later duplicate target wins, and potentially surprising overlaps—especially writable paths under the read-only Git target—produce warnings.</p>
+          <p>Runtime mounts are sorted from shallower to deeper targets so nested overrides are deterministic. A later duplicate target wins, and read-write binds or state at or below configured read-only workspace paths produce warnings.</p>
         </section>
 
-        <section id="git-overlay">
-          <h2><a href="#git-overlay">Git metadata overlay</a></h2>
-          <p>When enabled, Silo canonicalizes <code>&lt;project&gt;/.git</code> and mounts it separately at the corresponding path inside the writable project tree. It applies the overlay only when the resolved path remains inside the canonical project root; a missing directory or a symlink escaping the project is not mounted.</p>
-          <p>This is a focused guardrail, not a full sandbox policy. Tools can still edit source files, and another explicitly writable mount can overlap the protected destination. Silo warns about known overlap but preserves the user's configured mount order.</p>
+        <section id="read-only-overlays">
+          <h2><a href="#read-only-overlays">Read-only project overlays</a></h2>
+          <p>For each configured relative path, Silo canonicalizes the host directory and mounts it separately at the corresponding path inside the writable project tree. It applies an overlay only when the resolved path remains inside the canonical project root; a missing path, broken symlink, or symlink escaping the project is not mounted. Existing regular files fail resolution because Apple container does not support them as bind-mount sources.</p>
+          <p>This is a focused guardrail, not a full sandbox policy. Tools can still edit source files, and an explicit read-write bind can overlap the protected destination. Silo warns about known overlap but preserves deterministic runtime mount order.</p>
         </section>
 
         <section id="forwarding">
@@ -118,7 +118,7 @@ SILO_POSTGRES_PORT=5432</code></pre>
         <section id="runtime-boundary">
           <h2><a href="#runtime-boundary">Runtime boundary</a></h2>
           <p>Apple's <code>container</code> CLI owns Linux kernels, image storage, networking, VM execution, and low-level mount behavior. Silo owns only the resources carrying its validated labels and delegates commands through the CLI.</p>
-          <p>Image building is the exception where Silo intentionally treats Apple's user-global builder and dangling build images as disposable storage. Container and mount management remains ownership-scoped and conservative.</p>
+          <p>Image building is the exception where Silo intentionally treats Apple's user-global builder and dangling build images as disposable storage. Container and managed-state operations remain ownership-scoped and conservative.</p>
         </section>
 
         <nav class="page-links" aria-label="Adjacent documentation pages">

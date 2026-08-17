@@ -18,7 +18,9 @@ use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets::NO
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, Container, Forward, Mount, MountKind, Permission, Shell};
+use crate::config::{
+    Config, Container, Forward, Mount, MountKind, Permission, Shell, normalize_read_only_path,
+};
 use crate::forward;
 
 /// Name of the image this tool builds and runs.
@@ -55,6 +57,9 @@ const PROJECT_MARKER: &str = ".silo.toml";
 
 /// Directory that implicitly marks a project root when no Silo marker exists.
 const GIT_DIR: &str = ".git";
+
+/// Jujutsu workspace directory used as a project marker alongside Git.
+const JJ_DIR: &str = ".jj";
 
 /// Prefix of every `--name` silo passes to `container run`.
 const CONTAINER_NAME_PREFIX: &str = "silo-";
@@ -100,10 +105,10 @@ const GUEST_READY_TIMEOUT: Duration = Duration::from_mins(1);
 /// directory is mounted into it as `<home>/<project-name>`.
 const CONTAINER_HOME: &str = "/home/silo";
 
-const MANAGED_MOUNT_ID_PREFIX: &str = "silo-mount-";
+const MANAGED_STATE_ID_PREFIX: &str = "silo-state-";
 const PROJECT_ROOT_METADATA: &str = ".project-root";
 const STATE_PROJECT_VALUE: &str = "project";
-const STATE_SHARED_VALUE: &str = "shared";
+const STATE_USER_VALUE: &str = "user";
 
 /// One named configurable mount resolved for this run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +117,13 @@ struct ResolvedMount {
     source: ResolvedMountSource,
     dest: PathBuf,
     access: Permission,
+}
+
+/// One project-owned path overlaid read-only after the writable project bind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadOnlyProjectPath {
+    host: PathBuf,
+    relative: PathBuf,
 }
 
 struct ResolvedIsolatedMounts {
@@ -166,14 +178,14 @@ fn global_build_lock_root() -> PathBuf {
 impl MountLock {
     fn acquire() -> Result<Self> {
         let state_root = managed_state_root_from_env().ok_or_else(|| {
-            anyhow!("managed mounts require XDG_STATE_HOME or HOME to be absolute")
+            anyhow!("managed state requires XDG_STATE_HOME or HOME to be absolute")
         })?;
         ensure_private_directory(&state_root, "Silo state root")?;
-        Self::acquire_at(&state_root.join("mounts"))
+        Self::acquire_at(&state_root.join("state"))
     }
 
     fn acquire_at(root: &Path) -> Result<Self> {
-        Self::acquire_at_for(root, "managed mount")
+        Self::acquire_at_for(root, "managed state")
     }
 
     fn acquire_at_for(root: &Path, description: &str) -> Result<Self> {
@@ -209,21 +221,21 @@ impl Drop for MountLock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum StateScope {
     Project,
-    Shared,
+    User,
 }
 
 impl StateScope {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Project => STATE_PROJECT_VALUE,
-            Self::Shared => STATE_SHARED_VALUE,
+            Self::User => STATE_USER_VALUE,
         }
     }
 
     const fn config_kind(self) -> &'static str {
         match self {
             Self::Project => "project",
-            Self::Shared => "shared",
+            Self::User => "user",
         }
     }
 }
@@ -243,33 +255,33 @@ fn ensure_managed_mounts(mounts: &[ResolvedMount]) -> Result<()> {
 
 fn ensure_managed_mount(mount: &ManagedMount) -> Result<()> {
     let root = managed_mount_root_from_path(&mount.path, mount.scope)?;
-    ensure_private_directory(root, "managed mount root")?;
+    ensure_private_directory(root, "managed state root")?;
     match (&mount.scope, mount.project.as_deref()) {
-        (StateScope::Shared, None) => {
-            ensure_private_directory(&root.join("shared"), "shared mount root")?;
+        (StateScope::User, None) => {
+            ensure_private_directory(&root.join("user"), "user state root")?;
         }
         (StateScope::Project, Some(project)) => {
-            let projects = root.join("projects");
+            let projects = root.join("project");
             let project_dir = projects.join(project_digest(project));
-            ensure_private_directory(&projects, "project mount root")?;
-            ensure_private_directory(&project_dir, "project mount directory")?;
+            ensure_private_directory(&projects, "project state root")?;
+            ensure_private_directory(&project_dir, "project state directory")?;
             ensure_project_metadata(&project_dir, project)?;
-            ensure_private_directory(&project_dir.join("mounts"), "project mount collection")?;
+            ensure_private_directory(&project_dir.join("entries"), "project state collection")?;
         }
-        _ => return Err(anyhow!("managed mount scope and project identity disagree")),
+        _ => return Err(anyhow!("managed state scope and project identity disagree")),
     }
-    ensure_private_directory(&mount.path, "managed mount directory")?;
+    ensure_private_directory(&mount.path, "managed state directory")?;
     Ok(())
 }
 
 fn managed_mount_root_from_path(path: &Path, scope: StateScope) -> Result<&Path> {
     let levels = match scope {
-        StateScope::Shared => 2,
+        StateScope::User => 2,
         StateScope::Project => 4,
     };
     path.ancestors()
         .nth(levels)
-        .ok_or_else(|| anyhow!("managed mount `{}` has no storage root", path.display()))
+        .ok_or_else(|| anyhow!("managed state `{}` has no storage root", path.display()))
 }
 
 fn ensure_project_metadata(project_dir: &Path, project: &Path) -> Result<()> {
@@ -278,23 +290,23 @@ fn ensure_project_metadata(project_dir: &Path, project: &Path) -> Result<()> {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(anyhow!(
-                    "refusing to use project mount metadata `{}` because it is not a real file",
+                    "refusing to use project state metadata `{}` because it is not a real file",
                     path.display()
                 ));
             }
             let stored = fs::read(&path).with_context(|| {
-                format!("could not read project mount metadata `{}`", path.display())
+                format!("could not read project state metadata `{}`", path.display())
             })?;
             if stored != project.as_os_str().as_bytes() {
                 return Err(anyhow!(
-                    "refusing to use project mount directory `{}` because its project metadata does not match `{}`",
+                    "refusing to use project state directory `{}` because its project metadata does not match `{}`",
                     project_dir.display(),
                     project.display()
                 ));
             }
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).with_context(|| {
                 format!(
-                    "could not protect project mount metadata `{}`",
+                    "could not protect project state metadata `{}`",
                     path.display()
                 )
             })?;
@@ -304,7 +316,7 @@ fn ensure_project_metadata(project_dir: &Path, project: &Path) -> Result<()> {
         Err(err) => {
             return Err(err).with_context(|| {
                 format!(
-                    "could not inspect project mount metadata `{}`",
+                    "could not inspect project state metadata `{}`",
                     path.display()
                 )
             });
@@ -328,26 +340,26 @@ fn ensure_project_metadata(project_dir: &Path, project: &Path) -> Result<()> {
             .open(&temporary)
             .with_context(|| {
                 format!(
-                    "could not create project mount metadata `{}`",
+                    "could not create project state metadata `{}`",
                     temporary.display()
                 )
             })?;
         file.write_all(project.as_os_str().as_bytes())
             .with_context(|| {
                 format!(
-                    "could not write project mount metadata `{}`",
+                    "could not write project state metadata `{}`",
                     temporary.display()
                 )
             })?;
         file.sync_all().with_context(|| {
             format!(
-                "could not sync project mount metadata `{}`",
+                "could not sync project state metadata `{}`",
                 temporary.display()
             )
         })?;
         fs::rename(&temporary, &path).with_context(|| {
             format!(
-                "could not publish project mount metadata `{}`",
+                "could not publish project state metadata `{}`",
                 path.display()
             )
         })?;
@@ -420,7 +432,7 @@ fn effective_mounts(mounts: &[ResolvedMount]) -> impl Iterator<Item = &ResolvedM
 /// Creation-time project setup shared by identity and command construction.
 #[derive(Default)]
 struct ConfigMounts {
-    git: Option<PathBuf>,
+    read_only: Vec<ReadOnlyProjectPath>,
     named: Vec<ResolvedMount>,
     network: Option<String>,
     guest_forwarding: Option<forward::GuestForwarding>,
@@ -449,7 +461,7 @@ impl Project {
     /// Applies container-specific validation after config-independent project
     /// root discovery has completed.
     fn from_root(root: PathBuf) -> Result<Self> {
-        // Validate before persisting the path in labels or mount metadata.
+        // Validate before persisting the path in labels or state metadata.
         bind_host_path(&root)?;
         let workdir = shared_dir_name(&root)?;
         let id = project_container_id(&root);
@@ -477,12 +489,15 @@ fn project_root_from_path(cwd: &Path) -> Result<PathBuf> {
 /// Selects a project root from an already-canonical starting directory.
 ///
 /// An explicit Silo marker anywhere in the ancestor chain takes precedence
-/// over every Git directory. Within each marker type, the nearest ancestor
-/// wins. Without either marker, the exact starting directory is the project.
+/// over every VCS directory. Otherwise the nearest Git or Jujutsu directory
+/// wins. Without a marker, the exact starting directory is the project.
 fn discover_project_root(cwd: &Path) -> PathBuf {
     cwd.ancestors()
         .find(|dir| dir.join(PROJECT_MARKER).is_file())
-        .or_else(|| cwd.ancestors().find(|dir| dir.join(GIT_DIR).is_dir()))
+        .or_else(|| {
+            cwd.ancestors()
+                .find(|dir| dir.join(GIT_DIR).is_dir() || dir.join(JJ_DIR).is_dir())
+        })
         .unwrap_or(cwd)
         .to_path_buf()
 }
@@ -589,16 +604,36 @@ struct ContainerIdentity {
     spec: String,
 }
 
-/// Returns the host side of the read-only `.git` mount: the canonical path
-/// of the project's `.git` when the config enables the mount and `.git`
-/// resolves to a real path inside the project. A symlink escaping the
-/// project is not mounted, so no host path outside it becomes visible.
-fn git_mount_host(project_root: &Path, read_only_git: bool) -> Option<PathBuf> {
-    if !read_only_git {
-        return None;
+/// Resolves existing read-only project paths without exposing symlink targets
+/// outside the canonical project root. Missing and broken paths are omitted.
+///
+/// # Errors
+///
+/// Returns an error when an existing path is not a directory, because Apple
+/// container does not support regular files as bind-mount sources.
+fn resolve_read_only_paths(
+    project_root: &Path,
+    paths: &[PathBuf],
+) -> Result<Vec<ReadOnlyProjectPath>> {
+    let Some(root) = fs::canonicalize(project_root).ok() else {
+        return Ok(Vec::new());
+    };
+
+    let mut resolved = Vec::with_capacity(paths.len());
+    for path in paths {
+        let relative = normalize_read_only_path(path)?;
+        let Some(host) = mount_host(&project_root.join(&relative), &root) else {
+            continue;
+        };
+        if !host.is_dir() {
+            return Err(anyhow!(
+                "read-only project path `{}` must be a directory because Apple container does not support bind-mounting individual files",
+                relative.display()
+            ));
+        }
+        resolved.push(ReadOnlyProjectPath { host, relative });
     }
-    let root = fs::canonicalize(project_root).ok()?;
-    mount_host(&project_root.join(GIT_DIR), &root)
+    Ok(resolved)
 }
 
 /// Returns the canonical path of `path` when it resolves to a real path
@@ -610,13 +645,13 @@ fn mount_host(path: &Path, root_canonical: &Path) -> Option<PathBuf> {
     host.starts_with(root_canonical).then_some(host)
 }
 
-/// Resolves enabled named mounts for this project. Host sources are expanded
-/// and canonicalized; managed mounts receive deterministic private host
+/// Resolves enabled binds and state for this project. Bind sources are expanded
+/// and canonicalized; managed state receives deterministic private host
 /// directories. Sorting parents before children makes nested overrides stable.
 ///
 /// # Errors
 ///
-/// Returns an error naming the host mount when its source does not exist
+/// Returns an error naming the bind when its source does not exist
 /// or cannot be resolved (e.g. a broken symlink).
 fn resolve_named_mounts(
     mounts: &BTreeMap<String, Mount>,
@@ -633,17 +668,17 @@ fn resolve_named_mounts(
             .expect("enabled mounts were validated");
         let source = match kind {
             MountKind::Host => {
-                let configured = entry.host_source().expect("host mounts were validated");
+                let configured = entry.host_source().expect("binds were validated");
                 let host = fs::canonicalize(expand_tilde(configured, home)).with_context(|| {
                     format!(
-                        "cannot resolve source `{}` for host mount `{name}` at `{}` (missing path or broken symlink?)",
+                        "cannot resolve source `{}` for bind `{name}` at `{}` (missing path or broken symlink?)",
                         configured.display(),
                         dest.display()
                     )
                 })?;
                 if !host.is_dir() {
                     return Err(anyhow!(
-                        "source `{}` for host mount `{name}` must be a directory",
+                        "source `{}` for bind `{name}` must be a directory",
                         configured.display()
                     ));
                 }
@@ -656,8 +691,8 @@ fn resolve_named_mounts(
                 xdg_state_home,
                 home,
             )?),
-            MountKind::SharedState => ResolvedMountSource::Managed(managed_mount(
-                StateScope::Shared,
+            MountKind::UserState => ResolvedMountSource::Managed(managed_mount(
+                StateScope::User,
                 name,
                 None,
                 xdg_state_home,
@@ -683,7 +718,7 @@ fn resolve_named_mounts(
 }
 
 fn managed_mount_root(xdg_state_home: Option<&Path>, home: Option<&Path>) -> Result<PathBuf> {
-    Ok(managed_state_root(xdg_state_home, home)?.join("mounts"))
+    Ok(managed_state_root(xdg_state_home, home)?.join("state"))
 }
 
 fn managed_state_root(xdg_state_home: Option<&Path>, home: Option<&Path>) -> Result<PathBuf> {
@@ -694,7 +729,7 @@ fn managed_state_root(xdg_state_home: Option<&Path>, home: Option<&Path>) -> Res
             home.filter(|path| path.is_absolute() && !path.as_os_str().is_empty())
                 .map(|path| path.join(".local/state"))
         })
-        .ok_or_else(|| anyhow!("managed mounts require XDG_STATE_HOME or HOME to be absolute"))?;
+        .ok_or_else(|| anyhow!("managed state requires XDG_STATE_HOME or HOME to be absolute"))?;
     Ok(state_home.join("silo"))
 }
 
@@ -730,22 +765,22 @@ fn managed_mount_at_root(
     let name_digest = hex_digest(Sha256::digest(name.as_bytes()));
     let id = match (scope, project) {
         (StateScope::Project, Some(project)) => format!(
-            "{MANAGED_MOUNT_ID_PREFIX}p-{}-{}",
+            "{MANAGED_STATE_ID_PREFIX}p-{}-{}",
             &project_digest(project)[..PROJECT_DIGEST_HEX_LEN],
             &name_digest[..16]
         ),
-        (StateScope::Shared, None) => {
-            format!("{MANAGED_MOUNT_ID_PREFIX}s-{}", &name_digest[..24])
+        (StateScope::User, None) => {
+            format!("{MANAGED_STATE_ID_PREFIX}u-{}", &name_digest[..24])
         }
         _ => unreachable!("scope and project identity must agree"),
     };
     let path = match (scope, project) {
         (StateScope::Project, Some(project)) => root
-            .join("projects")
+            .join("project")
             .join(project_digest(project))
-            .join("mounts")
+            .join("entries")
             .join(name),
-        (StateScope::Shared, None) => root.join("shared").join(name),
+        (StateScope::User, None) => root.join("user").join(name),
         _ => unreachable!("scope and project identity must agree"),
     };
     ManagedMount {
@@ -773,29 +808,29 @@ fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Returns warnings for named mounts whose intent a later mount silently
-/// defeats: a read-write named mount at or under the `.git` target lets
-/// tools in the container modify version control state despite the
-/// read-only `.git` mount. Duplicate targets are also reported along with the
-/// deterministic winner.
+/// Returns warnings for configured entries whose runtime order silently
+/// defeats their intent: a read-write bind or state entry at or under a protected project target
+/// restores write access. Duplicate named targets are also reported along
+/// with the deterministic winner.
 fn mount_conflicts(
     project_dest: &Path,
-    git_mounted: bool,
+    read_only: &[ReadOnlyProjectPath],
     mounts: &[ResolvedMount],
 ) -> Vec<String> {
-    let git_dest = git_mounted.then(|| project_dest.join(".git"));
     let mut warnings = Vec::new();
     for entry in effective_mounts(mounts) {
-        if entry.access == Permission::ReadWrite
-            && git_dest
-                .as_deref()
-                .is_some_and(|git_dest| entry.dest.starts_with(git_dest))
-        {
-            warnings.push(format!(
-                "the read-write mount `{}` at `{}` overlaps the read-only `.git` mount, so tools in the container can modify version control state",
-                entry.name,
-                entry.dest.display()
-            ));
+        if entry.access == Permission::ReadWrite {
+            for protected in read_only {
+                let protected_dest = project_path_target(project_dest, &protected.relative);
+                if entry.dest.starts_with(&protected_dest) {
+                    warnings.push(format!(
+                        "the read-write entry `{}` at `{}` overlaps the read-only workspace path `{}`, so tools in the container can modify it",
+                        entry.name,
+                        entry.dest.display(),
+                        protected.relative.display()
+                    ));
+                }
+            }
         }
     }
     for (index, entry) in mounts.iter().enumerate() {
@@ -1155,7 +1190,7 @@ fn runtime_preflight_with(
 }
 
 /// Runs an ephemeral create/start lifecycle. Built-in isolated containers use
-/// the same host-backed managed mounts as shared containers. Custom images
+/// the same host-backed managed state as shared containers. Custom images
 /// omit them because their image-defined user cannot safely be granted access
 /// to private host-owned storage.
 fn run_isolated(
@@ -1177,9 +1212,8 @@ fn run_isolated(
     let id = isolated_container_id();
     // Build the command first: it only fails on path validation, before any
     // container exists.
-    let git_mount = git_mount_host(&project.root, config.read_only_git);
     let config_mounts = ConfigMounts {
-        git: git_mount,
+        read_only: resolve_read_only_paths(&project.root, &config.workspace.read_only)?,
         named,
         network: forwarding.network_name().map(ToString::to_string),
         guest_forwarding: if custom_image {
@@ -1190,7 +1224,7 @@ fn run_isolated(
     };
     for (scope, name) in skipped {
         eprintln!(
-            "warning: {scope} mount `{name}` was skipped for a custom image because its image-defined user may not be able to access Silo's private host storage; use a host mount with permissions appropriate for the image user"
+            "warning: {scope} state `{name}` was skipped for a custom image because its image-defined user may not be able to access Silo's private host storage; use a bind with permissions appropriate for the image user"
         );
     }
     let mount_lock = needs_mount_lock(&config_mounts.named)
@@ -1208,11 +1242,11 @@ fn run_isolated(
         shell,
         forwarding.environment(custom_image),
     )?;
-    // Warn about shared mounts whose intent a later mount defeats, e.g. a
-    // read-write shared mount overlapping the read-only `.git`.
+    // Warn about named mounts whose later placement restores write access to
+    // a protected project path.
     for warning in mount_conflicts(
         &project.workdir,
-        config_mounts.git.is_some(),
+        &config_mounts.read_only,
         &config_mounts.named,
     ) {
         eprintln!("warning: {warning}");
@@ -1249,7 +1283,7 @@ fn run_isolated(
 }
 
 /// Applies the image compatibility policy before resolving mount sources, so
-/// skipped managed mounts never require or inspect managed host storage.
+/// skipped managed state never requires or inspects managed host storage.
 fn resolve_isolated_named_mounts(
     mounts: &BTreeMap<String, Mount>,
     project_root: &Path,
@@ -1264,7 +1298,7 @@ fn resolve_isolated_named_mounts(
     Ok(ResolvedIsolatedMounts { named, skipped })
 }
 
-/// Rejects enabled host mounts whose target depends on the built-in image's
+/// Rejects enabled binds whose target depends on the built-in image's
 /// home-directory contract.
 fn validate_custom_image_mounts(
     mounts: &BTreeMap<String, Mount>,
@@ -1285,7 +1319,7 @@ fn validate_custom_image_mounts(
             .is_some_and(|target| target.starts_with("~/"))
         {
             return Err(anyhow!(
-                "host mount `{name}` uses home-relative target `{}` but custom images have no Silo-defined home; use a project-relative `./...` target or an absolute target",
+                "bind `{name}` uses home-relative target `{}` but custom images have no Silo-defined home; use a project-relative `./...` target or an absolute target",
                 target.display()
             ));
         }
@@ -1299,18 +1333,18 @@ fn remove_unavailable_managed_mounts(
 ) -> Vec<(&'static str, String)> {
     let mut skipped = Vec::new();
     mounts.retain(|name, mount| match mount.kind() {
-        Some(kind @ (MountKind::ProjectState | MountKind::SharedState))
+        Some(kind @ (MountKind::ProjectState | MountKind::UserState))
             if custom_image && mount.is_enabled() =>
         {
             let scope = match kind {
                 MountKind::ProjectState => StateScope::Project,
-                MountKind::SharedState => StateScope::Shared,
-                MountKind::Host => unreachable!("matched a managed mount kind"),
+                MountKind::UserState => StateScope::User,
+                MountKind::Host => unreachable!("matched a managed state kind"),
             };
             skipped.push((scope.config_kind(), name.clone()));
             false
         }
-        Some(MountKind::Host | MountKind::ProjectState | MountKind::SharedState) | None => true,
+        Some(MountKind::Host | MountKind::ProjectState | MountKind::UserState) | None => true,
     });
     skipped
 }
@@ -1369,7 +1403,7 @@ fn resolve_config_mounts(
     forwarding: &forward::Session,
 ) -> Result<ConfigMounts> {
     Ok(ConfigMounts {
-        git: git_mount_host(project_root, config.read_only_git),
+        read_only: resolve_read_only_paths(project_root, &config.workspace.read_only)?,
         named: resolve_named_mounts(
             &config.mounts,
             project_root,
@@ -1385,7 +1419,7 @@ fn resolve_config_mounts(
 fn warn_mount_conflicts(project: &Project, config_mounts: &ConfigMounts) {
     for warning in mount_conflicts(
         &project.workdir,
-        config_mounts.git.is_some(),
+        &config_mounts.read_only,
         &config_mounts.named,
     ) {
         eprintln!("warning: {warning}");
@@ -1406,11 +1440,11 @@ pub fn print_containers() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Prints every persistent mount directory owned by Silo.
-pub fn print_mounts() -> Result<ExitCode> {
+/// Prints every persistent state directory owned by Silo.
+pub fn print_state() -> Result<ExitCode> {
     let inventory = mount_inventory()?;
     if inventory.items.is_empty() {
-        println!("No Silo managed mounts.");
+        println!("No Silo managed state.");
     } else {
         println!("{}", render_mount_table(&inventory.items));
     }
@@ -1420,8 +1454,8 @@ pub fn print_mounts() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Permanently deletes one selected, currently unused managed mount.
-pub fn delete_selected_mount(selector: &str) -> Result<ExitCode> {
+/// Permanently deletes one selected, currently unused managed state entry.
+pub fn delete_selected_state(selector: &str) -> Result<ExitCode> {
     let inventory = mount_inventory()?;
     let selected = select_mount(&inventory.items, selector)?.0.clone();
     let _mount_lock = MountLock::acquire()?;
@@ -1434,63 +1468,63 @@ pub fn delete_selected_mount(selector: &str) -> Result<ExitCode> {
     )?;
     if selected != expected {
         return Err(anyhow!(
-            "refusing to delete managed mount `{}` because its path or identity is inconsistent",
+            "refusing to delete managed state `{}` because its path or identity is inconsistent",
             selected.id
         ));
     }
     validate_managed_mount(&selected)?;
     let metadata = fs::symlink_metadata(&selected.path).with_context(|| {
         format!(
-            "managed mount `{}` disappeared before deletion",
+            "managed state `{}` disappeared before deletion",
             selected.id
         )
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(anyhow!(
-            "refusing to delete managed mount `{}` because it is not a real directory",
+            "refusing to delete managed state `{}` because it is not a real directory",
             selected.id
         ));
     }
     if mount_directory_in_use(&selected.path)? {
         return Err(anyhow!(
-            "could not delete managed mount `{}` because a container still references it",
+            "could not delete managed state `{}` because a container still references it",
             selected.id
         ));
     }
     fs::remove_dir_all(&selected.path)
-        .with_context(|| format!("could not delete managed mount `{}`", selected.id))?;
+        .with_context(|| format!("could not delete managed state `{}`", selected.id))?;
     if selected.scope == StateScope::Project {
-        prune_empty_project_mount_directory(&selected.path)?;
+        prune_empty_project_state_directory(&selected.path)?;
     }
     Ok(ExitCode::SUCCESS)
 }
 
 fn validate_managed_mount(mount: &ManagedMount) -> Result<()> {
     let root = managed_mount_root_from_path(&mount.path, mount.scope)?;
-    validate_real_directory(root, "managed mount root")?;
+    validate_real_directory(root, "managed state root")?;
     if let Some(project) = mount.project.as_deref() {
-        validate_real_directory(&root.join("projects"), "project mount root")?;
+        validate_real_directory(&root.join("project"), "project state root")?;
         let project_dir = mount
             .path
             .parent()
             .and_then(Path::parent)
-            .ok_or_else(|| anyhow!("project mount `{}` has no project directory", mount.id))?;
-        validate_real_directory(project_dir, "project mount directory")?;
+            .ok_or_else(|| anyhow!("project state `{}` has no project directory", mount.id))?;
+        validate_real_directory(project_dir, "project state directory")?;
         validate_real_directory(
             mount.path.parent().unwrap_or(&mount.path),
-            "project mount collection",
+            "project state collection",
         )?;
         let stored = read_project_metadata(project_dir)?;
         if stored != project
             || OsStr::new(&project_digest(&stored)) != project_dir.file_name().unwrap_or_default()
         {
             return Err(anyhow!(
-                "refusing to use project mount `{}` because its project metadata is inconsistent",
+                "refusing to use project state `{}` because its project metadata is inconsistent",
                 mount.id
             ));
         }
     } else {
-        validate_real_directory(&root.join("shared"), "shared mount root")?;
+        validate_real_directory(&root.join("user"), "user state root")?;
     }
     Ok(())
 }
@@ -1507,21 +1541,21 @@ fn validate_real_directory(path: &Path, description: &str) -> Result<()> {
     Ok(())
 }
 
-fn prune_empty_project_mount_directory(path: &Path) -> Result<()> {
+fn prune_empty_project_state_directory(path: &Path) -> Result<()> {
     let mounts_dir = path
         .parent()
-        .ok_or_else(|| anyhow!("deleted project mount has no mount collection"))?;
+        .ok_or_else(|| anyhow!("deleted project state has no entry collection"))?;
     if fs::read_dir(mounts_dir)?.next().is_some() {
         return Ok(());
     }
     let project_dir = mounts_dir
         .parent()
-        .ok_or_else(|| anyhow!("deleted project mount has no project directory"))?;
+        .ok_or_else(|| anyhow!("deleted project state has no project directory"))?;
     let mut unexpected = Vec::new();
     for entry in fs::read_dir(project_dir)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name != OsStr::new("mounts") && name != OsStr::new(PROJECT_ROOT_METADATA) {
+        if name != OsStr::new("entries") && name != OsStr::new(PROJECT_ROOT_METADATA) {
             unexpected.push(name);
         }
     }
@@ -1530,19 +1564,19 @@ fn prune_empty_project_mount_directory(path: &Path) -> Result<()> {
     }
     fs::remove_dir(mounts_dir).with_context(|| {
         format!(
-            "could not remove empty project mount collection `{}`",
+            "could not remove empty project state collection `{}`",
             mounts_dir.display()
         )
     })?;
     fs::remove_file(project_dir.join(PROJECT_ROOT_METADATA)).with_context(|| {
         format!(
-            "could not remove project mount metadata `{}`",
+            "could not remove project state metadata `{}`",
             project_dir.display()
         )
     })?;
     fs::remove_dir(project_dir).with_context(|| {
         format!(
-            "could not remove empty project mount directory `{}`",
+            "could not remove empty project state directory `{}`",
             project_dir.display()
         )
     })?;
@@ -1729,10 +1763,10 @@ fn mount_inventory_for_env(
 
 fn mount_inventory_at(root: &Path) -> MountInventory {
     let mut inventory = MountInventory::default();
-    if !inventory_root_is_directory(root, "managed mount", &mut inventory) {
+    if !inventory_root_is_directory(root, "managed state", &mut inventory) {
         return inventory;
     }
-    collect_shared_mounts(root, &mut inventory);
+    collect_user_state(root, &mut inventory);
     collect_project_mounts(root, &mut inventory);
     inventory.items.sort_by(|left, right| {
         left.0
@@ -1771,30 +1805,30 @@ fn inventory_root_is_directory(
     }
 }
 
-fn collect_shared_mounts(root: &Path, inventory: &mut MountInventory) {
-    let shared = root.join("shared");
-    if !inventory_root_is_directory(&shared, "shared mount", inventory) {
+fn collect_user_state(root: &Path, inventory: &mut MountInventory) {
+    let user = root.join("user");
+    if !inventory_root_is_directory(&user, "user state", inventory) {
         return;
     }
-    for entry in read_inventory_directory(&shared, "shared mount", inventory) {
-        let Some(name) = inventory_mount_name(&entry, "shared", inventory) else {
+    for entry in read_inventory_directory(&user, "user state", inventory) {
+        let Some(name) = inventory_mount_name(&entry, "user", inventory) else {
             continue;
         };
-        let mount = managed_mount_at_root(StateScope::Shared, &name, None, root);
+        let mount = managed_mount_at_root(StateScope::User, &name, None, root);
         inventory.items.push(MountInfo(mount));
     }
 }
 
 fn collect_project_mounts(root: &Path, inventory: &mut MountInventory) {
-    let projects = root.join("projects");
-    if !inventory_root_is_directory(&projects, "project mount", inventory) {
+    let projects = root.join("project");
+    if !inventory_root_is_directory(&projects, "project state", inventory) {
         return;
     }
-    for entry in read_inventory_directory(&projects, "project mount", inventory) {
+    for entry in read_inventory_directory(&projects, "project state", inventory) {
         let Some(digest) = entry.file_name().to_str().map(ToString::to_string) else {
             inventory
                 .warnings
-                .push("ignored project mount directory with a non-UTF-8 digest".to_string());
+                .push("ignored project state directory with a non-UTF-8 digest".to_string());
             continue;
         };
         if digest.len() != 64
@@ -1803,11 +1837,11 @@ fn collect_project_mounts(root: &Path, inventory: &mut MountInventory) {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             inventory.warnings.push(format!(
-                "ignored invalid project mount directory `{digest}`"
+                "ignored invalid project state directory `{digest}`"
             ));
             continue;
         }
-        if !inventory_entry_is_directory(&entry, "project mount directory", inventory) {
+        if !inventory_entry_is_directory(&entry, "project state directory", inventory) {
             continue;
         }
         let project_dir = entry.path();
@@ -1815,22 +1849,22 @@ fn collect_project_mounts(root: &Path, inventory: &mut MountInventory) {
             Ok(project) if project_digest(&project) == digest => project,
             Ok(_) => {
                 inventory.warnings.push(format!(
-                    "ignored project mount directory `{digest}` because its metadata does not match its digest"
+                    "ignored project state directory `{digest}` because its metadata does not match its digest"
                 ));
                 continue;
             }
             Err(err) => {
                 inventory.warnings.push(format!(
-                    "ignored project mount directory `{digest}`: {err:#}"
+                    "ignored project state directory `{digest}`: {err:#}"
                 ));
                 continue;
             }
         };
-        let mounts = project_dir.join("mounts");
-        if !inventory_root_is_directory(&mounts, "project mount collection", inventory) {
+        let mounts = project_dir.join("entries");
+        if !inventory_root_is_directory(&mounts, "project state collection", inventory) {
             continue;
         }
-        for mount_entry in read_inventory_directory(&mounts, "project mount", inventory) {
+        for mount_entry in read_inventory_directory(&mounts, "project state", inventory) {
             let Some(name) = inventory_mount_name(&mount_entry, "project", inventory) else {
                 continue;
             };
@@ -1918,22 +1952,22 @@ fn read_project_metadata(project_dir: &Path) -> Result<PathBuf> {
     let path = project_dir.join(PROJECT_ROOT_METADATA);
     let metadata = fs::symlink_metadata(&path).with_context(|| {
         format!(
-            "could not inspect project mount metadata `{}`",
+            "could not inspect project state metadata `{}`",
             path.display()
         )
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(anyhow!(
-            "project mount metadata `{}` is not a real file",
+            "project state metadata `{}` is not a real file",
             path.display()
         ));
     }
     let bytes = fs::read(&path)
-        .with_context(|| format!("could not read project mount metadata `{}`", path.display()))?;
+        .with_context(|| format!("could not read project state metadata `{}`", path.display()))?;
     let project = PathBuf::from(OsString::from_vec(bytes));
     if !project.is_absolute() {
         return Err(anyhow!(
-            "project mount metadata `{}` does not contain an absolute path",
+            "project state metadata `{}` does not contain an absolute path",
             path.display()
         ));
     }
@@ -2052,7 +2086,7 @@ fn select_mount<'a>(items: &'a [MountInfo], selector: &str) -> Result<&'a MountI
     if !id_matches.is_empty() {
         return one_mount_match(selector, &id_matches);
     }
-    Err(anyhow!("no Silo managed mount matches `{selector}`"))
+    Err(anyhow!("no Silo managed state matches `{selector}`"))
 }
 
 fn one_mount_match<'a>(selector: &str, matches: &[&'a MountInfo]) -> Result<&'a MountInfo> {
@@ -2060,7 +2094,7 @@ fn one_mount_match<'a>(selector: &str, matches: &[&'a MountInfo]) -> Result<&'a 
         return Ok(*item);
     }
     Err(anyhow!(
-        "selector `{selector}` is ambiguous; matching managed mounts: {}",
+        "selector `{selector}` is ambiguous; matching managed state entries: {}",
         matches
             .iter()
             .map(|item| {
@@ -2641,10 +2675,17 @@ fn container_identity(
         b"workdir",
         project.workdir.as_os_str().as_bytes(),
     );
-    if let Some(git) = &config_mounts.git {
-        hash_spec_field(&mut hasher, b"git", git.as_os_str().as_bytes());
-    } else {
-        hash_spec_field(&mut hasher, b"git", b"");
+    for entry in &config_mounts.read_only {
+        hash_spec_field(
+            &mut hasher,
+            b"read-only-source",
+            entry.host.as_os_str().as_bytes(),
+        );
+        hash_spec_field(
+            &mut hasher,
+            b"read-only-target",
+            entry.relative.as_os_str().as_bytes(),
+        );
     }
     hash_spec_field(
         &mut hasher,
@@ -3285,7 +3326,7 @@ fn inspect_container(id: &str) -> Result<ContainerInspection> {
 
 fn mount_directory_in_use(path: &Path) -> Result<bool> {
     let canonical = fs::canonicalize(path)
-        .with_context(|| format!("could not resolve managed mount `{}`", path.display()))?;
+        .with_context(|| format!("could not resolve managed state `{}`", path.display()))?;
     for id in list_container_ids()? {
         let inspection = inspect_container(&id)?;
         if inspection.mount_sources.iter().any(|source| {
@@ -3988,13 +4029,12 @@ fn append_creation_mounts(
         .arg(format!("{host_dir}:{}", shared_dir.display()))
         .arg("-w")
         .arg(shared_dir);
-    if let Some(host) = &config_mounts.git {
-        // The project's `.git` is mounted read-only on top of the
-        // read-write project mount, so tools in the container cannot modify
-        // version control state.
-        let host = mount_host_path(host)?;
-        run.arg("-v")
-            .arg(format!("{host}:{}:ro", shared_dir.join(".git").display()));
+    // Overlay protected project paths before named mounts, which retain their
+    // established ability to override earlier project mounts.
+    for entry in &config_mounts.read_only {
+        let host = mount_host_path(&entry.host)?;
+        let target = project_path_target(shared_dir, &entry.relative);
+        run.arg("-v").arg(format!("{host}:{}:ro", target.display()));
     }
     for entry in effective_mounts(&config_mounts.named) {
         let target = mount_argument_path(&entry.dest)?;
@@ -4105,9 +4145,19 @@ fn bind_host_path(project_root: &Path) -> Result<&str> {
     spec_host_path(project_root, "share")
 }
 
-/// Like [`bind_host_path`], for configured host and `.git` mount paths.
+/// Like [`bind_host_path`], for configured mount paths.
 fn mount_host_path(path: &Path) -> Result<&str> {
     spec_host_path(path, "mount")
+}
+
+/// Places a normalized project-relative path below its container project
+/// root, treating `.` as the root itself rather than emitting a trailing dot.
+fn project_path_target(project_dest: &Path, relative: &Path) -> PathBuf {
+    if relative == Path::new(".") {
+        project_dest.to_path_buf()
+    } else {
+        project_dest.join(relative)
+    }
 }
 
 /// Returns a path suitable for Apple's comma-delimited `--mount` syntax.

@@ -5,24 +5,24 @@
 # container.cpus = 4
 # container.memory = "6G"
 # shell = "zsh"
-read_only_git = true
+workspace.read_only = [".git"]
 
 # https://serg-cs.github.io/silo/docs/configuration/#forwards
 [forward]
 # postgres = { port = 5432, enabled = true }
 # redis = { port = 6379, enabled = false }
 
-# https://serg-cs.github.io/silo/docs/configuration/#host-mounts
-[mounts.host]
-# docs = { source = "~/Documents/docs", target = "~/docs" }
-# output = { source = "./output", target = "./output", writable = true }
+# https://serg-cs.github.io/silo/docs/configuration/#binds
+[binds]
+# docs = { source = "~/Documents/docs", target = "~/docs", access = "read-only" }
+# output = { source = "./output", target = "./output", access = "read-write" }
 
-# https://serg-cs.github.io/silo/docs/configuration/#managed-mounts
-[mounts.project]
+# https://serg-cs.github.io/silo/docs/configuration/#managed-state
+[state.project]
 # cargo = { target = "~/.cargo" }
 # cargo-target = { target = "./target" }
 
-[mounts.shared]
+[state.user]
 # codex = { target = "~/.codex" }
 
 # https://serg-cs.github.io/silo/docs/configuration/#quick

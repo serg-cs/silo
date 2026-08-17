@@ -116,22 +116,56 @@ fn image_section_sets_dockerfile() {
 }
 
 #[test]
-fn read_only_git_is_enabled_by_default() {
+fn read_only_defaults_to_git() {
     let config = Config::parse("").expect("empty config parses");
-    assert!(config.read_only_git);
-    assert!(Config::default().read_only_git);
+    assert_eq!(config.workspace.read_only, [PathBuf::from(".git")]);
+    assert_eq!(
+        config.workspace.read_only,
+        Config::default().workspace.read_only
+    );
 }
 
 #[test]
-fn read_only_git_can_be_disabled() {
-    let config = Config::parse("read_only_git = false").expect("config parses");
-    assert!(!config.read_only_git);
+fn read_only_can_be_disabled() {
+    let config = Config::parse("workspace.read_only = []").expect("config parses");
+    assert!(config.workspace.read_only.is_empty());
 }
 
 #[test]
-fn read_only_git_can_be_enabled_explicitly() {
-    let config = Config::parse("read_only_git = true").expect("config parses");
-    assert!(config.read_only_git);
+fn read_only_accepts_custom_and_nested_paths() {
+    let config = Config::parse("workspace.read_only = [\"policy\", \"config/private\"]")
+        .expect("config parses");
+    assert_eq!(
+        config.workspace.read_only,
+        [PathBuf::from("policy"), PathBuf::from("config/private")]
+    );
+}
+
+#[test]
+fn read_only_rejects_unsafe_and_duplicate_paths() {
+    for path in ["", "/etc", "../outside", "folder/../../outside", "bad:path"] {
+        let error = Config::parse(&format!("workspace.read_only = [{path:?}]"))
+            .expect_err("unsafe read-only path is invalid")
+            .to_string();
+        assert!(error.contains("`workspace.read_only`"), "{error}");
+    }
+
+    let duplicate = Config::parse("workspace.read_only = [\"config/../policy\", \"policy\"]")
+        .expect_err("normalized duplicates are invalid")
+        .to_string();
+    assert!(duplicate.contains("duplicates"), "{duplicate}");
+}
+
+#[test]
+fn read_only_normalization_keeps_paths_inside_the_project() {
+    assert_eq!(
+        normalize_read_only_path(Path::new("config/../policy")).expect("path normalizes"),
+        Path::new("policy")
+    );
+    assert_eq!(
+        normalize_read_only_path(Path::new(".")).expect("project root normalizes"),
+        Path::new(".")
+    );
 }
 
 #[test]
@@ -139,7 +173,7 @@ fn default_config_file_matches_builtin_defaults() {
     let from_file = Config::parse(DEFAULT_CONFIG).expect("default file parses");
     let defaults = Config::default();
     assert_eq!(from_file.shell, defaults.shell);
-    assert_eq!(from_file.read_only_git, defaults.read_only_git);
+    assert_eq!(from_file.workspace.read_only, defaults.workspace.read_only);
     assert_eq!(from_file.image.dockerfile, defaults.image.dockerfile);
     assert_eq!(from_file.container, defaults.container);
     assert!(from_file.forward.is_empty());
@@ -159,7 +193,7 @@ fn forwards_default_to_enabled_and_render_like_mounts() {
     assert_eq!(config.forward["postgres"].port, 5432);
     assert_eq!(
         config.effective_toml().expect("forwards serialize"),
-        "read_only_git = true\n\n[forward]\npostgres = { port = 5432, enabled = true }\nredis = { port = 6379, enabled = false }\n"
+        "workspace.read_only = [\".git\"]\n\n[forward]\npostgres = { port = 5432, enabled = true }\nredis = { port = 6379, enabled = false }\n"
     );
 }
 
@@ -229,7 +263,7 @@ fn effective_toml_omits_every_empty_section() {
         .effective_toml()
         .expect("default config serializes");
 
-    assert_eq!(text, "read_only_git = true\n");
+    assert_eq!(text, "workspace.read_only = [\".git\"]\n");
 }
 
 #[test]
@@ -239,13 +273,14 @@ fn effective_toml_matches_starter_style_and_round_trips() {
          container.cpus = 4\n\
          container.memory = \"4G\"\n\
          shell = \"fish\"\n\
-         read_only_git = false\n\
-         [mounts.host.docs]\n\
+         workspace.read_only = [\"policy\"]\n\
+         [binds.docs]\n\
          source = \"/tmp/docs\"\n\
          target = \"~/docs\"\n\
-         [mounts.project.cargo]\n\
+         access = \"read-only\"\n\
+         [state.project.cargo]\n\
          target = \"~/.cargo\"\n\
-         [mounts.shared.codex]\n\
+         [state.user.codex]\n\
          target = \"~/.codex\"\n\
          [quick]\n\
          test = [\"cargo\", \"test\"]\n",
@@ -261,15 +296,15 @@ fn effective_toml_matches_starter_style_and_round_trips() {
          container.cpus = 4\n\
          container.memory = \"4G\"\n\
          shell = \"fish\"\n\
-         read_only_git = false\n\
+         workspace.read_only = [\"policy\"]\n\
          \n\
-         [mounts.host]\n\
-         docs = { enabled = true, source = \"/tmp/docs\", target = \"~/docs\", writable = false }\n\
+         [binds]\n\
+         docs = { enabled = true, source = \"/tmp/docs\", target = \"~/docs\", access = \"read-only\" }\n\
          \n\
-         [mounts.project]\n\
+         [state.project]\n\
          cargo = { enabled = true, target = \"~/.cargo\" }\n\
          \n\
-         [mounts.shared]\n\
+         [state.user]\n\
          codex = { enabled = true, target = \"~/.codex\" }\n\
          \n\
          [quick]\n\
@@ -277,7 +312,7 @@ fn effective_toml_matches_starter_style_and_round_trips() {
     );
 
     let reparsed = Config::parse(&text).expect("printed config parses again");
-    assert!(!reparsed.read_only_git);
+    assert_eq!(reparsed.workspace.read_only, [PathBuf::from("policy")]);
     assert_eq!(
         reparsed.image.dockerfile,
         Some(PathBuf::from("/tmp/Dockerfile"))
@@ -291,30 +326,27 @@ fn effective_toml_matches_starter_style_and_round_trips() {
         reparsed.mounts["cargo"].kind(),
         Some(MountKind::ProjectState)
     );
-    assert_eq!(
-        reparsed.mounts["codex"].kind(),
-        Some(MountKind::SharedState)
-    );
+    assert_eq!(reparsed.mounts["codex"].kind(), Some(MountKind::UserState));
     assert_eq!(reparsed.quick["test"], ["cargo", "test"]);
 }
 
 #[test]
 fn effective_toml_omits_unpopulated_mount_categories() {
     let config = Config::parse(
-        "[mounts.shared.zeta]\n\
+        "[state.user.zeta]\n\
          target = \"~/zeta\"\n\
-         [mounts.shared.codex]\n\
+         [state.user.codex]\n\
          target = \"~/.codex\"\n",
     )
-    .expect("shared mounts parse");
+    .expect("user state parses");
 
     let text = config.effective_toml().expect("config serializes");
 
     assert_eq!(
         text,
-        "read_only_git = true\n\
+        "workspace.read_only = [\".git\"]\n\
          \n\
-         [mounts.shared]\n\
+         [state.user]\n\
          codex = { enabled = true, target = \"~/.codex\" }\n\
          zeta = { enabled = true, target = \"~/zeta\" }\n"
     );
@@ -333,7 +365,7 @@ fn effective_toml_preserves_escaped_quick_names() {
 
     assert_eq!(
         text,
-        "read_only_git = true\n\
+        "workspace.read_only = [\".git\"]\n\
          \n\
          [quick]\n\
          \"review.code\" = [\"codex\", \"review\"]\n\
@@ -351,9 +383,10 @@ fn effective_toml_prints_the_merged_and_resolved_project_config() {
     fs::write(
         &global,
         "container.cpus = 8\n\
-         [mounts.host.docs]\n\
+         [binds.docs]\n\
          source = \"docs\"\n\
          target = \"~/docs\"\n\
+         access = \"read-only\"\n\
          [quick]\n\
          test = [\"cargo\", \"test\"]\n",
     )
@@ -361,8 +394,8 @@ fn effective_toml_prints_the_merged_and_resolved_project_config() {
     fs::write(
         dir.path().join(".silo.toml"),
         "container.memory = \"16G\"\n\
-         [mounts.host.docs]\n\
-         writable = true\n",
+         [binds.docs]\n\
+         access = \"read-write\"\n",
     )
     .expect("project config write succeeds");
 
@@ -393,17 +426,18 @@ fn dotted_container_resources_keep_later_settings_at_the_root() {
         "container.cpus = 8\n\
          container.memory = \"16G\"\n\
          shell = \"fish\"\n\
-         read_only_git = false\n\
-         [mounts.host.notes]\n\
+         workspace.read_only = []\n\
+         [binds.notes]\n\
          source = \"~/notes\"\n\
-         target = \"~/notes\"\n",
+         target = \"~/notes\"\n\
+         access = \"read-only\"\n",
     )
     .expect("dotted resources and later root settings parse");
 
     assert_eq!(config.container.cpus, Some(8));
     assert_eq!(config.container.memory.as_deref(), Some("16G"));
     assert_eq!(config.shell, Some(Shell::Fish));
-    assert!(!config.read_only_git);
+    assert!(config.workspace.read_only.is_empty());
     assert_eq!(config.mounts.len(), 1);
 }
 
@@ -469,7 +503,7 @@ fn load_from_resolves_relative_host_sources_from_config_directory() {
     let path = dir.path().join("config.toml");
     fs::write(
         &path,
-        "[mounts.host.docs]\nsource = \"content\"\ntarget = \"/docs\"\n",
+        "[binds.docs]\nsource = \"content\"\ntarget = \"/docs\"\naccess = \"read-only\"\n",
     )
     .expect("write succeeds");
 
@@ -656,12 +690,12 @@ fn editor_failure_is_reported() {
 }
 
 #[test]
-fn old_config_without_the_key_still_protects() {
-    // A config written before `read_only_git` existed: only `[image]`.
+fn config_without_read_only_uses_the_default() {
     let config =
         Config::parse("[image]\ndockerfile = \"/tmp/Dockerfile\"\n").expect("config parses");
-    assert!(
-        config.read_only_git,
+    assert_eq!(
+        config.workspace.read_only,
+        [PathBuf::from(".git")],
         "missing key falls back to the default"
     );
     assert_eq!(
@@ -757,15 +791,15 @@ fn mounts_default_to_empty() {
 }
 
 #[test]
-fn mount_intents_and_access_defaults_parse() {
+fn binds_and_scoped_state_parse_with_clear_access() {
     let config = Config::parse(
-        "[mounts.host]\n\
-         notes = { source = \"~/notes\", target = \"~/notes\" }\n\
-         output = { source = \"~/output\", target = \"~/output\", writable = true }\n\
-         [mounts.project]\n\
+        "[binds]\n\
+         notes = { source = \"~/notes\", target = \"~/notes\", access = \"read-only\" }\n\
+         output = { source = \"~/output\", target = \"~/output\", access = \"read-write\" }\n\
+         [state.project]\n\
          cargo = { target = \"~/.cargo\" }\n\
          cargo-target = { target = \"./target\" }\n\
-         [mounts.shared]\n\
+         [state.user]\n\
          codex = { target = \"~/.codex\" }\n",
     )
     .expect("named mounts parse");
@@ -809,10 +843,12 @@ fn mount_intents_and_access_defaults_parse() {
 #[test]
 fn omitted_project_mounts_inherit_global_entries() {
     let dir = TestDir::new("project-inherits-mounts");
-    fs::write(dir.path().join(".silo.toml"), "read_only_git = false\n")
+    fs::write(dir.path().join(".silo.toml"), "workspace.read_only = []\n")
         .expect("project config writes");
-    let global = Config::parse("[mounts.host.notes]\nsource = \"~/notes\"\ntarget = \"~/notes\"\n")
-        .expect("global config parses");
+    let global = Config::parse(
+        "[binds.notes]\nsource = \"~/notes\"\ntarget = \"~/notes\"\naccess = \"read-only\"\n",
+    )
+    .expect("global config parses");
 
     let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
 
@@ -821,7 +857,7 @@ fn omitted_project_mounts_inherit_global_entries() {
         merged.mounts["notes"].effective_target(Path::new("/home/silo/workspace")),
         Some(PathBuf::from("/home/silo/notes"))
     );
-    assert!(!merged.read_only_git);
+    assert!(merged.workspace.read_only.is_empty());
 }
 
 #[test]
@@ -838,7 +874,7 @@ fn project_shell_overrides_global_shell() {
 #[test]
 fn omitted_project_shell_inherits_global_shell() {
     let dir = TestDir::new("project-inherits-shell");
-    fs::write(dir.path().join(".silo.toml"), "read_only_git = false\n")
+    fs::write(dir.path().join(".silo.toml"), "workspace.read_only = []\n")
         .expect("project config writes");
     let global = Config::parse("shell = \"nu\"\n").expect("global config parses");
 
@@ -867,7 +903,7 @@ fn project_container_resources_override_independently() {
 #[test]
 fn project_schema_reports_unknown_nested_keys() {
     let (_, unknown_keys) = deserialize_toml::<ProjectConfig>(
-        "read_only_git = true\n[image]\ndockerfiel = \"Dockerfile\"\n",
+        "workspace.read_only = [\".git\"]\n[image]\ndockerfiel = \"Dockerfile\"\n",
     )
     .expect("project config parses");
     assert_eq!(unknown_keys, ["image.dockerfiel"]);
@@ -878,12 +914,12 @@ fn project_mount_overlay_changes_one_field_and_can_disable_another() {
     let dir = TestDir::new("project-overlays-mounts");
     fs::write(
         dir.path().join(".silo.toml"),
-        "[mounts.host.notes]\ntarget = \"/notes\"\n[mounts.shared.codex]\nenabled = false\n",
+        "[binds.notes]\ntarget = \"/notes\"\n[state.user.codex]\nenabled = false\n",
     )
     .expect("project config writes");
     let global = Config::parse(
-        "[mounts.host.notes]\nsource = \"~/notes\"\ntarget = \"/old\"\n\
-         [mounts.shared.codex]\ntarget = \"~/.codex\"\n",
+        "[binds.notes]\nsource = \"~/notes\"\ntarget = \"/old\"\naccess = \"read-only\"\n\
+         [state.user.codex]\ntarget = \"~/.codex\"\n",
     )
     .expect("global config parses");
 
@@ -906,7 +942,7 @@ fn project_mount_source_is_resolved_from_project_root() {
     let dir = TestDir::new("project-relative-mount");
     fs::write(
         dir.path().join(".silo.toml"),
-        "[mounts.host.cache]\nsource = \"project-cache\"\ntarget = \"/cache\"\n",
+        "[binds.cache]\nsource = \"project-cache\"\ntarget = \"/cache\"\naccess = \"read-only\"\n",
     )
     .expect("project config writes");
 
@@ -923,20 +959,20 @@ fn changing_mount_intent_resets_host_specific_fields() {
     let dir = TestDir::new("project-changes-mount-kind");
     fs::write(
         dir.path().join(".silo.toml"),
-        "[mounts.shared.tools]\ntarget = \"~/tools\"\n",
+        "[state.user.tools]\ntarget = \"~/tools\"\n",
     )
     .expect("project config writes");
     let global = Config::parse(
-        "[mounts.host.tools]\nsource = \"~/tools\"\ntarget = \"/tools\"\nwritable = true\n",
+        "[binds.tools]\nsource = \"~/tools\"\ntarget = \"/tools\"\naccess = \"read-write\"\n",
     )
     .expect("global config parses");
 
     let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
     let mount = &merged.mounts["tools"];
-    assert_eq!(mount.kind(), Some(MountKind::SharedState));
+    assert_eq!(mount.kind(), Some(MountKind::UserState));
     assert_eq!(mount.source, None);
     assert_eq!(mount.target.as_deref(), Some(Path::new("~/tools")));
-    assert_eq!(mount.writable, None);
+    assert_eq!(mount.access, None);
     assert_eq!(mount.effective_access(), Permission::ReadWrite);
 }
 
@@ -990,13 +1026,31 @@ fn project_dockerfile_overrides_and_resolves_from_project_root() {
 fn empty_project_file_keeps_global_configuration() {
     let dir = TestDir::new("empty-project-config");
     fs::write(dir.path().join(".silo.toml"), "").expect("project config writes");
-    let global = Config::parse("read_only_git = false\n[quick]\nglobal = [\"global-command\"]\n")
+    let global = Config::parse(
+        "workspace.read_only = [\"policy\"]\n[quick]\nglobal = [\"global-command\"]\n",
+    )
+    .expect("global config parses");
+
+    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+
+    assert_eq!(merged.workspace.read_only, [PathBuf::from("policy")]);
+    assert_eq!(merged.quick["global"], ["global-command"]);
+}
+
+#[test]
+fn project_read_only_list_replaces_the_global_list() {
+    let dir = TestDir::new("project-read-only");
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "workspace.read_only = [\"policy\"]\n",
+    )
+    .expect("project config writes");
+    let global = Config::parse("workspace.read_only = [\".git\", \".github\"]\n")
         .expect("global config parses");
 
     let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
 
-    assert!(!merged.read_only_git);
-    assert_eq!(merged.quick["global"], ["global-command"]);
+    assert_eq!(merged.workspace.read_only, [PathBuf::from("policy")]);
 }
 
 #[test]
@@ -1015,53 +1069,55 @@ fn invalid_project_config_reports_its_path_and_location() {
 
 #[test]
 fn disabled_mount_tombstone_needs_no_other_fields() {
-    let config =
-        Config::parse("[mounts.shared.optional]\nenabled = false\n").expect("config parses");
+    let config = Config::parse("[state.user.optional]\nenabled = false\n").expect("config parses");
     assert!(!config.mounts["optional"].is_enabled());
 }
 
 #[test]
 fn enabled_mount_requires_category_fields_and_unique_name() {
     let config = Config::parse(
-        "[mounts.host.missing]\ntarget = \"/somewhere\"\n\
-         [mounts.project.state]\n",
+        "[binds.missing]\ntarget = \"/somewhere\"\n\
+         [state.project.state]\n",
     )
     .expect_err("incomplete enabled mounts are invalid");
     let msg = config.to_string();
     assert!(
-        msg.contains("mount `missing`: host entry is missing `source`"),
+        msg.contains("bind or state entry `missing`: bind is missing `source`"),
         "{msg}"
     );
     assert!(
-        msg.contains("mount `state`: enabled entry is missing `target`"),
+        msg.contains("bind or state entry `state`: enabled entry is missing `target`"),
         "{msg}"
     );
 
     let duplicate = Config::parse(
-        "[mounts.host.same]\nsource = \"~/same\"\ntarget = \"~/same\"\n\
-         [mounts.shared.same]\ntarget = \"~/same\"\n",
+        "[binds.same]\nsource = \"~/same\"\ntarget = \"~/same\"\naccess = \"read-only\"\n\
+         [state.user.same]\ntarget = \"~/same\"\n",
     )
     .expect_err("names must be unique across mount categories");
     assert!(
         duplicate
             .to_string()
-            .contains("mount `same` is defined in more than one category")
+            .contains("entry `same` is defined in more than one bind or state category")
     );
 }
 
 #[test]
 fn direct_parse_rejects_relative_host_sources() {
-    let config = Config::parse("[mounts.host.notes]\nsource = \"notes\"\ntarget = \"~/notes\"\n")
-        .expect_err("relative source is invalid");
+    let config = Config::parse(
+        "[binds.notes]\nsource = \"notes\"\ntarget = \"~/notes\"\naccess = \"read-only\"\n",
+    )
+    .expect_err("relative source is invalid");
     let msg = config.to_string();
     assert!(msg.contains("does not start with a bare `~`"), "{msg}");
 }
 
 #[test]
 fn mount_rejects_named_user_tilde_paths() {
-    let config =
-        Config::parse("[mounts.host.notes]\nsource = \"~user/notes\"\ntarget = \"~/notes\"\n")
-            .expect_err("~user source is invalid");
+    let config = Config::parse(
+        "[binds.notes]\nsource = \"~user/notes\"\ntarget = \"~/notes\"\naccess = \"read-only\"\n",
+    )
+    .expect_err("~user source is invalid");
     let msg = config.to_string();
     assert!(msg.contains("does not start with a bare `~`"), "{msg}");
 }
@@ -1069,30 +1125,30 @@ fn mount_rejects_named_user_tilde_paths() {
 #[test]
 fn mounts_report_and_ignore_unknown_keys() {
     let (config, unknown_keys) = Config::parse_with_unknown_keys(
-        "[mounts.host.notes]\nsource = \"~/notes\"\ntarget = \"~/notes\"\nfuture_key = 42\n",
+        "[binds.notes]\nsource = \"~/notes\"\ntarget = \"~/notes\"\naccess = \"read-only\"\nfuture_key = 42\n",
     )
     .expect("unknown key is ignored");
     assert_eq!(
         config.mounts["notes"].effective_access(),
         Permission::ReadOnly
     );
-    assert_eq!(unknown_keys, ["mounts.host.notes.future_key"]);
+    assert_eq!(unknown_keys, ["binds.notes.future_key"]);
 }
 
 #[test]
 fn mount_rejects_invalid_name_and_target() {
     let config = Config::parse(
-        "[mounts.host.\"bad name\"]\nsource = \"~/notes\"\ntarget = \"./../notes\"\n",
+        "[binds.\"bad name\"]\nsource = \"~/notes\"\ntarget = \"./../notes\"\naccess = \"read-only\"\n",
     )
     .expect_err("relative target is invalid");
     let msg = config.to_string();
-    assert!(msg.contains("mount `bad name`"), "{msg}");
+    assert!(msg.contains("bind or state entry `bad name`"), "{msg}");
     assert!(msg.contains("must not escape its target root"), "{msg}");
 }
 
 #[test]
 fn mount_rejects_unanchored_relative_target() {
-    let err = Config::parse("[mounts.project.cache]\ntarget = \"cache\"\n")
+    let err = Config::parse("[state.project.cache]\ntarget = \"cache\"\n")
         .expect_err("an unanchored relative target is ambiguous");
     assert!(
         err.to_string().contains(
@@ -1105,9 +1161,9 @@ fn mount_rejects_unanchored_relative_target() {
 #[test]
 fn mount_rejects_empty_and_mount_syntax_paths() {
     let config = Config::parse(
-        "[mounts.host.empty]\nsource = \"\"\ntarget = \"/empty\"\n\
-         [mounts.host.comma]\nsource = \"~/notes\"\ntarget = \"/bad,target\"\n\
-         [mounts.host.equals]\nsource = \"~/bad=source\"\ntarget = \"/equals\"\n",
+        "[binds.empty]\nsource = \"\"\ntarget = \"/empty\"\naccess = \"read-only\"\n\
+         [binds.comma]\nsource = \"~/notes\"\ntarget = \"/bad,target\"\naccess = \"read-only\"\n\
+         [binds.equals]\nsource = \"~/bad=source\"\ntarget = \"/equals\"\naccess = \"read-only\"\n",
     )
     .expect_err("invalid paths are rejected");
     let msg = config.to_string();

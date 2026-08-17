@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Complete reference for Silo run, image, config, container, mount, and quick commands.">
+    <meta name="description" content="Complete reference for Silo run, image, config, container, state, and quick commands.">
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/commands/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
@@ -35,7 +35,7 @@
           <a href="#image"><code>silo image</code></a>
           <a href="#config"><code>silo config</code></a>
           <a href="#containers"><code>silo containers</code></a>
-          <a href="#mounts"><code>silo mounts</code></a>
+          <a href="#state"><code>silo state</code></a>
           <a href="#quick-commands">Quick commands</a>
         </nav>
       </aside>
@@ -55,7 +55,7 @@
             <a href="#image"><code>silo image build</code><span>Build the workspace image.</span></a>
             <a href="#config"><code>silo config</code><span>Inspect and manage configuration.</span></a>
             <a href="#containers"><code>silo containers</code><span>Inspect or delete Silo containers.</span></a>
-            <a href="#mounts"><code>silo mounts</code><span>Inspect or delete managed state.</span></a>
+            <a href="#state"><code>silo state</code><span>Inspect or delete managed state.</span></a>
             <a href="#quick-commands"><code>silo &lt;name&gt;</code><span>Run a configured shortcut.</span></a>
           </nav>
           <div class="command-block">
@@ -105,12 +105,12 @@ silo run --cpus 8 --memory 12G -- cargo build</code></pre>
           <h2><a href="#config">Inspect and edit configuration</a></h2>
           <p><code>silo config</code> without a subcommand behaves like <code>silo config list</code>.</p>
           <dl class="command-list">
-            <div><dt><code>silo config list</code><span>Alias: <code>ls</code></span></dt><dd>Print the merged effective TOML, including normalized mount and forwarding defaults.</dd></div>
+            <div><dt><code>silo config list</code><span>Alias: <code>ls</code></span></dt><dd>Print the merged effective TOML, including normalized bind, state, and forwarding defaults.</dd></div>
             <div><dt><code>silo config edit</code></dt><dd>Open the active project configuration, or the global file when no project file exists.</dd></div>
             <div><dt><code>silo config edit --global</code></dt><dd>Always open or create the global configuration.</dd></div>
             <div><dt><code>silo config default</code></dt><dd>Print the bundled starter configuration without reading project or filesystem state.</dd></div>
             <div><dt><code>silo config path</code></dt><dd>Print active files in precedence order, labeled as global or project configuration.</dd></div>
-            <div><dt><code>silo config check</code></dt><dd>Validate the effective schema, Dockerfile, mount compatibility, and cross-field rules.</dd></div>
+            <div><dt><code>silo config check</code></dt><dd>Validate the effective schema, Dockerfile, storage compatibility, and cross-field rules.</dd></div>
           </dl>
           <p>Editing uses <code>$VISUAL</code>, then <code>$EDITOR</code>, then <code>vi</code>. Silo reloads and validates the effective configuration after the editor exits, and warns about unknown keys.</p>
           <h3>Common inspection flow</h3>
@@ -137,25 +137,25 @@ silo config check</code></pre>
           <pre data-copy><code>silo containers
 silo containers delete my-project
 silo containers rm silo-a0b1c2 --force</code></pre>
-          <p>Without <code>--force</code>, Silo refuses to terminate an active session or shared-session handoff. Container deletion does not remove managed mounts.</p>
+          <p>Without <code>--force</code>, Silo refuses to terminate an active session or shared-session handoff. Container deletion does not remove managed state.</p>
           <div class="warning"><p><code>--force</code> can terminate active shells, commands, or agents.</p></div>
         </section>
 
-        <section id="mounts">
-          <h2><a href="#mounts">Manage persistent mounts</a></h2>
-          <p><code>silo mounts</code> without a subcommand behaves like <code>silo mounts list</code>.</p>
+        <section id="state">
+          <h2><a href="#state">Manage persistent state</a></h2>
+          <p><code>silo state</code> without a subcommand behaves like <code>silo state list</code>.</p>
           <dl class="command-list">
             <div>
-              <dt><code>silo mounts list</code><span>Alias: <code>ls</code></span></dt>
-              <dd>List every Silo-managed mount with its stable ID, scope, logical name, project, and host path.</dd>
+              <dt><code>silo state list</code><span>Alias: <code>ls</code></span></dt>
+              <dd>List every Silo-managed state directory with its stable ID, scope, logical name, project, and host path.</dd>
             </div>
             <div>
-              <dt><code>silo mounts delete &lt;selector&gt;</code><span>Alias: <code>rm</code></span></dt>
-              <dd>Permanently delete one unused mount selected by ID, unique ID prefix, project, or logical name.</dd>
+              <dt><code>silo state delete &lt;selector&gt;</code><span>Alias: <code>rm</code></span></dt>
+              <dd>Permanently delete one unused state directory selected by ID, unique ID prefix, project, or logical name.</dd>
             </div>
           </dl>
           <p>Silo refuses deletion when the identity or storage path is inconsistent, the target is not a real directory, or any container still references it. There is no force option.</p>
-          <div class="warning"><p>Mount deletion removes durable data recursively and cannot be undone through Silo. List mounts first and use the stable ID when a name is ambiguous.</p></div>
+          <div class="warning"><p>State deletion removes durable data recursively and cannot be undone through Silo. List state first and use the stable ID when a name is ambiguous.</p></div>
         </section>
 
         <section id="quick-commands">

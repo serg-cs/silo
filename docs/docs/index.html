@@ -65,7 +65,7 @@
           <h2><a href="#first-session">Your first session</a></h2>
           <p>Build Silo's image before the first run. The built-in image is substantial because it includes several coding agents, browser tooling, language runtimes, shells, and common development utilities.</p>
           <pre data-copy><code>silo image build</code></pre>
-          <p>Move into a Git repository or any working directory and open a shell:</p>
+          <p>Move into a Git or Jujutsu repository—or any working directory—and open a shell:</p>
           <pre data-copy><code>cd ~/code/my-project
 silo run</code></pre>
           <p>Silo discovers a project root, mounts it read-write as the container's working directory, and starts a shared container. With the built-in image, the host user and group IDs are mirrored into the container so files remain usable on both sides.</p>
@@ -78,7 +78,7 @@ silo run -- codex --model gpt-5</code></pre>
         <section id="project-config">
           <h2><a href="#project-config">Add a project configuration</a></h2>
           <p>A <code>.silo.toml</code> file marks an explicit project root and adds project-specific settings. Start small:</p>
-          <pre data-copy><code>[mounts.project]
+          <pre data-copy><code>[state.project]
 cargo = { target = "~/.cargo" }
 cargo-target = { target = "./target" }
 
@@ -103,7 +103,7 @@ silo config list</code></pre>
               </tbody>
             </table>
           </div>
-          <p>Both built-in lifecycles mount the project and can use configured host or managed mounts. Custom images retain their own user, entrypoint, command, and filesystem assumptions, so their mount behavior is intentionally narrower.</p>
+          <p>Both built-in lifecycles mount the project and can use configured binds and managed state. Custom images retain their own user, entrypoint, command, and filesystem assumptions, so their storage behavior is intentionally narrower.</p>
         </section>
 
         <section id="next-steps">
@@ -112,7 +112,7 @@ silo config list</code></pre>
             <li>Read <a href="./concepts/">Concepts</a> for the project, image, container, session, and state model.</li>
             <li>Use the <a href="./commands/">Command reference</a> for every subcommand, flag, alias, and selector.</li>
             <li>Open <a href="./configuration/">Configuration</a> for the complete TOML schema and merge rules.</li>
-            <li>Study <a href="./how-it-works/">How it works</a> for container identity, session safety, mounts, and forwarding.</li>
+            <li>Study <a href="./how-it-works/">How it works</a> for container identity, session safety, storage, and forwarding.</li>
           </ul>
         </section>
 

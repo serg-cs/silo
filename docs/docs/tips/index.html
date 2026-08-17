@@ -34,18 +34,18 @@
         <section id="agent-workspace">
           <h2><a href="#agent-workspace">Build a practical agent workspace</a></h2>
           <p>Keep dependency and build caches private to the project. Share only the agent state that genuinely needs to follow you:</p>
-          <pre data-copy><code>[mounts.project]
+          <pre data-copy><code>[state.project]
 cargo-home = { target = "~/.cargo" }
 cargo-target = { target = "./target" }
 
-[mounts.shared]
+[state.user]
 codex = { target = "~/.codex" }
 
 [quick]
 codex = ["codex"]
 check = ["cargo", "test", "--workspace"]</code></pre>
           <p>This layout lets an agent reuse credentials while keeping compiled dependencies specific to one canonical project.</p>
-          <div class="warning"><p>A shared mount is visible to every project that enables the same logical name. Do not put project secrets there merely for convenience.</p></div>
+          <div class="warning"><p>User state is visible to every project that enables the same logical name. Do not put project secrets there merely for convenience.</p></div>
         </section>
 
         <section id="multiple-agents">
@@ -92,14 +92,15 @@ curl "http://localhost:$SILO_API_PORT/health"</code></pre>
           <pre data-copy><code>container.cpus = 4
 container.memory = "6G"</code></pre>
           <pre data-copy><code>silo run --cpus 8 --memory 12G -- cargo test</code></pre>
-          <p>Resource settings apply when a container is created. Because they are part of its specification, changing them can replace the shared project container on the next session. Durable mounts remain, but unmounted container-local state does not.</p>
+          <p>Resource settings apply when a container is created. Because they are part of its specification, changing them can replace the shared project container on the next session. Binds and managed state remain, but container-local state does not.</p>
         </section>
 
-        <section id="git-writes">
-          <h2><a href="#git-writes">Choose Git access for the workflow</a></h2>
-          <p>Silo defaults to read-only Git metadata while leaving the working tree writable. If agents or other tools should stage, commit, switch branches, or manage repository configuration, set this in the project file:</p>
-          <pre data-copy><code>read_only_git = false</code></pre>
-          <p>Set <code>read_only_git = true</code> when tools should inspect repository state without changing Git metadata. This is a project-level workflow choice.</p>
+        <section id="project-writes">
+          <h2><a href="#project-writes">Choose protected paths for the workflow</a></h2>
+          <p>Silo leaves the working tree writable while protecting existing Git metadata by default. If agents or other tools should modify Git metadata, disable the project overlays in the project file:</p>
+          <pre data-copy><code>workspace.read_only = []</code></pre>
+          <p>Use literal relative paths to protect additional directories, for example <code>workspace.read_only = [".git", ".github"]</code>. Missing entries are harmless, while absolute paths and paths that escape the project root are rejected. Existing regular files are rejected because Apple container bind mounts require directory sources.</p>
+          <p>Keep <code>.jj</code> writable when using Jujutsu in the container: read commands such as <code>jj status</code> still need metadata locks and can fail against a read-only overlay.</p>
         </section>
 
         <section id="inspect-first">
@@ -108,22 +109,22 @@ container.memory = "6G"</code></pre>
 silo config list
 silo config check
 silo containers
-silo mounts</code></pre>
+silo state</code></pre>
           <p>This sequence answers which files contributed, what Silo actually sees, whether the result is valid, which containers are active, and which durable directories exist.</p>
           <p>Delete runtime containers independently from durable state:</p>
           <pre data-copy><code>silo containers delete my-project
-silo mounts delete silo-mount-p-&lt;id&gt;</code></pre>
-          <div class="warning"><p>Container deletion is recoverable from source and configuration. Managed mount deletion removes its data permanently.</p></div>
+silo state delete silo-state-p-&lt;id&gt;</code></pre>
+          <div class="warning"><p>Container deletion is recoverable from source and configuration. Managed state deletion removes its data permanently.</p></div>
         </section>
 
         <section id="custom-images">
           <h2><a href="#custom-images">Design custom images for isolation</a></h2>
-          <p>Use a custom Dockerfile when the entire image contract should belong to the project. Keep host-mount targets absolute or project-relative and make their permissions compatible with the image-defined user.</p>
+          <p>Use a custom Dockerfile when the entire image contract should belong to the project. Keep bind targets absolute or project-relative and make their permissions compatible with the image-defined user.</p>
           <pre data-copy><code>image.dockerfile = "./Dockerfile.silo"
 
-[mounts.host]
-artifacts = { source = "./artifacts", target = "./artifacts", writable = true }</code></pre>
-          <p>Do not expect shared sessions, Silo's built-in shells, <code>/home/silo</code>, or project/shared managed mounts. Silo warns when managed entries are skipped.</p>
+[binds]
+artifacts = { source = "./artifacts", target = "./artifacts", access = "read-write" }</code></pre>
+          <p>Do not expect shared sessions, Silo's built-in shells, <code>/home/silo</code>, or project/user managed state. Silo warns when state entries are skipped.</p>
         </section>
 
         <section id="troubleshooting">
@@ -143,7 +144,7 @@ artifacts = { source = "./artifacts", target = "./artifacts", writable = true }<
           <h3 id="unknown-config"><a href="#unknown-config">An unknown config key is ignored</a></h3>
           <p>Read the warning's full dotted key and file path, fix the likely typo, then run <code>silo config check</code>. Unknown values never participate in the effective configuration.</p>
 
-          <h3 id="mount-source"><a href="#mount-source">A host mount source cannot be resolved</a></h3>
+          <h3 id="bind-source"><a href="#bind-source">A bind source cannot be resolved</a></h3>
           <p>Confirm that the source exists and is a directory. Relative global sources resolve from the global config directory; relative project sources resolve from the project root; <code>~</code> expands from the host home. Broken symlinks are rejected.</p>
 
           <h3 id="custom-home"><a href="#custom-home">A custom image rejects a home-relative target</a></h3>
@@ -152,8 +153,8 @@ artifacts = { source = "./artifacts", target = "./artifacts", writable = true }<
           <h3 id="active-container"><a href="#active-container">A container cannot be deleted because it is active</a></h3>
           <p>Let its sessions exit and retry. Use <code>--force</code> only when terminating those shells, commands, or agents is intentional.</p>
 
-          <h3 id="mount-in-use"><a href="#mount-in-use">A managed mount is still referenced</a></h3>
-          <p>List containers, end active sessions, and delete stopped containers that still reference the mount. Silo intentionally offers no force-delete path for in-use durable storage.</p>
+          <h3 id="state-in-use"><a href="#state-in-use">Managed state is still referenced</a></h3>
+          <p>List containers, end active sessions, and delete stopped containers that still reference the state directory. Silo intentionally offers no force-delete path for in-use durable storage.</p>
 
           <h3 id="quick-name"><a href="#quick-name">A quick command is unknown or unusable</a></h3>
           <p>Inspect the effective <code>[quick]</code> table with <code>silo config list</code>. Remember that a project table replaces the global table and that names cannot shadow built-ins or start with <code>-</code>.</p>
