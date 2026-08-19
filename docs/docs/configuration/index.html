@@ -106,7 +106,7 @@ agent = ["codex"]</code></pre>
               <tr><td><code>workspace.read_only</code></td><td>Relative directory array; <code>[".git"]</code></td><td>Overlays each existing workspace directory read-only. Paths are literal, may be nested, and must remain inside the project root; use <code>[]</code> to disable these overlays.</td></tr>
             </tbody>
           </table></div>
-          <p>CPU, memory, sudo access, and resolved read-only paths participate in shared-container identity. A changed value causes the next run to replace a mismatched stopped workspace or coordinate safe replacement when possible. Missing read-only paths are ignored; <code>workspace.read_only = [".git", ".github"]</code> additionally protects a project directory, while <code>workspace.read_only = ["."]</code> protects the entire project.</p>
+          <p>CPU, memory, sudo access, and resolved read-only paths participate in shared-container identity. A changed value is applied when a stopped workspace is recreated. If the workspace is already running, Silo warns and joins it with its existing creation settings. Missing read-only paths are ignored; <code>workspace.read_only = [".git", ".github"]</code> additionally protects a project directory, while <code>workspace.read_only = ["."]</code> protects the entire project.</p>
           <div class="note"><p>The built-in image contains the <code>sudo</code> command, but its locked <code>silo</code> user cannot elevate unless <code>container.sudo = true</code> or <code>silo run --sudo</code> enables passwordless access.</p></div>
           <div class="warning"><p>Do not add <code>.jj</code> when Jujutsu commands need to run in the container. Even inspection commands such as <code>jj status</code> acquire locks and may update Jujutsu metadata, so a read-only <code>.jj</code> overlay prevents normal operation.</p></div>
           <div class="warning"><p>Apple container supports only directories as bind-mount sources. An existing <code>workspace.read_only</code> entry that resolves to a regular file, such as <code>AGENTS.md</code>, prevents container creation with a clear error. Protect its containing directory or use a different enforcement mechanism for individual files.</p></div>
@@ -125,9 +125,9 @@ web_api = { port = 8080, enabled = true }</code></pre>
               <tr><td><code>enabled</code></td><td>Optional boolean; defaults to <code>true</code>.</td></tr>
             </tbody>
           </table></div>
-          <p>In the built-in shared container, each configured port is available on the same IPv4 loopback port. The example supplies <code>SILO_POSTGRES_PORT=5432</code> and <code>SILO_WEB_API_PORT=8080</code>, so programs may connect directly to <code>127.0.0.1:$SILO_POSTGRES_PORT</code>.</p>
+          <p>In the built-in shared container, each configured port is available on the same IPv4 loopback port, so the example services are reachable at <code>127.0.0.1:5432</code> and <code>127.0.0.1:8080</code>.</p>
           <p>Silo establishes an authenticated SSH reverse tunnel for only the named ports. Each guest listener binds to <code>127.0.0.1</code> and connects to the same <code>127.0.0.1</code> port on the host; forwarding does not expose other host services.</p>
-          <div class="warning"><p>Forwarding is not part of the custom-image or isolated-mode contract. If either is selected, Silo warns, ignores enabled forwards, and does not supply their environment variables.</p></div>
+          <div class="warning"><p>Forwarding is not part of the custom-image or isolated-mode contract. If either is selected, Silo warns and ignores enabled forwards.</p></div>
         </section>
 
         <section id="binds">

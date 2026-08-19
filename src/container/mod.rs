@@ -1117,6 +1117,24 @@ struct HostIds {
     gid: String,
 }
 
+/// Creation inputs prepared from the current shared-container configuration.
+struct PreparedSharedContainer {
+    ids: HostIds,
+    config_mounts: ConfigMounts,
+    forwarding: forward::Session,
+}
+
+/// Determines whether this invocation may apply current forwarding settings.
+enum SharedContainerUse {
+    Current(forward::Session),
+    Existing(RunningContainerWarning),
+}
+
+enum RunningContainerWarning {
+    Drift,
+    Unverified(anyhow::Error),
+}
+
 /// Runs a command in this project's shared container, or in a one-shot
 /// foreground container when `isolated` is set or the configured image is
 /// custom. Custom images retain the image-defined user, command, and runtime
@@ -1145,13 +1163,11 @@ pub fn run_image(
         warn_unsupported_forwards(config, isolated);
         return run_isolated(config, project, command, shell);
     }
-    let forwarding = forward::Session::prepare(config, &project.root)?;
     run_shared(
         config,
         project,
         command,
         shell.expect("the shared lifecycle always uses the built-in image"),
-        &forwarding,
     )
 }
 
@@ -1368,44 +1384,57 @@ fn run_shared(
     project: &Project,
     command: &[OsString],
     shell: Shell,
-    forwarding: &forward::Session,
 ) -> Result<ExitCode> {
     sweep_orphaned_isolated_containers(None);
     let deadline = Instant::now() + GUEST_READY_TIMEOUT + CONFLICT_RETRY_TIMEOUT;
-    let (reservation, address) = loop {
+    let (reservation, address, container_use) = loop {
         if Instant::now() >= deadline {
             return Err(anyhow!(
                 "container `{}` repeatedly stopped during session handoff",
                 project.id
             ));
         }
-        ensure_shared_container(project, config, forwarding)?;
-        let Some(inspection) = wait_for_guest_ready(project, forwarding.requires_address())? else {
+        let container_use = ensure_shared_container(project, config)?;
+        let requires_address = matches!(
+            &container_use,
+            SharedContainerUse::Current(forwarding) if forwarding.requires_address()
+        );
+        let Some(inspection) = wait_for_guest_ready(project, requires_address)? else {
             continue;
         };
         let reservation = session_reservation_token(project);
         if reserve_shared_session(project, &reservation)? {
-            break (reservation, inspection.ipv4_address);
+            break (reservation, inspection.ipv4_address, container_use);
         }
     };
-    if forwarding.requires_address() {
-        let address = address.ok_or_else(|| {
-            anyhow!(
-                "container `{}` did not expose an IPv4 address for SSH forwarding",
-                project.id
-            )
-        })?;
-        forwarding.ensure_tunnel(address)?;
+    // Only an exact match may apply current forwarding assets; stale
+    // containers keep any forwarding they already provide untouched.
+    match container_use {
+        SharedContainerUse::Current(forwarding) if forwarding.requires_address() => {
+            let address = address.ok_or_else(|| {
+                anyhow!(
+                    "container `{}` did not expose an IPv4 address for SSH forwarding",
+                    project.id
+                )
+            })?;
+            forwarding.ensure_tunnel(address)?;
+        }
+        SharedContainerUse::Current(_) => {}
+        SharedContainerUse::Existing(warning) => {
+            eprintln!(
+                "warning: {}",
+                running_container_warning(&project.id, &warning)
+            );
+        }
     }
 
     // The attached process owns the terminal, but not the shared container.
-    let mut exec = exec_command_with_forward(
+    let mut exec = exec_command(
         std::io::stdin().is_terminal(),
         project,
         &reservation,
         command,
         shell,
-        forwarding.environment(),
     );
     install_signal_handlers()?;
     let terminal = SavedTerminal::capture();
@@ -2914,32 +2943,23 @@ fn session_reservation_token(project: &Project) -> String {
     hex_digest(hasher.finalize())
 }
 
-/// Ensures the deterministic shared container exists, belongs to this
-/// project, matches the requested creation specification, and is running.
-fn ensure_shared_container(
-    project: &Project,
-    config: &Config,
-    forwarding: &forward::Session,
-) -> Result<()> {
-    let ids = host_ids()?;
-    let config_mounts = resolve_config_mounts(config, &project.root, forwarding)?;
-    warn_mount_conflicts(project, &config_mounts);
+/// Ensures the deterministic shared container exists and is safe to join.
+/// Running owned containers remain usable when current creation settings
+/// drift or cannot be prepared; absent and stopped containers are reconciled.
+fn ensure_shared_container(project: &Project, config: &Config) -> Result<SharedContainerUse> {
     let deadline = Instant::now() + CONFLICT_RETRY_TIMEOUT;
     let mut last_conflict = None;
-    let desired_identity = |inspection: &ContainerInspection| -> Result<ContainerIdentity> {
-        desired_existing_container_identity(
-            inspection,
-            project,
-            &ids,
-            &config_mounts,
-            &config.container,
-        )
-    };
 
     loop {
         let inspection = inspect_container(&project.id)?;
         match inspection.state {
             ContainerState::Absent => {
+                let PreparedSharedContainer {
+                    ids,
+                    config_mounts,
+                    forwarding,
+                } = prepare_shared_container(project, config)?;
+                warn_mount_conflicts(project, &config_mounts);
                 let image_digest = require_image_digest()?;
                 let identity = shared_container_identity(
                     project,
@@ -2962,19 +2982,13 @@ fn ensure_shared_container(
                 );
                 drop(mount_lock);
                 match creation {
-                    Ok(()) => {}
+                    Ok(()) => return Ok(SharedContainerUse::Current(forwarding)),
                     Err(err) => last_conflict = Some(err),
                 }
             }
             ContainerState::Running => {
-                let identity = desired_identity(&inspection)?;
-                if shared_container_matches(&inspection, project, &identity)? {
-                    return Ok(());
-                }
-                match replace_outdated_shared_container(project, &inspection)? {
-                    ReplacementOutcome::Replaced => continue,
-                    ReplacementOutcome::Conflict(err) => last_conflict = Some(err),
-                }
+                validate_shared_ownership(&inspection, project)?;
+                return Ok(running_container_use(project, config, &inspection));
             }
             ContainerState::Stopped => {
                 let container = container_info_from_inspection(project, &inspection)?;
@@ -3007,6 +3021,79 @@ fn ensure_shared_container(
             }));
         }
         thread::sleep(CONFLICT_RETRY_INTERVAL);
+    }
+}
+
+/// Prepares creation-time inputs only after runtime inspection determines
+/// that current settings are needed for creation or compatibility checking.
+fn prepare_shared_container(project: &Project, config: &Config) -> Result<PreparedSharedContainer> {
+    let forwarding = forward::Session::prepare(config, &project.root)?;
+    let ids = host_ids()?;
+    let config_mounts = resolve_config_mounts(config, &project.root, &forwarding)?;
+    Ok(PreparedSharedContainer {
+        ids,
+        config_mounts,
+        forwarding,
+    })
+}
+
+/// Compares a running container without allowing current configuration or
+/// image-store failures to interrupt an existing workspace.
+fn running_container_use(
+    project: &Project,
+    config: &Config,
+    inspection: &ContainerInspection,
+) -> SharedContainerUse {
+    running_container_use_with(
+        project,
+        config,
+        inspection,
+        || prepare_shared_container(project, config),
+        require_image_digest,
+    )
+}
+
+fn running_container_use_with(
+    project: &Project,
+    config: &Config,
+    inspection: &ContainerInspection,
+    prepare: impl FnOnce() -> Result<PreparedSharedContainer>,
+    inspect_image: impl FnOnce() -> Result<String>,
+) -> SharedContainerUse {
+    let prepared = match prepare() {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            return SharedContainerUse::Existing(RunningContainerWarning::Unverified(err));
+        }
+    };
+    let image_digest = match inspect_image() {
+        Ok(digest) => digest,
+        Err(err) => {
+            return SharedContainerUse::Existing(RunningContainerWarning::Unverified(err));
+        }
+    };
+    let identity = shared_container_identity(
+        project,
+        &image_digest,
+        &prepared.ids,
+        &prepared.config_mounts,
+        &config.container,
+    );
+    if inspection.labels.get(LABEL_SPEC) != Some(&identity.spec) {
+        return SharedContainerUse::Existing(RunningContainerWarning::Drift);
+    }
+    warn_mount_conflicts(project, &prepared.config_mounts);
+    SharedContainerUse::Current(prepared.forwarding)
+}
+
+fn running_container_warning(id: &str, warning: &RunningContainerWarning) -> String {
+    match warning {
+        RunningContainerWarning::Drift => format!(
+            "container `{id}` was created from a different image or configuration; connecting to the existing running container without applying current creation settings; recreate it to apply them"
+        ),
+        RunningContainerWarning::Unverified(err) => format!(
+            "could not verify running container `{id}` against the current image and configuration: {err:#}; connecting to the existing container without applying current creation settings"
+        ),
     }
 }
 
@@ -3052,62 +3139,6 @@ fn container_info_from_inspection(
             .unwrap_or_else(|| IMAGE_TAG.to_string()),
         resources: inspection.resources,
     })
-}
-
-/// Prefers the current tag, but preserves a valid existing container when
-/// the image store is temporarily unavailable or the mutable tag was removed.
-fn desired_existing_container_identity(
-    inspection: &ContainerInspection,
-    project: &Project,
-    ids: &HostIds,
-    config_mounts: &ConfigMounts,
-    resources: &Container,
-) -> Result<ContainerIdentity> {
-    desired_existing_container_identity_with(
-        inspection,
-        project,
-        ids,
-        config_mounts,
-        resources,
-        require_image_digest,
-    )
-}
-
-fn desired_existing_container_identity_with(
-    inspection: &ContainerInspection,
-    project: &Project,
-    ids: &HostIds,
-    config_mounts: &ConfigMounts,
-    resources: &Container,
-    inspect_image: impl FnOnce() -> Result<String>,
-) -> Result<ContainerIdentity> {
-    match inspect_image() {
-        Ok(digest) => Ok(shared_container_identity(
-            project,
-            &digest,
-            ids,
-            config_mounts,
-            resources,
-        )),
-        Err(err) => existing_container_identity(inspection, project, ids, config_mounts, resources)
-            .ok_or(err),
-    }
-}
-
-/// Reconstructs the digest-based specification from durable inspection data,
-/// accepting it only when it matches the value recorded on the container.
-fn existing_container_identity(
-    inspection: &ContainerInspection,
-    project: &Project,
-    ids: &HostIds,
-    config_mounts: &ConfigMounts,
-    resources: &Container,
-) -> Option<ContainerIdentity> {
-    inspection
-        .image_digest
-        .as_deref()
-        .map(|image| shared_container_identity(project, image, ids, config_mounts, resources))
-        .filter(|identity| inspection.labels.get(LABEL_SPEC) == Some(&identity.spec))
 }
 
 /// Creates a detached shared container with a unique, automatically removed
@@ -3232,8 +3263,8 @@ fn validate_shared_container(
     Ok(())
 }
 
-/// Checks ownership separately from the creation specification so an owned,
-/// outdated container can be replaced without relaxing the adoption rules.
+/// Checks ownership separately from the creation specification so ownership
+/// always remains strict when a running container is reused.
 fn shared_container_matches(
     inspection: &ContainerInspection,
     project: &Project,
@@ -3241,102 +3272,6 @@ fn shared_container_matches(
 ) -> Result<bool> {
     validate_shared_ownership(inspection, project)?;
     Ok(inspection.labels.get(LABEL_SPEC) == Some(&identity.spec))
-}
-
-/// Replaces an owned shared container after its creation-time configuration
-/// changes. Running containers use the same guest-side lifecycle lock as a
-/// normal non-forced stop, closing the race with new session reservations.
-#[derive(Debug)]
-enum ReplacementOutcome {
-    Replaced,
-    Conflict(anyhow::Error),
-}
-
-fn replace_outdated_shared_container(
-    project: &Project,
-    inspection: &ContainerInspection,
-) -> Result<ReplacementOutcome> {
-    replace_outdated_shared_container_with(
-        project,
-        inspection,
-        inspect_session_count,
-        require_image,
-        guarded_stop,
-        delete_stopped_container,
-    )
-}
-
-fn replace_outdated_shared_container_with(
-    project: &Project,
-    inspection: &ContainerInspection,
-    session_count: impl FnOnce(&str) -> Result<usize>,
-    require_replacement_image: impl FnOnce() -> Result<()>,
-    stop: impl FnOnce(&ContainerInfo) -> Result<()>,
-    delete: impl FnOnce(&ContainerInfo) -> Result<()>,
-) -> Result<ReplacementOutcome> {
-    let spec = inspection.labels.get(LABEL_SPEC).cloned().ok_or_else(|| {
-        anyhow!(
-            "container '{}' has an outdated Silo configuration but no specification label; run 'silo containers delete {}' and retry",
-            project.id,
-            project.id
-        )
-    })?;
-    let container = ContainerInfo {
-        id: project.id.clone(),
-        lifecycle: ContainerLifecycle::Shared,
-        state: inspection.state,
-        sessions: None,
-        project: project.root.clone(),
-        spec,
-        image: inspection
-            .image
-            .clone()
-            .unwrap_or_else(|| IMAGE_TAG.to_string()),
-        resources: inspection.resources,
-    };
-
-    match inspection.state {
-        ContainerState::Running => match session_count(&project.id) {
-            Ok(0) => {
-                require_replacement_image()?;
-                if let Err(err) = stop(&container) {
-                    return Ok(ReplacementOutcome::Conflict(err.context(format!(
-                        "configuration changed for container `{}`, but Silo could not safely stop the existing container; it was not replaced",
-                        project.id
-                    ))));
-                }
-            }
-            Ok(sessions) => return Err(active_config_drift_error(&project.id, sessions)),
-            Err(err) => {
-                return Ok(ReplacementOutcome::Conflict(err.context(format!(
-                    "configuration changed for container `{}`, but Silo could not confirm that no other sessions are using it; it was not replaced",
-                    project.id
-                ))));
-            }
-        },
-        ContainerState::Stopped => require_replacement_image()?,
-        ContainerState::Absent => return Ok(ReplacementOutcome::Replaced),
-        ContainerState::Stopping | ContainerState::Unknown => {
-            return Ok(ReplacementOutcome::Conflict(anyhow!(
-                "container `{}` changed state while replacing its outdated configuration; retry",
-                project.id
-            )));
-        }
-    }
-    match delete(&container) {
-        Ok(()) => Ok(ReplacementOutcome::Replaced),
-        Err(err) => Ok(ReplacementOutcome::Conflict(err.context(format!(
-            "configuration changed for container `{}`, but Silo could not safely delete the existing container; it was not replaced",
-            project.id
-        )))),
-    }
-}
-
-fn active_config_drift_error(id: &str, sessions: usize) -> anyhow::Error {
-    let noun = if sessions == 1 { "session" } else { "sessions" };
-    anyhow!(
-        "configuration changed for container `{id}`, but {sessions} other active {noun} are still using it; wait for them to finish, or run `silo containers delete {id} --force` to terminate them"
-    )
 }
 
 /// Inspects a container, booting the container system and retrying once when needed.
@@ -3962,13 +3897,6 @@ fn append_resources(run: &mut Command, resources: &Container) {
     }
 }
 
-/// Adds environment values resolved for this one attached session.
-fn append_environment(run: &mut Command, environment: &[(String, String)]) {
-    for (name, value) in environment {
-        run.arg("--env").arg(format!("{name}={value}"));
-    }
-}
-
 /// Adds mounts in their established override order and selects the workdir.
 fn append_creation_mounts(
     run: &mut Command,
@@ -4030,24 +3958,12 @@ fn append_sudo_access(run: &mut Command, enabled: bool) {
 }
 
 /// Builds one session attachment command for the running shared container.
-#[cfg(test)]
 fn exec_command(
     interactive: bool,
     project: &Project,
     reservation: &str,
     command: &[OsString],
     shell: Shell,
-) -> Command {
-    exec_command_with_forward(interactive, project, reservation, command, shell, &[])
-}
-
-fn exec_command_with_forward(
-    interactive: bool,
-    project: &Project,
-    reservation: &str,
-    command: &[OsString],
-    shell: Shell,
-    forward_environment: &[(String, String)],
 ) -> Command {
     let mut exec = Command::new(CONTAINER_BIN);
     exec.arg("exec").arg("-i");
@@ -4062,7 +3978,6 @@ fn exec_command_with_forward(
         .arg(format!("HOME={CONTAINER_HOME}"))
         .arg("--env")
         .arg(format!("SHELL={}", shell.path()));
-    append_environment(&mut exec, forward_environment);
     exec.arg(&project.id);
     exec.arg(SESSION_WRAPPER_COMMAND).arg(reservation);
     if command.is_empty() {

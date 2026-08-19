@@ -81,9 +81,9 @@ logs = ["sh", "-lc", "just logs | tail -n 100"]</code></pre>
 postgres = { port = 5432 }
 api = { port = 8080 }</code></pre>
           <p>Use the same IPv4 loopback ports inside the built-in shared container:</p>
-          <pre data-copy><code>psql -h 127.0.0.1 -p "$SILO_POSTGRES_PORT"
-curl "http://127.0.0.1:$SILO_API_PORT/health"</code></pre>
-          <p>The named port variables are useful when a tool should follow configuration instead of hard-coding a service port. Custom images and isolated runs ignore forwards with a warning and do not receive these variables.</p>
+          <pre data-copy><code>psql -h 127.0.0.1 -p 5432
+curl "http://127.0.0.1:8080/health"</code></pre>
+          <p>Use the configured port directly: every forward keeps the same port number on the host and inside the container. Custom images and isolated runs ignore forwards with a warning.</p>
         </section>
 
         <section id="resources">
@@ -92,14 +92,14 @@ curl "http://127.0.0.1:$SILO_API_PORT/health"</code></pre>
           <pre data-copy><code>container.cpus = 4
 container.memory = "6G"</code></pre>
           <pre data-copy><code>silo run --cpus 8 --memory 12G -- cargo test</code></pre>
-          <p>Resource settings apply when a container is created. Because they are part of its specification, changing them can replace the shared project container on the next session. Binds and managed state remain, but container-local state does not.</p>
+          <p>Resource settings apply when a container is created. If they change while the shared project container is running, Silo warns and joins it with its existing limits. The new settings apply after the container is recreated.</p>
         </section>
 
         <section id="sudo">
           <h2><a href="#sudo">Enable elevation deliberately</a></h2>
           <p>The built-in image keeps sudo access disabled by default. Enable it persistently for a project with <code>container.sudo = true</code>, or opt in for one invocation:</p>
           <pre data-copy><code>silo run --sudo -- apt-get update</code></pre>
-          <p>Sudo is a container creation setting. In shared mode, concurrent sessions use the same <code>silo</code> user and therefore share the enabled access until a later run reconciles the container back to its configured setting. Use <code>--isolated --sudo</code> when elevation must be confined to a one-shot container. Custom images retain their own user and privilege policy.</p>
+          <p>Sudo is a container creation setting. In shared mode, concurrent sessions use the same <code>silo</code> user and therefore share the access selected when the container was created. A changed setting applies after recreation. Use <code>--isolated --sudo</code> when elevation must be confined to a one-shot container. Custom images retain their own user and privilege policy.</p>
         </section>
 
         <section id="project-writes">

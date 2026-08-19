@@ -90,7 +90,7 @@ silo run --isolated -- ./scripts/check.sh
 silo run --cpus 8 --memory 12G -- cargo build
 silo run --sudo -- apt-get update</code></pre>
           <div class="note"><p>The separator is required: use <code>silo run -- cargo test</code>, not <code>silo run cargo test</code>.</p></div>
-          <div class="note"><p>Like resource overrides, <code>--sudo</code> reconciles the shared container's creation settings. Concurrent sessions in that container also have sudo until a later run reconciles it back to the configured value.</p></div>
+          <div class="note"><p>CPU, memory, and sudo access are container creation settings. If the shared container is already running with different settings, Silo warns and joins it without applying the overrides. The settings take effect after the container is recreated.</p></div>
         </section>
 
         <section id="image">

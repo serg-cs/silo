@@ -8,7 +8,7 @@ fn forward(port: u16, enabled: bool) -> Forward {
 }
 
 #[test]
-fn enabled_forward_selection_and_environment_are_stable() {
+fn enabled_forward_selection_is_stable() {
     let forwards = BTreeMap::from([
         ("redis".to_string(), forward(6379, false)),
         ("postgres".to_string(), forward(5432, true)),
@@ -17,10 +17,6 @@ fn enabled_forward_selection_and_environment_are_stable() {
     let enabled = enabled_forwards(&forwards);
 
     assert_eq!(enabled.keys().collect::<Vec<_>>(), ["postgres"]);
-    assert_eq!(
-        forward_environment(&enabled),
-        [("SILO_POSTGRES_PORT".to_string(), "5432".to_string())]
-    );
 }
 
 #[test]

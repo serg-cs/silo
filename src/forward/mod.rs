@@ -54,7 +54,6 @@ impl GuestAssets {
 
 /// Host forwarding state prepared for one built-in shared-container run.
 pub(crate) struct Session {
-    environment: Vec<(String, String)>,
     tunnel: Option<Tunnel>,
 }
 
@@ -71,13 +70,9 @@ impl Session {
     /// Creates the managed key material required by the enabled forward set.
     pub(crate) fn prepare(config: &Config, project_root: &Path) -> Result<Self> {
         let enabled = enabled_forwards(&config.forward);
-        let environment = forward_environment(&enabled);
         let ports: BTreeSet<_> = enabled.values().map(|forward| forward.port).collect();
         if ports.is_empty() {
-            return Ok(Self {
-                environment,
-                tunnel: None,
-            });
+            return Ok(Self { tunnel: None });
         }
 
         let state_root = forward_state_root()?;
@@ -112,7 +107,6 @@ impl Session {
         )?;
 
         Ok(Self {
-            environment,
             tunnel: Some(Tunnel {
                 project_key,
                 asset_key,
@@ -125,10 +119,6 @@ impl Session {
                 },
             }),
         })
-    }
-
-    pub(crate) fn environment(&self) -> &[(String, String)] {
-        &self.environment
     }
 
     pub(crate) fn guest(&self) -> Option<&GuestAssets> {
@@ -153,18 +143,6 @@ fn enabled_forwards(forwards: &BTreeMap<String, Forward>) -> BTreeMap<String, Fo
         .iter()
         .filter(|(_, entry)| entry.is_enabled())
         .map(|(name, entry)| (name.clone(), entry.clone()))
-        .collect()
-}
-
-fn forward_environment(enabled: &BTreeMap<String, Forward>) -> Vec<(String, String)> {
-    enabled
-        .iter()
-        .map(|(name, entry)| {
-            (
-                format!("SILO_{}_PORT", name.to_ascii_uppercase()),
-                entry.port.to_string(),
-            )
-        })
         .collect()
 }
 

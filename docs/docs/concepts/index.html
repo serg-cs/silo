@@ -104,7 +104,7 @@
           <ul>
             <li>Custom-image runs always use the isolated lifecycle.</li>
             <li>Project and user state entries are skipped because Silo cannot safely grant the image user access to private host-owned storage.</li>
-            <li>Enabled forwards are ignored with a warning and their environment variables are not supplied.</li>
+            <li>Enabled forwards are ignored with a warning.</li>
             <li>Enabled binds remain available, but their target must be project-relative or absolute; <code>~/</code> has no Silo-defined meaning for a custom image.</li>
             <li>The project root and configured read-only project overlays remain available.</li>
           </ul>

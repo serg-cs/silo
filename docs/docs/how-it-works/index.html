@@ -62,8 +62,8 @@
             <li>Read-only workspace overlays, bind and state sources, targets, and access modes.</li>
             <li>Forwarding SSH assets and ports, CPU count, memory, and creation command.</li>
           </ul>
-          <p>If the running or stopped container does not match the desired specification, Silo coordinates replacement rather than silently reusing the wrong environment. Image changes during creation are detected and retried within a bounded window.</p>
-          <p>Ephemeral state inside the old container is lost on replacement. The source tree, binds, and configured managed state are host-backed and remain available.</p>
+          <p>If a running container does not match the desired specification, or Silo cannot verify the current image and configuration, Silo warns and joins the existing workspace without applying changed creation settings. Existing forwarding is left untouched; changed forwarding settings wait for recreation. A stopped container is removed and recreated with the current specification. Image changes during creation are detected and retried within a bounded window.</p>
+          <p>Reusing a running container preserves its ephemeral state. When a stopped container is recreated, container-local state is lost; the source tree, binds, and configured managed state are host-backed and remain available.</p>
         </section>
 
         <section id="shared-lifecycle">
@@ -108,10 +108,9 @@
 postgres = { port = 5432 }
 
 # Available in the built-in shared container:
-127.0.0.1:5432
-SILO_POSTGRES_PORT=5432</code></pre>
+127.0.0.1:5432</code></pre>
           <p>The SSH client uses Silo's managed identity, exact host-key verification, and no ambient SSH configuration or agent. The guest account cannot open a shell, allocate a terminal, forward an agent, or listen on an unconfigured port.</p>
-          <p>Custom images and isolated runs keep a narrower contract: Silo warns, ignores enabled forwards, and supplies no forward environment variables.</p>
+          <p>Custom images and isolated runs keep a narrower contract: Silo warns and ignores enabled forwards.</p>
           <p>The broker caps concurrent relay work, shares listeners safely across active sessions, and removes idle networks only after their leases close. Startup and cleanup are serialized per project to avoid deleting a network while another session is acquiring it.</p>
         </section>
 

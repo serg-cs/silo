@@ -2517,7 +2517,7 @@ fn shared_create_command_applies_configured_sudo_access() {
 }
 
 #[test]
-fn shared_forward_assets_and_environment_reach_container_commands() {
+fn shared_forward_assets_reach_creation_without_session_environment() {
     let project = test_project("/tmp/project");
     let ids = HostIds {
         uid: "501".into(),
@@ -2530,8 +2530,6 @@ fn shared_forward_assets_and_environment_reach_container_commands() {
         )),
         ..ConfigMounts::default()
     };
-    let environment = [("SILO_POSTGRES_PORT".to_string(), "5432".to_string())];
-
     let shared = create_command(
         &project,
         TEST_IMAGE_DIGEST,
@@ -2551,21 +2549,20 @@ fn shared_forward_assets_and_environment_reach_container_commands() {
     assert!(shared_args.ends_with(&[IMAGE_TAG, SHARED_INIT_COMMAND]));
     assert!(!shared_args.contains(&"--network"));
 
-    let exec = exec_command_with_forward(false, &project, "abc123", &[], Shell::Zsh, &environment);
+    let exec = exec_command(false, &project, "abc123", &[], Shell::Zsh);
     let exec_args: Vec<_> = exec
         .get_args()
         .map(|arg| arg.to_str().expect("argument is UTF-8"))
         .collect();
-    assert!(exec_args.contains(&"SILO_POSTGRES_PORT=5432"));
     assert!(
         !exec_args
             .iter()
-            .any(|arg| arg.starts_with("SILO_POSTGRES_HOST="))
+            .any(|arg| arg.starts_with("SILO_") && arg.contains("_PORT="))
     );
 }
 
 #[test]
-fn isolated_commands_do_not_receive_forwarding_assets_or_environment() {
+fn isolated_commands_do_not_receive_forwarding_assets() {
     let project = test_project("/tmp/project");
     let command = isolated_create_command(
         false,
@@ -3223,242 +3220,124 @@ fn forward_assets_and_ports_change_the_container_specification() {
     assert_ne!(with_forwarding.spec, with_changed_ports.spec);
 }
 
-#[test]
-fn existing_container_identity_reuses_digest_spec_when_image_lookup_fails() {
-    let project = test_project("/tmp/project");
-    let expected = shared_identity(&project);
-    let inspection = shared_inspection(&project, &expected);
-
-    let actual = desired_existing_container_identity_with(
-        &inspection,
-        &project,
-        &HostIds {
+fn prepared_shared_test_container(project: &Project) -> PreparedSharedContainer {
+    PreparedSharedContainer {
+        ids: HostIds {
             uid: "501".into(),
             gid: "20".into(),
         },
-        &ConfigMounts::default(),
-        &Container::default(),
-        || Err(anyhow!("image inspection is unavailable")),
-    )
-    .expect("the inspected container remains reusable");
-
-    assert_eq!(actual, expected);
+        config_mounts: ConfigMounts::default(),
+        forwarding: forward::Session::prepare(&Config::default(), &project.root)
+            .expect("disabled forwarding needs no host state"),
+    }
 }
 
 #[test]
-fn existing_container_identity_requires_a_recorded_digest_when_image_lookup_fails() {
+fn matching_running_container_uses_current_settings() {
     let project = test_project("/tmp/project");
-    let expected = shared_identity(&project);
-    let mut inspection = shared_inspection(&project, &expected);
-    inspection.image_digest = None;
+    let config = Config::default();
+    let inspection = shared_inspection(&project, &shared_identity(&project));
 
-    let error = desired_existing_container_identity_with(
-        &inspection,
+    let container_use = running_container_use_with(
         &project,
-        &HostIds {
-            uid: "501".into(),
-            gid: "20".into(),
-        },
-        &ConfigMounts::default(),
-        &Container::default(),
-        || Err(anyhow!("image inspection is unavailable")),
-    )
-    .expect_err("an identity without a recorded digest is not reusable");
-
-    assert!(
-        error
-            .to_string()
-            .contains("image inspection is unavailable")
+        &config,
+        &inspection,
+        || Ok(prepared_shared_test_container(&project)),
+        || Ok(TEST_IMAGE_DIGEST.to_string()),
     );
+
+    assert!(matches!(container_use, SharedContainerUse::Current(_)));
 }
 
 #[test]
-fn existing_container_identity_requires_an_image_for_configuration_drift() {
-    let project = test_project("/tmp/project");
-    let mut inspection = shared_inspection(&project, &shared_identity(&project));
-    inspection
-        .labels
-        .insert(LABEL_SPEC.to_string(), "outdated".to_string());
-
-    let error = desired_existing_container_identity_with(
-        &inspection,
-        &project,
-        &HostIds {
-            uid: "501".into(),
-            gid: "20".into(),
-        },
-        &ConfigMounts::default(),
-        &Container::default(),
-        || Err(anyhow!("image is missing")),
-    )
-    .expect_err("configuration drift needs a replacement image");
-
-    assert!(error.to_string().contains("image is missing"));
-}
-
-#[test]
-fn existing_container_identity_prefers_the_current_image_digest() {
+fn image_and_configuration_drift_reuse_the_running_container() {
     let project = test_project("/tmp/project");
     let inspection = shared_inspection(&project, &shared_identity(&project));
     let updated_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-    let actual = desired_existing_container_identity_with(
-        &inspection,
+    let image_use = running_container_use_with(
         &project,
-        &HostIds {
-            uid: "501".into(),
-            gid: "20".into(),
-        },
-        &ConfigMounts::default(),
-        &Container::default(),
+        &Config::default(),
+        &inspection,
+        || Ok(prepared_shared_test_container(&project)),
         || Ok(updated_digest.to_string()),
-    )
-    .expect("the current image is available");
-
-    assert_ne!(actual.spec, shared_identity(&project).spec);
-}
-
-#[test]
-fn spec_drift_deletes_an_idle_running_container() {
-    let project = test_project("/tmp/project");
-    let identity = shared_identity(&project);
-    let mut inspection = shared_inspection(&project, &identity);
-    inspection
-        .labels
-        .insert(LABEL_SPEC.to_string(), "b".repeat(64));
-    let stopped = Cell::new(false);
-    let deleted = Cell::new(false);
-    let image_checked = Cell::new(false);
-
-    let outcome = replace_outdated_shared_container_with(
-        &project,
-        &inspection,
-        |_| Ok(0),
-        || {
-            image_checked.set(true);
-            Ok(())
-        },
-        |_| {
-            assert!(image_checked.get());
-            stopped.set(true);
-            Ok(())
-        },
-        |_| {
-            deleted.set(true);
-            Ok(())
-        },
-    )
-    .expect("an idle outdated container is replaced");
-
-    assert!(matches!(outcome, ReplacementOutcome::Replaced));
-    assert!(stopped.get());
-    assert!(deleted.get());
-}
-
-#[test]
-fn spec_drift_preserves_the_container_when_the_image_is_missing() {
-    let project = test_project("/tmp/project");
-    let identity = shared_identity(&project);
-    let mut inspection = shared_inspection(&project, &identity);
-    inspection
-        .labels
-        .insert(LABEL_SPEC.to_string(), "b".repeat(64));
-    let stopped = Cell::new(false);
-    let deleted = Cell::new(false);
-
-    let error = replace_outdated_shared_container_with(
-        &project,
-        &inspection,
-        |_| Ok(0),
-        || Err(anyhow!("replacement image is missing")),
-        |_| {
-            stopped.set(true);
-            Ok(())
-        },
-        |_| {
-            deleted.set(true);
-            Ok(())
-        },
-    )
-    .expect_err("the existing container must survive without a replacement image");
-
-    assert!(error.to_string().contains("replacement image is missing"));
-    assert!(!stopped.get());
-    assert!(!deleted.get());
-}
-
-#[test]
-fn spec_drift_reports_other_active_sessions_explicitly() {
-    let id = "silo-4070dfe2dfb71225713e6507";
-    let project = test_project("/tmp/project");
-    let identity = shared_identity(&project);
-    let mut inspection = shared_inspection(&project, &identity);
-    inspection
-        .labels
-        .insert(LABEL_SPEC.to_string(), "b".repeat(64));
-    let stopped = Cell::new(false);
-    let deleted = Cell::new(false);
-    let one = replace_outdated_shared_container_with(
-        &project,
-        &inspection,
-        |_| Ok(1),
-        || Ok(()),
-        |_| {
-            stopped.set(true);
-            Ok(())
-        },
-        |_| {
-            deleted.set(true);
-            Ok(())
-        },
-    )
-    .expect_err("an active outdated container is preserved")
-    .to_string();
-    assert!(one.contains("1 other active session"), "{one}");
-    assert!(one.contains("configuration changed"), "{one}");
-    assert!(!stopped.get());
-    assert!(!deleted.get());
-
-    let several = active_config_drift_error(id, 3).to_string();
-    assert!(several.contains("3 other active sessions"), "{several}");
-    assert!(
-        several.contains(&format!("silo containers delete {id} --force")),
-        "{several}"
     );
+    assert!(matches!(
+        image_use,
+        SharedContainerUse::Existing(RunningContainerWarning::Drift)
+    ));
+
+    let mut config = Config::default();
+    config.container.sudo = true;
+    let config_use = running_container_use_with(
+        &project,
+        &config,
+        &inspection,
+        || Ok(prepared_shared_test_container(&project)),
+        || Ok(TEST_IMAGE_DIGEST.to_string()),
+    );
+    assert!(matches!(
+        config_use,
+        SharedContainerUse::Existing(RunningContainerWarning::Drift)
+    ));
 }
 
 #[test]
-fn spec_drift_classifies_a_concurrent_stop_as_retryable() {
+fn comparison_failures_warn_and_reuse_the_running_container() {
     let project = test_project("/tmp/project");
-    let identity = shared_identity(&project);
-    let mut inspection = shared_inspection(&project, &identity);
-    inspection
-        .labels
-        .insert(LABEL_SPEC.to_string(), "b".repeat(64));
-    let deleted = Cell::new(false);
-
-    let outcome = replace_outdated_shared_container_with(
+    let config = Config::default();
+    let inspection = shared_inspection(&project, &shared_identity(&project));
+    let preparation_use = running_container_use_with(
         &project,
+        &config,
         &inspection,
-        |_| Ok(0),
-        || Ok(()),
-        |_| Err(anyhow!("ownership changed")),
-        |_| {
-            deleted.set(true);
-            Ok(())
-        },
-    )
-    .expect("a concurrent replacement is not fatal");
-
-    let ReplacementOutcome::Conflict(error) = outcome else {
-        panic!("the ownership race must be retried");
+        || Err(anyhow!("mount resolution is unavailable")),
+        || Ok(TEST_IMAGE_DIGEST.to_string()),
+    );
+    let SharedContainerUse::Existing(preparation_warning) = preparation_use else {
+        panic!("preparation failure must reuse the running container");
     };
     assert!(
-        error
-            .to_string()
-            .contains("could not safely stop the existing container")
+        running_container_warning(&project.id, &preparation_warning)
+            .contains("mount resolution is unavailable")
     );
-    assert!(!deleted.get());
+
+    let image_use = running_container_use_with(
+        &project,
+        &config,
+        &inspection,
+        || Ok(prepared_shared_test_container(&project)),
+        || Err(anyhow!("image inspection is unavailable")),
+    );
+    let SharedContainerUse::Existing(image_warning) = image_use else {
+        panic!("image inspection failure must reuse the running container");
+    };
+    let warning = running_container_warning(&project.id, &image_warning);
+    assert!(
+        warning.contains("image inspection is unavailable"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("connecting to the existing container"),
+        "{warning}"
+    );
+}
+
+#[test]
+fn drift_warning_explains_that_current_settings_are_deferred() {
+    let warning = running_container_warning(
+        "silo-4070dfe2dfb71225713e6507",
+        &RunningContainerWarning::Drift,
+    );
+
+    assert!(
+        warning.contains("different image or configuration"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("connecting to the existing running container"),
+        "{warning}"
+    );
+    assert!(warning.contains("recreate it to apply them"), "{warning}");
 }
 
 #[test]
