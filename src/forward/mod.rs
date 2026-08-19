@@ -16,6 +16,8 @@ use crate::config::{Config, Forward};
 
 const SSH_BIN: &str = "ssh";
 const SSH_KEYGEN_BIN: &str = "ssh-keygen";
+const SSH_IDENTITY_ENV: &str = "SILO_SSH_IDENTITY_FILE";
+const SSH_KNOWN_HOSTS_ENV: &str = "SILO_SSH_KNOWN_HOSTS_FILE";
 const FORWARD_STATE_DIR: &str = "forward";
 const IDENTITY_DIR: &str = "identity";
 const PROJECTS_DIR: &str = "projects";
@@ -242,11 +244,8 @@ fn ensure_key_pair(private_key: &Path, comment: &str) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let public = String::from_utf8(output.stdout)
-        .context("managed SSH public key is not UTF-8")?
-        .trim()
-        .to_string();
-    validate_public_key(&public)?;
+    let public = String::from_utf8(output.stdout).context("managed SSH public key is not UTF-8")?;
+    let public = normalize_public_key(public.trim())?;
     write_managed_file(
         &public_key,
         format!("{public} {comment}\n").as_bytes(),
@@ -271,14 +270,20 @@ fn validate_private_file(path: &Path, mode: u32, description: &str) -> Result<()
         .with_context(|| format!("could not protect {description} `{}`", path.display()))
 }
 
-fn validate_public_key(public: &str) -> Result<()> {
-    let mut fields = public.split_whitespace();
-    let key_type = fields.next();
-    let body = fields.next();
-    if key_type != Some("ssh-ed25519") || body.is_none() || fields.next().is_some() {
+fn normalize_public_key(public: &str) -> Result<String> {
+    if public.lines().count() != 1 {
         return Err(anyhow!("managed SSH identity is not an Ed25519 public key"));
     }
-    Ok(())
+
+    let mut fields = public.split_whitespace();
+    let key_type = fields.next();
+    let Some(body) = fields.next() else {
+        return Err(anyhow!("managed SSH identity is not an Ed25519 public key"));
+    };
+    if key_type != Some("ssh-ed25519") {
+        return Err(anyhow!("managed SSH identity is not an Ed25519 public key"));
+    }
+    Ok(format!("ssh-ed25519 {body}"))
 }
 
 fn write_managed_file(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
@@ -348,16 +353,11 @@ impl Tunnel {
         }
         remove_stale_control_socket(&socket)?;
 
-        let arguments = ssh_arguments(
-            &socket,
-            &self.identity,
-            &self.known_hosts,
-            &self.host_alias,
-            self.guest.ports(),
-            address,
-        );
-        let output = Command::new(SSH_BIN)
-            .args(&arguments)
+        let arguments = ssh_arguments(&socket, &self.host_alias, self.guest.ports(), address);
+        let mut command = Command::new(SSH_BIN);
+        command.args(&arguments);
+        set_ssh_path_environment(&mut command, &self.identity, &self.known_hosts);
+        let output = command
             .output()
             .context("could not start SSH host-forward tunnel")?;
         if !output.status.success() {
@@ -440,8 +440,6 @@ fn remove_stale_control_socket(path: &Path) -> Result<()> {
 
 fn ssh_arguments(
     socket: &Path,
-    identity: &Path,
-    known_hosts: &Path,
     host_alias: &str,
     ports: &BTreeSet<u16>,
     address: Ipv4Addr,
@@ -461,11 +459,11 @@ fn ssh_arguments(
         format!("HostKeyAlias={host_alias}"),
         "IdentitiesOnly=yes".to_string(),
         "IdentityAgent=none".to_string(),
-        format!("IdentityFile={}", identity.display()),
+        format!("IdentityFile=${{{SSH_IDENTITY_ENV}}}"),
         "ServerAliveCountMax=3".to_string(),
         "ServerAliveInterval=15".to_string(),
         "StrictHostKeyChecking=yes".to_string(),
-        format!("UserKnownHostsFile={}", known_hosts.display()),
+        format!("UserKnownHostsFile=${{{SSH_KNOWN_HOSTS_ENV}}}"),
     ] {
         arguments.push("-o".into());
         arguments.push(option.into());
@@ -476,6 +474,12 @@ fn ssh_arguments(
     }
     arguments.push(format!("silo@{address}").into());
     arguments
+}
+
+fn set_ssh_path_environment(command: &mut Command, identity: &Path, known_hosts: &Path) {
+    command
+        .env(SSH_IDENTITY_ENV, identity)
+        .env(SSH_KNOWN_HOSTS_ENV, known_hosts);
 }
 
 struct FileLock {
