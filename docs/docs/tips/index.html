@@ -80,10 +80,10 @@ logs = ["sh", "-lc", "just logs | tail -n 100"]</code></pre>
           <pre data-copy><code>[forward]
 postgres = { port = 5432 }
 api = { port = 8080 }</code></pre>
-          <p>Use the same ports on <code>localhost</code> inside the built-in container:</p>
-          <pre data-copy><code>psql -h localhost -p "$SILO_POSTGRES_PORT"
-curl "http://localhost:$SILO_API_PORT/health"</code></pre>
-          <p>The named port variables are useful when a tool should follow configuration instead of hard-coding a service port. Custom images receive both host and port variables because their image-defined startup does not include Silo's loopback listener.</p>
+          <p>Use the same IPv4 loopback ports inside the built-in shared container:</p>
+          <pre data-copy><code>psql -h 127.0.0.1 -p "$SILO_POSTGRES_PORT"
+curl "http://127.0.0.1:$SILO_API_PORT/health"</code></pre>
+          <p>The named port variables are useful when a tool should follow configuration instead of hard-coding a service port. Custom images and isolated runs ignore forwards with a warning and do not receive these variables.</p>
         </section>
 
         <section id="resources">
@@ -145,8 +145,8 @@ artifacts = { source = "./artifacts", target = "./artifacts", access = "read-wri
           <h3 id="runtime-not-started"><a href="#runtime-not-started">The Apple container system is unavailable</a></h3>
           <p>Check the runtime directly with <code>container system status</code>. Silo attempts to start the system for image builds and first-use paths that require it, but kernels and service failures belong to Apple's CLI.</p>
 
-          <h3 id="forward-version"><a href="#forward-version">Forwarding requires a newer runtime</a></h3>
-          <p>Enabled forwards require Apple <code>container</code> 1.2.1 or newer. Check <code>container system version --format json</code>, update the runtime through its supported channel, or temporarily set the affected forward to <code>enabled = false</code>.</p>
+          <h3 id="forward-ssh"><a href="#forward-ssh">An SSH forward cannot start</a></h3>
+          <p>Confirm that <code>ssh</code> and <code>ssh-keygen</code> are installed on the host, rebuild the built-in image after upgrading Silo, and check that the named port is free inside the container. Forwarding is intentionally unavailable for custom images and <code>--isolated</code> runs.</p>
 
           <h3 id="unknown-config"><a href="#unknown-config">An unknown config key is ignored</a></h3>
           <p>Read the warning's full dotted key and file path, fix the likely typo, then run <code>silo config check</code>. Unknown values never participate in the effective configuration.</p>

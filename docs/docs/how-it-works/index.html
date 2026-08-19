@@ -37,11 +37,11 @@
             <li><strong>Discover.</strong> Canonicalize the current directory and select a <code>.silo.toml</code> marker, the nearest Git or Jujutsu root, or the current directory itself.</li>
             <li><strong>Configure.</strong> Load built-in defaults, global TOML, and the project TOML; warn about unknown or unreachable entries; then apply invocation resource flags.</li>
             <li><strong>Validate.</strong> Resolve the lifecycle, image contract, binds, managed state, configured read-only workspace paths, container settings, and enabled forwards.</li>
-            <li><strong>Prepare.</strong> Confirm the image/runtime state and establish managed storage or a forwarding lease where needed.</li>
+            <li><strong>Prepare.</strong> Confirm the image/runtime state and establish managed storage and SSH forwarding assets where needed.</li>
             <li><strong>Run.</strong> Reuse or create the shared project container, or create a one-shot isolated container, then attach the requested shell or command.</li>
-            <li><strong>Clean up.</strong> Restore the terminal, release session and forwarding leases, and remove isolated runtime resources.</li>
+            <li><strong>Clean up.</strong> Restore the terminal, release the session lease, and remove isolated runtime resources.</li>
           </ol>
-          <p>Silo has no persistent host daemon. The forwarding broker is a short-lived internal helper started only when forwarding is active and exits after its leases become idle.</p>
+          <p>Silo has no persistent host daemon. When forwarding is active, the host SSH master remains connected only for the lifetime of the shared container and exits when that container stops.</p>
         </section>
 
         <section id="identity">
@@ -60,7 +60,7 @@
             <li>Host user and group IDs.</li>
             <li>Project root and working directory.</li>
             <li>Read-only workspace overlays, bind and state sources, targets, and access modes.</li>
-            <li>Forward network, CPU count, memory, and creation command.</li>
+            <li>Forwarding SSH assets and ports, CPU count, memory, and creation command.</li>
           </ul>
           <p>If the running or stopped container does not match the desired specification, Silo coordinates replacement rather than silently reusing the wrong environment. Image changes during creation are detected and retried within a bounded window.</p>
           <p>Ephemeral state inside the old container is lost on replacement. The source tree, binds, and configured managed state are host-backed and remain available.</p>
@@ -96,22 +96,22 @@
 
         <section id="forwarding">
           <h2><a href="#forwarding">Host loopback forwarding</a></h2>
-          <p>A container cannot reach a service bound only to the host's <code>127.0.0.1</code> through normal container networking. For each project with enabled forwards, Silo:</p>
+          <p>A container cannot reach a service bound only to the host's <code>127.0.0.1</code> through normal container networking. In the built-in shared mode, Silo:</p>
           <ol>
-            <li>Checks that Apple's <code>container</code> runtime is at least version 1.2.1.</li>
-            <li>Creates or validates a labeled, project-specific IPv4 network.</li>
-            <li>Acquires relay listeners from a per-user local broker.</li>
-            <li>Limits accepted relay sources to leased project-network subnets.</li>
-            <li>Starts built-in-image listeners on the configured IPv4 and IPv6 loopback ports before declaring the container ready.</li>
+            <li>Generates or reuses a managed client identity and a project-specific SSH host identity.</li>
+            <li>Mounts only the guest host key and a restricted <code>authorized_keys</code> file into the container.</li>
+            <li>Waits for the container's IPv4 address and its restricted SSH server.</li>
+            <li>Starts or reuses one authenticated SSH master with a reverse tunnel for each named port.</li>
+            <li>Binds every guest listener to <code>127.0.0.1</code> and targets the same <code>127.0.0.1</code> port on the host.</li>
           </ol>
           <pre><code>[forward]
 postgres = { port = 5432 }
 
-# Available in the built-in image:
-localhost:5432
+# Available in the built-in shared container:
+127.0.0.1:5432
 SILO_POSTGRES_PORT=5432</code></pre>
-          <p>The guest listener crosses the project network through a leased broker port, and the broker connects each accepted request to <code>127.0.0.1:5432</code> on the host. Those internal addresses remain implementation details.</p>
-          <p>Custom images do not use Silo's guest listener. They retain the gateway and leased port as <code>SILO_POSTGRES_HOST</code> and <code>SILO_POSTGRES_PORT</code>.</p>
+          <p>The SSH client uses Silo's managed identity, exact host-key verification, and no ambient SSH configuration or agent. The guest account cannot open a shell, allocate a terminal, forward an agent, or listen on an unconfigured port.</p>
+          <p>Custom images and isolated runs keep a narrower contract: Silo warns, ignores enabled forwards, and supplies no forward environment variables.</p>
           <p>The broker caps concurrent relay work, shares listeners safely across active sessions, and removes idle networks only after their leases close. Startup and cleanup are serialized per project to avoid deleting a network while another session is acquiring it.</p>
         </section>
 

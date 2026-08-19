@@ -89,26 +89,40 @@ fn built_in_images_remain_shared_by_default() {
 }
 
 #[test]
-fn forwarded_shared_preflight_preserves_image_fallback() {
+fn shared_preflight_preserves_image_fallback() {
     let image_checked = Cell::new(false);
-    let system_checked = Cell::new(false);
 
-    runtime_preflight_with(
-        false,
-        true,
-        || {
-            image_checked.set(true);
-            Err(anyhow!("image inspection is unavailable"))
-        },
-        || {
-            system_checked.set(true);
-            Ok(())
-        },
-    )
-    .expect("shared forwarding only requires the container system");
+    runtime_preflight_with(false, || {
+        image_checked.set(true);
+        Err(anyhow!("image inspection is unavailable"))
+    })
+    .expect("shared runs can reuse the existing container");
 
     assert!(!image_checked.get());
-    assert!(system_checked.get());
+}
+
+#[test]
+fn unsupported_forward_warning_distinguishes_isolated_and_custom_runs() {
+    let mut config = Config::default();
+    config.forward.insert(
+        "postgres".to_string(),
+        Forward {
+            port: 5432,
+            enabled: Some(true),
+        },
+    );
+
+    assert!(
+        unsupported_forward_warning(&config, true)
+            .is_some_and(|warning| warning.contains("isolated run"))
+    );
+    config.image.dockerfile = Some(PathBuf::from("/tmp/Dockerfile"));
+    assert!(
+        unsupported_forward_warning(&config, false)
+            .is_some_and(|warning| warning.contains("custom-image run"))
+    );
+    config.image.dockerfile = None;
+    assert_eq!(unsupported_forward_warning(&config, false), None);
 }
 
 #[test]
@@ -856,34 +870,6 @@ fn inspect_image_does_not_boot_when_the_system_is_up() {
     assert_eq!(boots.get(), 0);
 }
 
-#[test]
-fn system_preflight_allows_a_missing_image_tag() {
-    let boots = Cell::new(0);
-
-    ensure_container_system_with(
-        || Ok("Error: image not found: silo:latest".to_string()),
-        || {
-            boots.set(boots.get() + 1);
-            true
-        },
-    )
-    .expect("a running system does not require the image tag");
-
-    assert_eq!(boots.get(), 0);
-}
-
-#[test]
-fn system_preflight_reports_a_failed_boot() {
-    let error = ensure_container_system_with(|| Ok(NOT_STARTED_HINT.to_string()), || false)
-        .expect_err("an unavailable system must start");
-
-    assert!(
-        error
-            .to_string()
-            .contains("could not start Apple container system")
-    );
-}
-
 #[cfg(unix)]
 #[test]
 fn exit_code_reports_signals_as_128_plus_signal() {
@@ -1139,8 +1125,7 @@ fn run_command_mounts_project_paths_read_only() {
                 read_only_path("/tmp/project/.jj", ".jj"),
             ],
             named: vec![],
-            network: None,
-            guest_forwarding: None,
+            forwarding: None,
         },
         &Container::default(),
         "silo-123",
@@ -1234,8 +1219,7 @@ fn run_command_mounts_configured_named_mounts() {
         &ConfigMounts {
             read_only: vec![],
             named,
-            network: None,
-            guest_forwarding: None,
+            forwarding: None,
         },
         &Container::default(),
         "silo-123",
@@ -1272,8 +1256,7 @@ fn run_command_orders_read_only_then_named_mounts() {
         &ConfigMounts {
             read_only: vec![read_only_path("/tmp/project/.git", ".git")],
             named,
-            network: None,
-            guest_forwarding: None,
+            forwarding: None,
         },
         &Container::default(),
         "silo-123",
@@ -1319,8 +1302,7 @@ fn shared_create_bind_mounts_all_managed_storage() {
                 access: Permission::ReadOnly,
             },
         ],
-        network: None,
-        guest_forwarding: None,
+        forwarding: None,
     };
     let command = create_command(
         &test_project("/tmp/project"),
@@ -1398,8 +1380,7 @@ fn built_in_isolated_mount_filter_keeps_all_managed_mounts() {
         &ConfigMounts {
             read_only: vec![],
             named: mounts,
-            network: None,
-            guest_forwarding: None,
+            forwarding: None,
         },
         &Container::default(),
         "silo-123",
@@ -2536,54 +2517,20 @@ fn shared_create_command_applies_configured_sudo_access() {
 }
 
 #[test]
-fn forward_network_and_environment_reach_container_commands() {
+fn shared_forward_assets_and_environment_reach_container_commands() {
     let project = test_project("/tmp/project");
     let ids = HostIds {
         uid: "501".into(),
         gid: "20".into(),
     };
     let mounts = ConfigMounts {
-        network: Some("silo-net-test".to_string()),
-        guest_forwarding: Some(forward::GuestForwarding::new(
-            "192.168.64.1".parse().expect("gateway parses"),
-            BTreeMap::from([(5432, 15432)]),
+        forwarding: Some(forward::GuestAssets::new(
+            PathBuf::from("/tmp/silo-forward-assets"),
+            BTreeSet::from([5432]),
         )),
         ..ConfigMounts::default()
     };
     let environment = [("SILO_POSTGRES_PORT".to_string(), "5432".to_string())];
-
-    let isolated = isolated_create_command_with_forward(
-        false,
-        &project.root,
-        &ids,
-        &mounts,
-        &Container::default(),
-        "silo-isolated",
-        &[],
-        Some(Shell::Zsh),
-        &environment,
-    )
-    .expect("isolated command builds");
-    let isolated_args = args_without_labels(&isolated);
-    assert!(
-        isolated_args
-            .windows(2)
-            .any(|pair| pair == ["--network", "silo-net-test"])
-    );
-    assert!(isolated_args.contains(&"SILO_POSTGRES_PORT=5432"));
-    assert!(
-        !isolated_args
-            .iter()
-            .any(|arg| arg.starts_with("SILO_POSTGRES_HOST="))
-    );
-    assert!(isolated_args.ends_with(&[
-        IMAGE_TAG,
-        FORWARD_WRAPPER_COMMAND,
-        "192.168.64.1",
-        "5432:15432",
-        "--",
-        ZSH_PATH,
-    ]));
 
     let shared = create_command(
         &project,
@@ -2595,19 +2542,14 @@ fn forward_network_and_environment_reach_container_commands() {
     )
     .expect("shared command builds");
     let shared_args = args_without_labels(&shared);
-    assert!(
-        shared_args
-            .windows(2)
-            .any(|pair| pair == ["--network", "silo-net-test"])
-    );
-    assert!(shared_args.ends_with(&[
-        IMAGE_TAG,
-        FORWARD_WRAPPER_COMMAND,
-        "192.168.64.1",
-        "5432:15432",
-        "--",
-        SHARED_INIT_COMMAND,
-    ]));
+    assert!(shared_args.windows(2).any(|pair| pair
+        == [
+            "--mount",
+            "type=bind,source=/tmp/silo-forward-assets,target=/run/silo-ssh,readonly"
+        ]));
+    assert!(shared_args.contains(&"SILO_INTERNAL_SSH_FORWARDING=1"));
+    assert!(shared_args.ends_with(&[IMAGE_TAG, SHARED_INIT_COMMAND]));
+    assert!(!shared_args.contains(&"--network"));
 
     let exec = exec_command_with_forward(false, &project, "abc123", &[], Shell::Zsh, &environment);
     let exec_args: Vec<_> = exec
@@ -2623,35 +2565,68 @@ fn forward_network_and_environment_reach_container_commands() {
 }
 
 #[test]
-fn custom_image_forwarding_keeps_gateway_environment_without_guest_wrapper() {
+fn isolated_commands_do_not_receive_forwarding_assets_or_environment() {
     let project = test_project("/tmp/project");
-    let environment = [
-        ("SILO_POSTGRES_HOST".to_string(), "192.168.64.1".to_string()),
-        ("SILO_POSTGRES_PORT".to_string(), "15432".to_string()),
-    ];
-    let command = isolated_create_command_with_forward(
+    let command = isolated_create_command(
         false,
         &project.root,
         &HostIds {
             uid: "501".into(),
             gid: "20".into(),
         },
-        &ConfigMounts {
-            network: Some("silo-net-test".to_string()),
-            ..ConfigMounts::default()
-        },
+        &ConfigMounts::default(),
         &Container::default(),
         "silo-isolated",
         &[],
         None,
-        &environment,
     )
-    .expect("custom image command builds");
+    .expect("isolated command builds");
     let args = args_without_labels(&command);
 
-    assert!(args.contains(&"SILO_POSTGRES_HOST=192.168.64.1"));
-    assert!(args.contains(&"SILO_POSTGRES_PORT=15432"));
-    assert!(!args.contains(&FORWARD_WRAPPER_COMMAND));
+    assert!(
+        !args
+            .iter()
+            .any(|argument| argument.starts_with("SILO_POSTGRES_"))
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|argument| argument.contains("/run/silo-ssh"))
+    );
+    assert!(!args.contains(&"SILO_INTERNAL_SSH_FORWARDING=1"));
+}
+
+#[test]
+fn user_mount_at_forwarding_path_does_not_enable_sshd() {
+    let project = test_project("/tmp/project");
+    let mounts = ConfigMounts {
+        named: vec![resolved_host(
+            "runtime",
+            "/tmp/runtime",
+            "/run/silo-ssh",
+            Permission::ReadWrite,
+        )],
+        ..ConfigMounts::default()
+    };
+    let command = create_command(
+        &project,
+        TEST_IMAGE_DIGEST,
+        &HostIds {
+            uid: "501".into(),
+            gid: "20".into(),
+        },
+        &mounts,
+        &Container::default(),
+        Path::new("/tmp/project.cid"),
+    )
+    .expect("shared command builds");
+    let args = args_without_labels(&command);
+
+    assert!(
+        args.iter()
+            .any(|argument| argument.contains("target=/run/silo-ssh"))
+    );
+    assert!(!args.contains(&"SILO_INTERNAL_SSH_FORWARDING=1"));
 }
 
 #[test]
@@ -2882,10 +2857,14 @@ fn inspect_parser_accepts_current_nested_state() {
             },
             "resources":{"cpus":8,"memoryInBytes":12884901888}
         },
-        "status":{"state":"running","networks":[]}
+        "status":{"state":"running","networks":[{"ipv4Address":"192.168.64.2/24"}]}
     }]"#;
     let inspection = parse_container_inspection(json, "silo-test").expect("state parses");
     assert_eq!(inspection.state, ContainerState::Running);
+    assert_eq!(
+        inspection.ipv4_address,
+        Some(Ipv4Addr::new(192, 168, 64, 2))
+    );
     assert_eq!(inspection.image.as_deref(), Some("silo:latest"));
     assert_eq!(inspection.image_digest.as_deref(), Some("sha256:aaaa"));
     assert_eq!(inspection.resources.cpus, Some(8));
@@ -3135,6 +3114,7 @@ fn shared_identity(project: &Project) -> ContainerIdentity {
 fn shared_inspection(project: &Project, identity: &ContainerIdentity) -> ContainerInspection {
     ContainerInspection {
         state: ContainerState::Running,
+        ipv4_address: Some(Ipv4Addr::new(192, 168, 64, 2)),
         labels: HashMap::from([
             (LABEL_OWNER.to_string(), LABEL_OWNER_VALUE.to_string()),
             (LABEL_SCHEMA.to_string(), LABEL_SCHEMA_VALUE.to_string()),
@@ -3169,6 +3149,7 @@ fn inspect_identity_refuses_foreign_containers_including_buildkit() {
     let identity = shared_identity(&project);
     let foreign = ContainerInspection {
         state: ContainerState::Running,
+        ipv4_address: None,
         labels: HashMap::new(),
         image: None,
         image_digest: None,
@@ -3198,10 +3179,10 @@ fn inspect_identity_distinguishes_owned_spec_drift() {
 }
 
 #[test]
-fn forward_network_and_guest_mapping_change_the_container_specification() {
+fn forward_assets_and_ports_change_the_container_specification() {
     let project = test_project("/tmp/project");
-    let without_network = shared_identity(&project);
-    let with_network = container_identity(
+    let without_forwarding = shared_identity(&project);
+    let with_forwarding = container_identity(
         &project,
         TEST_IMAGE_DIGEST,
         &HostIds {
@@ -3209,14 +3190,17 @@ fn forward_network_and_guest_mapping_change_the_container_specification() {
             gid: "20".into(),
         },
         &ConfigMounts {
-            network: Some("silo-net-test".to_string()),
+            forwarding: Some(forward::GuestAssets::new(
+                PathBuf::from("/tmp/silo-forward-a"),
+                BTreeSet::from([5432]),
+            )),
             ..ConfigMounts::default()
         },
         &Container::default(),
         LABEL_SHARED_VALUE,
         &[OsString::from(SHARED_INIT_COMMAND)],
     );
-    let with_guest_mapping = container_identity(
+    let with_changed_ports = container_identity(
         &project,
         TEST_IMAGE_DIGEST,
         &HostIds {
@@ -3224,10 +3208,9 @@ fn forward_network_and_guest_mapping_change_the_container_specification() {
             gid: "20".into(),
         },
         &ConfigMounts {
-            network: Some("silo-net-test".to_string()),
-            guest_forwarding: Some(forward::GuestForwarding::new(
-                "192.168.64.1".parse().expect("gateway parses"),
-                BTreeMap::from([(5432, 15432)]),
+            forwarding: Some(forward::GuestAssets::new(
+                PathBuf::from("/tmp/silo-forward-a"),
+                BTreeSet::from([5432, 6379]),
             )),
             ..ConfigMounts::default()
         },
@@ -3236,8 +3219,8 @@ fn forward_network_and_guest_mapping_change_the_container_specification() {
         &[OsString::from(SHARED_INIT_COMMAND)],
     );
 
-    assert_ne!(without_network.spec, with_network.spec);
-    assert_ne!(with_network.spec, with_guest_mapping.spec);
+    assert_ne!(without_forwarding.spec, with_forwarding.spec);
+    assert_ne!(with_forwarding.spec, with_changed_ports.spec);
 }
 
 #[test]
@@ -3510,6 +3493,7 @@ fn isolated_orphan_cleanup_requires_complete_runtime_ownership_labels() {
     );
     let mut inspection = ContainerInspection {
         state: ContainerState::Running,
+        ipv4_address: None,
         labels: HashMap::from([
             (LABEL_OWNER.to_string(), LABEL_OWNER_VALUE.to_string()),
             (LABEL_SCHEMA.to_string(), LABEL_SCHEMA_VALUE.to_string()),
@@ -3698,7 +3682,7 @@ fn embedded_image_contains_guest_lifecycle_programs() {
     assert!(DOCKERFILE.contains("COPY silo-reserve.sh"));
     assert!(DOCKERFILE.contains("COPY silo-status.sh"));
     assert!(DOCKERFILE.contains("COPY silo-stop-guard.sh"));
-    assert!(DOCKERFILE.contains("COPY silo-forward.sh"));
+    assert!(DOCKERFILE.contains("COPY silo-sshd_config"));
     assert!(DOCKERFILE.contains("util-linux"));
     assert!(DOCKERFILE.contains("sudo"));
     assert!(DOCKERFILE.contains("${SILO_SUDO:-0}"));
@@ -3710,9 +3694,11 @@ fn embedded_image_contains_guest_lifecycle_programs() {
     assert!(SESSION_RESERVER.contains("flock --shared"));
     assert!(STATUS_HELPER.contains("count=$((count + 1))"));
     assert!(STOP_GUARD.contains("flock --exclusive --nonblock"));
-    assert!(FORWARD_WRAPPER.contains("TCP4-LISTEN"));
-    assert!(FORWARD_WRAPPER.contains("TCP6-LISTEN"));
-    assert!(FORWARD_WRAPPER.contains("touch \"$runtime/ready\""));
+    assert!(DOCKERFILE.contains("if [ \"$ssh_forwarding\" = 1 ]"));
+    assert!(DOCKERFILE.contains("unset SILO_INTERNAL_SSH_FORWARDING"));
+    assert!(!DOCKERFILE.contains("if [ -d /run/silo-ssh ]"));
+    assert!(DOCKERFILE.contains("sshd\" -t -f /etc/ssh/silo_sshd_config"));
+    assert!(DOCKERFILE.contains("touch /run/silo/ready"));
     assert!(SESSION_WRAPPER.contains("exec \"$@\""));
     assert!(!DOCKERFILE.contains("SILO_STATE_TARGETS"));
     assert!(!DOCKERFILE.contains("silo-init-state"));
@@ -3720,18 +3706,16 @@ fn embedded_image_contains_guest_lifecycle_programs() {
 }
 
 #[test]
-fn forwarding_wrapper_has_valid_posix_shell_syntax() {
-    let dir = TestDir::new("forward-wrapper-syntax");
-    let path = dir.path().join("silo-forward");
-    fs::write(&path, FORWARD_WRAPPER).expect("forwarding wrapper is written");
-
-    let status = Command::new("sh")
-        .arg("-n")
-        .arg(path)
-        .status()
-        .expect("POSIX shell starts");
-
-    assert!(status.success());
+fn ssh_forwarding_configuration_disables_login_and_non_remote_forwarding() {
+    assert!(SSHD_CONFIG.contains("AddressFamily inet"));
+    assert!(SSHD_CONFIG.contains("AllowTcpForwarding remote"));
+    assert!(SSHD_CONFIG.contains("GatewayPorts no"));
+    assert!(SSHD_CONFIG.contains("MaxSessions 0"));
+    assert!(SSHD_CONFIG.contains("ForceCommand /usr/bin/false"));
+    assert!(SSHD_CONFIG.contains("PasswordAuthentication no"));
+    assert!(SSHD_CONFIG.contains("PermitRootLogin no"));
+    assert!(SSHD_CONFIG.contains("AllowAgentForwarding no"));
+    assert!(SSHD_CONFIG.contains("X11Forwarding no"));
 }
 
 #[test]
@@ -3775,7 +3759,7 @@ fn embedded_image_installs_developer_tooling_and_yazi_dependencies() {
         "qwen-code",
         "ruff",
         "shellcheck",
-        "socat",
+        "openssh",
         "tmux",
         "uv",
         "vim",

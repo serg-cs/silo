@@ -125,9 +125,9 @@ web_api = { port = 8080, enabled = true }</code></pre>
               <tr><td><code>enabled</code></td><td>Optional boolean; defaults to <code>true</code>.</td></tr>
             </tbody>
           </table></div>
-          <p>In the built-in image, the configured port is available on container loopback too. The example supplies <code>SILO_POSTGRES_PORT=5432</code> and <code>SILO_WEB_API_PORT=8080</code>, so programs may connect directly to <code>localhost:$SILO_POSTGRES_PORT</code>.</p>
-          <p>Custom images keep their own image contract and do not receive the guest loopback relay. Their sessions instead receive both <code>SILO_POSTGRES_HOST</code> and <code>SILO_POSTGRES_PORT</code> with the internal gateway and leased relay port.</p>
-          <p>Silo forwards only the named host loopback ports. It creates a private project network and relays traffic through bounded listeners rather than exposing every host service.</p>
+          <p>In the built-in shared container, each configured port is available on the same IPv4 loopback port. The example supplies <code>SILO_POSTGRES_PORT=5432</code> and <code>SILO_WEB_API_PORT=8080</code>, so programs may connect directly to <code>127.0.0.1:$SILO_POSTGRES_PORT</code>.</p>
+          <p>Silo establishes an authenticated SSH reverse tunnel for only the named ports. Each guest listener binds to <code>127.0.0.1</code> and connects to the same <code>127.0.0.1</code> port on the host; forwarding does not expose other host services.</p>
+          <div class="warning"><p>Forwarding is not part of the custom-image or isolated-mode contract. If either is selected, Silo warns, ignores enabled forwards, and does not supply their environment variables.</p></div>
         </section>
 
         <section id="binds">

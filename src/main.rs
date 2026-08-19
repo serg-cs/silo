@@ -12,9 +12,6 @@ mod forward;
 use cli::{Cli, Command, ConfigCommand, ContainersCommand, ImageCommand, StateCommand};
 
 fn main() -> ExitCode {
-    if let Some(result) = forward::run_internal_broker() {
-        return result.map_or_else(|err| fail(&err), |()| ExitCode::SUCCESS);
-    }
     let cli = Cli::parse();
     if let Command::Config { command } = &cli.command {
         return run_config_command(command.as_ref()).unwrap_or_else(|err| fail(&err));

@@ -1,0 +1,33 @@
+Port 22
+AddressFamily inet
+ListenAddress 0.0.0.0
+
+HostKey /run/silo-ssh/ssh_host_ed25519_key
+PidFile /run/silo/sshd.pid
+
+AllowUsers silo
+AuthenticationMethods publickey
+AuthorizedKeysFile /run/silo-ssh/authorized_keys
+KbdInteractiveAuthentication no
+PasswordAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+PubkeyAuthentication yes
+StrictModes yes
+UsePAM no
+ForceCommand /usr/bin/false
+
+AllowAgentForwarding no
+AllowStreamLocalForwarding no
+AllowTcpForwarding remote
+GatewayPorts no
+MaxSessions 0
+PermitTunnel no
+PermitUserEnvironment no
+PermitUserRC no
+PermitTTY no
+X11Forwarding no
+
+ClientAliveCountMax 3
+ClientAliveInterval 60
+LogLevel VERBOSE

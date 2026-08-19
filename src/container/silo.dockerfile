@@ -38,6 +38,14 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 # Temporary build-time sudo lets Playwright install system dependencies. The
 # grant is removed before the image is finalized and restored only on request.
 RUN useradd --create-home --shell /bin/bash silo \
+    && groupadd --system sshd \
+    && useradd \
+        --system \
+        --gid sshd \
+        --home-dir /home/linuxbrew/.linuxbrew/var/lib/sshd \
+        --no-create-home \
+        --shell /usr/sbin/nologin \
+        sshd \
     && printf '%s\n' 'silo ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/silo \
     && chmod 0440 /etc/sudoers.d/silo
 
@@ -69,6 +77,7 @@ RUN brew install \
         node \
         nushell \
         opencode \
+        openssh \
         pi-coding-agent \
         playwright-cli \
         python \
@@ -78,7 +87,6 @@ RUN brew install \
         rust \
         rust-analyzer \
         shellcheck \
-        socat \
         tmux \
         uv \
         vim \
@@ -102,6 +110,9 @@ RUN playwright-cli install-browser --with-deps \
 # (Zsh by default) as PID 1.
 USER root
 RUN usermod --shell "${BREW_PREFIX}/bin/zsh" silo \
+    && passwd --delete silo \
+    && install -d -m 0755 /run/sshd \
+    && install -d -o root -g root -m 0755 "${BREW_PREFIX}/var/lib/sshd" \
     && for shell in \
         /bin/bash \
         "${BREW_PREFIX}/bin/zsh" \
@@ -115,18 +126,21 @@ COPY silo-session.sh /usr/local/bin/silo-session
 COPY silo-reserve.sh /usr/local/bin/silo-reserve
 COPY silo-status.sh /usr/local/bin/silo-status
 COPY silo-stop-guard.sh /usr/local/bin/silo-stop-guard
-COPY silo-forward.sh /usr/local/bin/silo-forward
+COPY silo-sshd_config /etc/ssh/silo_sshd_config
 RUN chmod 0755 \
         /usr/local/bin/silo-supervisor \
         /usr/local/bin/silo-session \
         /usr/local/bin/silo-reserve \
         /usr/local/bin/silo-status \
-        /usr/local/bin/silo-stop-guard \
-        /usr/local/bin/silo-forward
+        /usr/local/bin/silo-stop-guard
 
 RUN cat > /usr/local/bin/silo-entrypoint <<'EOF'
 #!/bin/sh
 set -eu
+
+# Consume the creation-time forwarding marker before starting user processes.
+ssh_forwarding="${SILO_INTERNAL_SSH_FORWARDING:-0}"
+unset SILO_INTERNAL_SSH_FORWARDING
 
 # Remap silo to the host ids (SILO_UID/SILO_GID, set by `silo run`).
 if [ -n "${SILO_UID:-}" ]; then
@@ -152,12 +166,15 @@ install -d -o silo -g silo -m 0700 \
 if [ "$(stat -c %u /home/linuxbrew/.linuxbrew)" != "$(id -u silo)" ]; then
     chown -R silo:silo /home/linuxbrew
 fi
+install -d -o root -g root -m 0755 \
+    /run/sshd "${BREW_PREFIX}/var/lib/sshd"
 
-# The forwarding wrapper publishes readiness after claiming every loopback
-# listener. Runs without forwarding are ready after entrypoint initialization.
-if [ "${1:-}" != /usr/local/bin/silo-forward ]; then
-    touch /run/silo/ready
+# Start the restricted tunnel server only when container creation enabled it.
+if [ "$ssh_forwarding" = 1 ]; then
+    "${BREW_PREFIX}/sbin/sshd" -t -f /etc/ssh/silo_sshd_config
+    "${BREW_PREFIX}/sbin/sshd" -f /etc/ssh/silo_sshd_config -E /run/silo/sshd.log
 fi
+touch /run/silo/ready
 
 exec setpriv --reuid "$(id -u silo)" --regid "$(id -g silo)" --init-groups \
     env HOME=/home/silo "$@"
@@ -168,3 +185,5 @@ WORKDIR /home/silo
 
 ENTRYPOINT ["/usr/local/bin/silo-entrypoint"]
 CMD ["zsh"]
+
+EXPOSE 22
