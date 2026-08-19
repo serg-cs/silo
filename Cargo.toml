@@ -14,9 +14,11 @@ pedantic = "deny"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.23.1"
 clap = { version = "4.6.6", features = ["derive"] }
 comfy-table = "8.0.0"
 libc = "0.2"
+parse-dockerfile = { version = "0.1.8", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"

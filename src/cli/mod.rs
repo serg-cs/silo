@@ -38,7 +38,7 @@ pub(crate) enum Command {
         /// Override the memory allocated to the container (for example `4G`).
         #[arg(long, value_parser = parse_memory)]
         memory: Option<String>,
-        /// Grant passwordless sudo access in the built-in container.
+        /// Grant passwordless sudo access to the Silo user.
         #[arg(long)]
         sudo: bool,
         /// Command to run inside the container; empty runs the default shell.
@@ -83,7 +83,7 @@ pub(crate) enum ConfigCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum ImageCommand {
-    /// Rebuild the configured Silo image without cached layers.
+    /// Rebuild the Silo base and configured derivative without cached layers.
     Build,
 }
 

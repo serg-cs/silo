@@ -24,34 +24,32 @@ use crate::config::{
 };
 use crate::forward;
 
-/// Name of the image this tool builds and runs.
-pub const IMAGE_TAG: &str = "silo:latest";
+mod image;
 
-/// Dockerfile embedded into the executable at compile time.
-pub const DOCKERFILE: &str = include_str!("silo.dockerfile");
+use image::DEFAULT_IMAGE_TAG;
 
-/// Supervisor embedded alongside the built-in Dockerfile.
+/// Supervisor embedded in the runtime base.
 const SUPERVISOR: &str = include_str!("silo-supervisor.sh");
 
-/// Session lease wrapper embedded alongside the built-in Dockerfile.
+/// Privilege-dropping entrypoint embedded in the runtime base.
+const ENTRYPOINT: &str = include_str!("silo-entrypoint.sh");
+
+/// Session lease wrapper embedded in the runtime base.
 const SESSION_WRAPPER: &str = include_str!("silo-session.sh");
 
-/// Session reservation helper embedded alongside the built-in Dockerfile.
+/// Session reservation helper embedded in the runtime base.
 const SESSION_RESERVER: &str = include_str!("silo-reserve.sh");
 
-/// Session counter embedded alongside the built-in Dockerfile.
+/// Session counter embedded in the runtime base.
 const STATUS_HELPER: &str = include_str!("silo-status.sh");
 
-/// Stop guard embedded alongside the built-in Dockerfile.
+/// Stop guard embedded in the runtime base.
 const STOP_GUARD: &str = include_str!("silo-stop-guard.sh");
 
 /// Restricted SSH server configuration used only for reverse forwarding.
 const SSHD_CONFIG: &str = include_str!("silo-sshd_config");
 
 const CONTAINER_BIN: &str = "container";
-
-/// Fixed parent for the per-user lock guarding Apple's user-global builder.
-const BUILD_LOCK_PARENT: &str = "/tmp";
 
 /// File that explicitly marks a directory as a Silo project root.
 const PROJECT_MARKER: &str = ".silo.toml";
@@ -69,6 +67,7 @@ const CONTAINER_NAME_PREFIX: &str = "silo-";
 const PROJECT_DIGEST_HEX_LEN: usize = 24;
 
 const BASH_PATH: &str = "/bin/bash";
+const BREW_PREFIX: &str = "/home/linuxbrew/.linuxbrew";
 const ZSH_PATH: &str = "/home/linuxbrew/.linuxbrew/bin/zsh";
 const FISH_PATH: &str = "/home/linuxbrew/.linuxbrew/bin/fish";
 const NU_PATH: &str = "/home/linuxbrew/.linuxbrew/bin/nu";
@@ -77,12 +76,60 @@ const DEFAULT_SHELL: Shell = Shell::Zsh;
 /// PID 1 for shared containers; it exits when the final guest-side session
 /// lease closes.
 const SHARED_INIT_COMMAND: &str = "/usr/local/bin/silo-supervisor";
-
+const ENTRYPOINT_COMMAND: &str = "/usr/local/bin/silo-entrypoint";
+const STOP_GUARD_COMMAND: &str = "/usr/local/bin/silo-stop-guard";
 /// Guest wrapper that holds a shared lease for the command and all children.
 const SESSION_WRAPPER_COMMAND: &str = "/usr/local/bin/silo-session";
 const SESSION_RESERVE_COMMAND: &str = "/usr/local/bin/silo-reserve";
 const STATUS_COMMAND: &str = "/usr/local/bin/silo-status";
 const GUEST_READY_PATH: &str = "/run/silo/ready";
+const CONTAINER_RUNTIME_DIR: &str = "/run/silo";
+
+/// One file owned by Silo rather than by a derivative image.
+struct RuntimeAsset {
+    build_arg: &'static str,
+    image_path: &'static str,
+    contents: &'static str,
+}
+
+/// Build argument, destination, and contents for the runtime contract.
+const RUNTIME_ASSETS: &[RuntimeAsset] = &[
+    RuntimeAsset {
+        build_arg: "SILO_INTERNAL_ASSET_ENTRYPOINT",
+        image_path: ENTRYPOINT_COMMAND,
+        contents: ENTRYPOINT,
+    },
+    RuntimeAsset {
+        build_arg: "SILO_INTERNAL_ASSET_SUPERVISOR",
+        image_path: SHARED_INIT_COMMAND,
+        contents: SUPERVISOR,
+    },
+    RuntimeAsset {
+        build_arg: "SILO_INTERNAL_ASSET_SESSION",
+        image_path: SESSION_WRAPPER_COMMAND,
+        contents: SESSION_WRAPPER,
+    },
+    RuntimeAsset {
+        build_arg: "SILO_INTERNAL_ASSET_RESERVE",
+        image_path: SESSION_RESERVE_COMMAND,
+        contents: SESSION_RESERVER,
+    },
+    RuntimeAsset {
+        build_arg: "SILO_INTERNAL_ASSET_STATUS",
+        image_path: STATUS_COMMAND,
+        contents: STATUS_HELPER,
+    },
+    RuntimeAsset {
+        build_arg: "SILO_INTERNAL_ASSET_STOP_GUARD",
+        image_path: STOP_GUARD_COMMAND,
+        contents: STOP_GUARD,
+    },
+    RuntimeAsset {
+        build_arg: "SILO_INTERNAL_ASSET_SSHD_CONFIG",
+        image_path: "/etc/ssh/silo_sshd_config",
+        contents: SSHD_CONFIG,
+    },
+];
 
 const LABEL_OWNER: &str = "dev.silo.owner";
 const LABEL_SCHEMA: &str = "dev.silo.schema";
@@ -102,6 +149,15 @@ const GUEST_READY_TIMEOUT: Duration = Duration::from_mins(1);
 /// Home directory of the container's `silo` user; the shared project
 /// directory is mounted into it as `<home>/<project-name>`.
 const CONTAINER_HOME: &str = "/home/silo";
+
+/// Small set of mount destinations owned directly by Silo's lifecycle.
+const PROTECTED_RUNTIME_DIRS: &[&str] = &[
+    "/etc/sudoers.d",
+    "/run/silo",
+    "/run/sshd",
+    "/var/run/silo",
+    "/var/run/sshd",
+];
 
 const MANAGED_STATE_ID_PREFIX: &str = "silo-state-";
 const PROJECT_ROOT_METADATA: &str = ".project-root";
@@ -124,11 +180,6 @@ struct ReadOnlyProjectPath {
     relative: PathBuf,
 }
 
-struct ResolvedIsolatedMounts {
-    named: Vec<ResolvedMount>,
-    skipped: Vec<(&'static str, String)>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolvedMountSource {
     Host(PathBuf),
@@ -146,31 +197,6 @@ struct ManagedMount {
 
 struct MountLock {
     file: fs::File,
-}
-
-/// Cross-process serialization for Silo operations that replace Apple's
-/// user-global image builder. Its location cannot depend on process-specific
-/// state-directory environment variables.
-struct BuildLock {
-    _lock: MountLock,
-}
-
-impl BuildLock {
-    fn acquire() -> Result<Self> {
-        let root = global_build_lock_root();
-        ensure_owned_private_directory(&root, "image build lock root")?;
-        MountLock::acquire_at_for(&root, "image build").map(|lock| Self { _lock: lock })
-    }
-
-    #[cfg(test)]
-    fn acquire_at(state_root: &Path) -> Result<Self> {
-        MountLock::acquire_at_for(&state_root.join("build"), "image build")
-            .map(|lock| Self { _lock: lock })
-    }
-}
-
-fn global_build_lock_root() -> PathBuf {
-    Path::new(BUILD_LOCK_PARENT).join(format!("silo-build-{}", unsafe { libc::geteuid() }))
 }
 
 impl MountLock {
@@ -227,13 +253,6 @@ impl StateScope {
         match self {
             Self::Project => STATE_PROJECT_VALUE,
             Self::User => STATE_USER_VALUE,
-        }
-    }
-
-    const fn config_kind(self) -> &'static str {
-        match self {
-            Self::Project => "project",
-            Self::User => "user",
         }
     }
 }
@@ -650,14 +669,17 @@ fn mount_host(path: &Path, root_canonical: &Path) -> Option<PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns an error naming the bind when its source does not exist
-/// or cannot be resolved (e.g. a broken symlink).
+/// Returns an error when a mount overlaps the managed runtime or names a bind
+/// whose source does not exist or cannot be resolved (e.g. a broken symlink).
 fn resolve_named_mounts(
     mounts: &BTreeMap<String, Mount>,
     project_root: &Path,
     home: Option<&Path>,
     xdg_state_home: Option<&Path>,
 ) -> Result<Vec<ResolvedMount>> {
+    // Enforce the image contract before resolving sources or managed state.
+    validate_runtime_mounts(mounts)?;
+
     let mut resolved = Vec::with_capacity(mounts.len());
     let project_dir = shared_dir_name(project_root)?;
     for (name, entry) in mounts.iter().filter(|(_, entry)| entry.is_enabled()) {
@@ -848,266 +870,82 @@ fn mount_conflicts(
     warnings
 }
 
-/// Temporary build directory that removes itself on drop, so cleanup also
-/// runs on error paths.
-struct BuildDir(PathBuf);
-
-impl BuildDir {
-    fn create() -> Result<Self> {
-        let dir = build_dir();
-        // Stale dir from an interrupted previous build.
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create build dir `{}`", dir.display()))?;
-        Ok(Self(dir))
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-
-    fn dockerfile(&self) -> PathBuf {
-        self.0.join("silo.dockerfile")
-    }
-
-    fn supervisor(&self) -> PathBuf {
-        self.0.join("silo-supervisor.sh")
-    }
-
-    fn session_wrapper(&self) -> PathBuf {
-        self.0.join("silo-session.sh")
-    }
-
-    fn session_reserver(&self) -> PathBuf {
-        self.0.join("silo-reserve.sh")
-    }
-
-    fn status_helper(&self) -> PathBuf {
-        self.0.join("silo-status.sh")
-    }
-
-    fn stop_guard(&self) -> PathBuf {
-        self.0.join("silo-stop-guard.sh")
-    }
-
-    fn sshd_config(&self) -> PathBuf {
-        self.0.join("silo-sshd_config")
-    }
-}
-
-impl Drop for BuildDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Rebuilds the image without cached layers: the embedded Dockerfile by
-/// default, or the Dockerfile configured in `[image] dockerfile`, which is
-/// then the user's own image. When the container system has not been started,
-/// boots it first so the build does not fail and get retried for that.
+/// Rebuilds the runtime base and selected derivative without cached layers.
 ///
 /// # Errors
 ///
-/// Returns an error when build serialization or storage cleanup fails, when
-/// the configured Dockerfile is unusable, when the container CLI is missing,
-/// when the embedded Dockerfile cannot be written, or when the build fails.
+/// Returns an error when image configuration, building, validation, or
+/// publication fails.
 pub fn build_image(config: &Config) -> Result<ExitCode> {
-    validate_image_config(config)?;
-    let _build_lock = BuildLock::acquire()?;
-    ensure_container_system_started()?;
-    run_build_lifecycle(
-        delete_builder,
-        || build_configured_image(config),
-        cleanup_build_storage,
-    )
+    image::build(config)
 }
 
-/// Validates image-related config without accessing the container runtime.
-///
-/// # Errors
-///
-/// Returns an error when a configured Dockerfile path is unusable.
 fn validate_image_config(config: &Config) -> Result<()> {
-    if let Some(dockerfile) = &config.image.dockerfile {
-        validate_dockerfile(dockerfile)?;
-    }
-    Ok(())
+    image::validate_config(config)
 }
 
+fn image_reference(config: &Config) -> Result<String> {
+    image::reference(config)
+}
 /// Validates config relationships that are known to be unusable before any
 /// container runtime access occurs.
 ///
 /// # Errors
 ///
-/// Returns an error when image config is invalid or an enabled mount is
-/// incompatible with the selected image type.
+/// Returns an error when image config is invalid or an enabled mount directly
+/// hides a Silo lifecycle path.
 pub(crate) fn validate_effective_config(config: &Config) -> Result<()> {
     validate_image_config(config)?;
-    validate_custom_image_mounts(&config.mounts, config.image.dockerfile.is_some())
+    validate_runtime_mounts(&config.mounts)
 }
 
-fn build_configured_image(config: &Config) -> Result<ExitCode> {
-    if let Some(dockerfile) = &config.image.dockerfile {
-        return execute_build(&mut build_command(
-            dockerfile,
-            dockerfile_context(dockerfile),
-        ));
-    }
-    let build_dir = BuildDir::create()?;
-    fs::write(build_dir.dockerfile(), DOCKERFILE).context("failed to write Dockerfile")?;
-    fs::write(build_dir.supervisor(), SUPERVISOR).context("failed to write supervisor")?;
-    fs::write(build_dir.session_wrapper(), SESSION_WRAPPER)
-        .context("failed to write session wrapper")?;
-    fs::write(build_dir.session_reserver(), SESSION_RESERVER)
-        .context("failed to write session reserver")?;
-    fs::write(build_dir.status_helper(), STATUS_HELPER)
-        .context("failed to write session status helper")?;
-    fs::write(build_dir.stop_guard(), STOP_GUARD).context("failed to write stop guard")?;
-    fs::write(build_dir.sshd_config(), SSHD_CONFIG)
-        .context("failed to write SSH forwarding configuration")?;
-    execute_build(&mut build_command(
-        &build_dir.dockerfile(),
-        build_dir.path(),
-    ))
-}
-
-/// Reclaims stale builder storage before the build and guarantees normal-path
-/// teardown afterward, without hiding the build's own failure status.
-fn run_build_lifecycle(
-    delete_before: impl FnOnce() -> Result<()>,
-    build: impl FnOnce() -> Result<ExitCode>,
-    cleanup_after: impl FnOnce() -> Result<()>,
-) -> Result<ExitCode> {
-    delete_before()?;
-    let build_result = build();
-    let cleanup_result = cleanup_after();
-    match build_result {
-        Ok(code) if code == ExitCode::SUCCESS => {
-            cleanup_result?;
-            Ok(code)
+/// Rejects mounts that directly hide Silo's lifecycle and identity anchors.
+fn validate_runtime_mounts(mounts: &BTreeMap<String, Mount>) -> Result<()> {
+    let project_dir = Path::new(CONTAINER_HOME).join("project");
+    for (name, entry) in mounts.iter().filter(|(_, entry)| entry.is_enabled()) {
+        let Some(target) = entry.effective_target(&project_dir) else {
+            continue;
+        };
+        if target
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(anyhow!(
+                "bind or state entry `{name}` targets `{}`, which contains `..` and can cross container symlinks",
+                target.display()
+            ));
         }
-        Ok(code) => {
-            if let Err(err) = cleanup_result {
-                eprintln!("warning: image build cleanup failed: {err:#}");
-            }
-            Ok(code)
+        if let Some(protected) = protected_runtime_overlap(&target) {
+            return Err(anyhow!(
+                "bind or state entry `{name}` targets `{}`, which overlaps Silo-managed runtime path `{}`",
+                target.display(),
+                protected.display()
+            ));
         }
-        Err(err) => {
-            if let Err(cleanup_err) = cleanup_result {
-                eprintln!("warning: image build cleanup failed: {cleanup_err:#}");
-            }
-            Err(err)
-        }
-    }
-}
-
-fn ensure_container_system_started() -> Result<()> {
-    let (_, stderr) = probe_image()?;
-    if system_not_started(&stderr) && !start_container_system() {
-        return Err(anyhow!(
-            "could not start the Apple container system before cleaning build storage"
-        ));
     }
     Ok(())
 }
 
-fn delete_builder() -> Result<()> {
-    // Silo exclusively owns the user's Apple container state, so reclaiming
-    // the global builder is part of its storage lifecycle.
-    execute_maintenance(builder_delete_command(), "delete the global image builder")
-}
-
-fn prune_images() -> Result<()> {
-    // The exclusive-ownership contract also makes global dangling images
-    // disposable after Silo publishes its tagged image.
-    execute_maintenance(image_prune_command(), "prune dangling images")
-}
-
-fn cleanup_build_storage() -> Result<()> {
-    cleanup_build_storage_with(delete_builder, prune_images)
-}
-
-fn cleanup_build_storage_with(
-    delete: impl FnOnce() -> Result<()>,
-    prune: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    let builder = delete();
-    let images = prune();
-    match (builder, images) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(builder), Ok(())) => Err(builder),
-        (Ok(()), Err(images)) => Err(images),
-        (Err(builder), Err(images)) => Err(anyhow!(
-            "could not delete the global image builder: {builder:#}; could not prune dangling images: {images:#}"
-        )),
+fn protected_runtime_overlap(target: &Path) -> Option<&Path> {
+    // Children of the silo home are intentional mount targets, but replacing
+    // the home itself or an ancestor would hide its managed ownership.
+    let home = Path::new(CONTAINER_HOME);
+    if home.starts_with(target) {
+        return Some(home);
     }
-}
 
-fn builder_delete_command() -> Command {
-    let mut command = Command::new(CONTAINER_BIN);
-    command.args(["builder", "delete", "--force"]);
-    command
-}
-
-fn image_prune_command() -> Command {
-    let mut command = Command::new(CONTAINER_BIN);
-    command.args(["image", "prune"]);
-    command
-}
-
-fn execute_maintenance(mut command: Command, description: &str) -> Result<()> {
-    let status = command.status().map_err(spawn_error)?;
-    if status.success() {
-        return Ok(());
+    for protected in PROTECTED_RUNTIME_DIRS.iter().map(Path::new) {
+        if target.starts_with(protected) || protected.starts_with(target) {
+            return Some(protected);
+        }
     }
-    Err(anyhow!(
-        "failed to {description}: `{}` exited with {}",
-        command_display(&command),
-        status
-    ))
-}
-
-fn command_display(command: &Command) -> String {
-    std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(|part| part.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Checks that a configured Dockerfile path is usable: non-empty, existing,
-/// and a regular file (a symlink to one counts as a file).
-///
-/// # Errors
-///
-/// Returns an error when the path is empty, does not exist, or is not a file.
-fn validate_dockerfile(dockerfile: &Path) -> Result<()> {
-    if dockerfile.as_os_str().is_empty() {
-        return Err(anyhow!("image dockerfile path is empty"));
+    for asset in RUNTIME_ASSETS {
+        let protected = Path::new(asset.image_path);
+        if target.starts_with(protected) || protected.starts_with(target) {
+            return Some(protected);
+        }
     }
-    if !dockerfile.exists() {
-        return Err(anyhow!(
-            "image dockerfile `{}` does not exist",
-            dockerfile.display()
-        ));
-    }
-    if !dockerfile.is_file() {
-        return Err(anyhow!(
-            "image dockerfile `{}` is not a file",
-            dockerfile.display()
-        ));
-    }
-    Ok(())
-}
-
-/// Returns the build context for a configured Dockerfile: its own directory,
-/// so relative COPY/ADD paths resolve as the author wrote them. A bare file
-/// name without a directory component falls back to the current directory.
-fn dockerfile_context(dockerfile: &Path) -> &Path {
-    dockerfile
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
+    None
 }
 
 /// Host user and group ids, forwarded to the container so its `silo` user can
@@ -1136,11 +974,9 @@ enum RunningContainerWarning {
 }
 
 /// Runs a command in this project's shared container, or in a one-shot
-/// foreground container when `isolated` is set or the configured image is
-/// custom. Custom images retain the image-defined user, command, and runtime
-/// filesystem contract through the established one-shot lifecycle. Shared
-/// runs use a guest reservation to hand off safely from runtime inspection to
-/// an attached exec session while still allowing concurrent sessions.
+/// foreground container when `isolated` is set. Every selected image shares
+/// the base runtime contract, so lifecycle and feature behavior is independent
+/// of whether its development tools came from the default or a custom layer.
 ///
 /// # Errors
 ///
@@ -1152,45 +988,14 @@ pub fn run_image(
     command: &[OsString],
     isolated: bool,
 ) -> Result<ExitCode> {
-    let isolated_lifecycle = uses_isolated_lifecycle(config, isolated);
-    runtime_preflight(isolated_lifecycle)?;
-    let shell = config
-        .image
-        .dockerfile
-        .is_none()
-        .then(|| resolve_shell(config.shell, std::env::var_os("SHELL").as_deref()));
-    if isolated_lifecycle {
+    let shell = resolve_shell(config.shell, std::env::var_os("SHELL").as_deref());
+    if isolated {
+        let image = image_reference(config)?;
+        image::require(&image)?;
         warn_unsupported_forwards(config, isolated);
-        return run_isolated(config, project, command, shell);
+        return run_isolated(config, project, command, shell, &image);
     }
-    run_shared(
-        config,
-        project,
-        command,
-        shell.expect("the shared lifecycle always uses the built-in image"),
-    )
-}
-
-/// Custom images cannot rely on the built-in image's shared-container user,
-/// home, shell, or supervisor, so preserve their image-agnostic lifecycle.
-fn uses_isolated_lifecycle(config: &Config, isolated: bool) -> bool {
-    isolated || config.image.dockerfile.is_some()
-}
-
-/// Prepares only the runtime resources required by the selected lifecycle.
-fn runtime_preflight(isolated_lifecycle: bool) -> Result<()> {
-    runtime_preflight_with(isolated_lifecycle, require_image)
-}
-
-fn runtime_preflight_with(
-    isolated_lifecycle: bool,
-    require_image: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    if isolated_lifecycle {
-        require_image()
-    } else {
-        Ok(())
-    }
+    run_shared(config, project, command, shell)
 }
 
 /// Reports enabled forwards that the selected lifecycle intentionally ignores.
@@ -1201,41 +1006,29 @@ fn warn_unsupported_forwards(config: &Config, isolated: bool) {
 }
 
 fn unsupported_forward_warning(config: &Config, isolated: bool) -> Option<&'static str> {
-    if !config.forward.values().any(Forward::is_enabled) {
+    if !isolated || !config.forward.values().any(Forward::is_enabled) {
         return None;
     }
-    if config.image.dockerfile.is_some() {
-        Some(
-            "host forwards are available only in the built-in shared container; ignoring enabled forwards for this custom-image run",
-        )
-    } else if isolated {
-        Some(
-            "host forwards are available only in the built-in shared container; ignoring enabled forwards for this isolated run",
-        )
-    } else {
-        None
-    }
+    Some(
+        "host forwards require a shared container; ignoring enabled forwards for this isolated run",
+    )
 }
 
-/// Runs an ephemeral create/start lifecycle. Built-in isolated containers use
-/// the same host-backed managed state as shared containers. Custom images
-/// omit them because their image-defined user cannot safely be granted access
-/// to private host-owned storage.
+/// Runs an ephemeral create/start lifecycle with the same image and storage
+/// contract as shared mode.
 fn run_isolated(
     config: &Config,
     project: &Project,
     command: &[OsString],
-    shell: Option<Shell>,
+    shell: Shell,
+    image: &str,
 ) -> Result<ExitCode> {
     let ids = host_ids()?;
-    let custom_image = config.image.dockerfile.is_some();
-    let container = effective_container_settings(&config.container, custom_image);
-    let ResolvedIsolatedMounts { named, skipped } = resolve_isolated_named_mounts(
+    let named = resolve_named_mounts(
         &config.mounts,
         &project.root,
         std::env::var_os("HOME").as_deref().map(Path::new),
         std::env::var_os("XDG_STATE_HOME").as_deref().map(Path::new),
-        custom_image,
     )?;
     let id = isolated_container_id();
     // Build the command first: it only fails on path validation, before any
@@ -1245,24 +1038,20 @@ fn run_isolated(
         named,
         forwarding: None,
     };
-    for (scope, name) in skipped {
-        eprintln!(
-            "warning: {scope} state `{name}` was skipped for a custom image because its image-defined user may not be able to access Silo's private host storage; use a bind with permissions appropriate for the image user"
-        );
-    }
     let mount_lock = needs_mount_lock(&config_mounts.named)
         .then(MountLock::acquire)
         .transpose()?;
     ensure_managed_mounts(&config_mounts.named)?;
-    let mut create = isolated_create_command(
+    let mut create = isolated_create_command_for_image(
         std::io::stdin().is_terminal(),
         &project.root,
         &ids,
         &config_mounts,
-        &container,
+        &config.container,
         &id,
         command,
         shell,
+        image,
     )?;
     // Warn about named mounts whose later placement restores write access to
     // a protected project path.
@@ -1302,80 +1091,6 @@ fn run_isolated(
     }
     cleanup_isolated_container(&id);
     status.map(exit_code)
-}
-
-/// Leaves custom images in full control of their own privilege policy.
-fn effective_container_settings(container: &Container, custom_image: bool) -> Container {
-    let mut effective = container.clone();
-    effective.sudo &= !custom_image;
-    effective
-}
-
-/// Applies the image compatibility policy before resolving mount sources, so
-/// skipped managed state never requires or inspects managed host storage.
-fn resolve_isolated_named_mounts(
-    mounts: &BTreeMap<String, Mount>,
-    project_root: &Path,
-    home: Option<&Path>,
-    xdg_state_home: Option<&Path>,
-    custom_image: bool,
-) -> Result<ResolvedIsolatedMounts> {
-    validate_custom_image_mounts(mounts, custom_image)?;
-    let mut available = mounts.clone();
-    let skipped = remove_unavailable_managed_mounts(&mut available, custom_image);
-    let named = resolve_named_mounts(&available, project_root, home, xdg_state_home)?;
-    Ok(ResolvedIsolatedMounts { named, skipped })
-}
-
-/// Rejects enabled binds whose target depends on the built-in image's
-/// home-directory contract.
-fn validate_custom_image_mounts(
-    mounts: &BTreeMap<String, Mount>,
-    custom_image: bool,
-) -> Result<()> {
-    if !custom_image {
-        return Ok(());
-    }
-    for (name, mount) in mounts
-        .iter()
-        .filter(|(_, mount)| mount.kind() == Some(MountKind::Host) && mount.is_enabled())
-    {
-        let Some(target) = mount.target.as_deref() else {
-            continue;
-        };
-        if target
-            .to_str()
-            .is_some_and(|target| target.starts_with("~/"))
-        {
-            return Err(anyhow!(
-                "bind `{name}` uses home-relative target `{}` but custom images have no Silo-defined home; use a project-relative `./...` target or an absolute target",
-                target.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn remove_unavailable_managed_mounts(
-    mounts: &mut BTreeMap<String, Mount>,
-    custom_image: bool,
-) -> Vec<(&'static str, String)> {
-    let mut skipped = Vec::new();
-    mounts.retain(|name, mount| match mount.kind() {
-        Some(kind @ (MountKind::ProjectState | MountKind::UserState))
-            if custom_image && mount.is_enabled() =>
-        {
-            let scope = match kind {
-                MountKind::ProjectState => StateScope::Project,
-                MountKind::UserState => StateScope::User,
-                MountKind::Host => unreachable!("matched a managed state kind"),
-            };
-            skipped.push((scope.config_kind(), name.clone()));
-            false
-        }
-        Some(MountKind::Host | MountKind::ProjectState | MountKind::UserState) | None => true,
-    });
-    skipped
 }
 
 /// Ensures the shared project container and attaches one exec session.
@@ -1773,7 +1488,9 @@ fn container_inventory() -> Result<ContainerInventory> {
             sessions,
             project,
             spec,
-            image: inspection.image.unwrap_or_else(|| IMAGE_TAG.to_string()),
+            image: inspection
+                .image
+                .unwrap_or_else(|| DEFAULT_IMAGE_TAG.to_string()),
             resources: inspection.resources,
         });
     }
@@ -2960,7 +2677,8 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<SharedC
                     forwarding,
                 } = prepare_shared_container(project, config)?;
                 warn_mount_conflicts(project, &config_mounts);
-                let image_digest = require_image_digest()?;
+                let image = image_reference(config)?;
+                let image_digest = image::require_digest(&image)?;
                 let identity = shared_container_identity(
                     project,
                     &image_digest,
@@ -2974,6 +2692,7 @@ fn ensure_shared_container(project: &Project, config: &Config) -> Result<SharedC
                 ensure_managed_mounts(&config_mounts.named)?;
                 let creation = create_shared_container(
                     project,
+                    &image,
                     &image_digest,
                     &ids,
                     &config_mounts,
@@ -3049,7 +2768,12 @@ fn running_container_use(
         config,
         inspection,
         || prepare_shared_container(project, config),
-        require_image_digest,
+        || {
+            // Keep filesystem-dependent tag resolution inside the existing
+            // running-container fallback boundary.
+            let image = image_reference(config)?;
+            image::require_digest(&image)
+        },
     )
 }
 
@@ -3136,7 +2860,7 @@ fn container_info_from_inspection(
         image: inspection
             .image
             .clone()
-            .unwrap_or_else(|| IMAGE_TAG.to_string()),
+            .unwrap_or_else(|| DEFAULT_IMAGE_TAG.to_string()),
         resources: inspection.resources,
     })
 }
@@ -3145,6 +2869,7 @@ fn container_info_from_inspection(
 /// cidfile beneath the current user's temporary directory.
 fn create_shared_container(
     project: &Project,
+    image: &str,
     image_digest: &str,
     ids: &HostIds,
     config_mounts: &ConfigMounts,
@@ -3156,15 +2881,16 @@ fn create_shared_container(
         .tempdir_in(std::env::temp_dir())
         .context("failed to create temporary cid directory")?;
     let cidfile = cid_dir.path().join("container.cid");
-    let current_digest = require_image_digest()?;
+    let current_digest = image::require_digest(image)?;
     if current_digest != image_digest {
         return Err(anyhow!(
-            "image `{IMAGE_TAG}` changed while creating container '{}'; retrying",
+            "image `{image}` changed while creating container '{}'; retrying",
             project.id
         ));
     }
-    let output = create_command(
+    let output = create_command_for_image(
         project,
+        image,
         image_digest,
         ids,
         config_mounts,
@@ -3196,8 +2922,8 @@ fn create_shared_container(
     if inspection.image_digest.as_deref() != Some(image_digest) {
         cleanup_partial_creation(project, identity, &cidfile);
         return Err(anyhow!(
-            "container '{}' was created from a different image than `{IMAGE_TAG}`; retrying",
-            project.id
+            "container '{}' was created from a different image than `{image}`; retrying",
+            project.id,
         ));
     }
     validate_shared_container(&inspection, project, identity)?;
@@ -3523,32 +3249,14 @@ fn cleanup_isolated_container(id: &str) {
     }
 }
 
-/// Builds the error reported when the image check failed, treating a missing
-/// image ("not found" in the probe's stderr) separately from other probe
-/// failures (e.g. the container system service is not running).
-fn inspect_error(stderr: &str) -> anyhow::Error {
-    if stderr.to_lowercase().contains("not found") {
-        anyhow!("image `{IMAGE_TAG}` not built yet; run `silo image build` first")
-    } else {
-        anyhow!(
-            "could not check for image `{IMAGE_TAG}`; \
-             `{CONTAINER_BIN} image inspect` reported:\n{stderr}"
-        )
-    }
-}
-
-/// Returns whether the container CLI's stderr indicates the container system
-/// (the VM behind the CLI) has not been started, using the CLI's documented
-/// startup hint.
+/// Recognizes the Apple CLI hint emitted when its container system is stopped.
 fn system_not_started(stderr: &str) -> bool {
     let stderr = stderr.to_lowercase();
     stderr.contains("container system service has been started")
         && stderr.contains("container system start")
 }
 
-/// Boots the container system with `container system start`, passing its
-/// output through so the user sees the boot. Returns whether it started
-/// successfully.
+/// Starts Apple's container system and forwards its output to the user.
 fn start_container_system() -> bool {
     Command::new(CONTAINER_BIN)
         .args(["system", "start"])
@@ -3556,173 +3264,9 @@ fn start_container_system() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Runs `container image inspect`, returning the image's OCI digest when it
-/// exists and the probe's stderr otherwise. When the probe fails because the
-/// container system has not been started, boots it first and probes again
-/// once; if the boot fails, the original failure remains available.
-fn inspect_image() -> Result<(Option<String>, String)> {
-    inspect_image_with(probe_image, start_container_system)
-}
-
-/// Requires the built image for operations that only need its presence.
-fn require_image() -> Result<()> {
-    require_image_digest().map(|_| ())
-}
-
-/// Returns the built image's immutable identity for shared-container reuse.
-fn require_image_digest() -> Result<String> {
-    let (digest, stderr) = inspect_image()?;
-    digest.ok_or_else(|| inspect_error(&stderr))
-}
-
-/// The probe/boot/reprobe logic behind [`inspect_image`], separated so tests
-/// can substitute fakes for the `container` CLI.
-fn inspect_image_with(
-    probe: impl Fn() -> Result<(Option<String>, String)>,
-    boot: impl Fn() -> bool,
-) -> Result<(Option<String>, String)> {
-    let (digest, stderr) = probe()?;
-    if digest.is_none() && system_not_started(&stderr) && boot() {
-        return probe();
-    }
-    Ok((digest, stderr))
-}
-
-/// Runs the raw `container image inspect` probe, without booting anything.
-fn probe_image() -> Result<(Option<String>, String)> {
-    let output = Command::new(CONTAINER_BIN)
-        .args(["image", "inspect", IMAGE_TAG])
-        .output()
-        .map_err(spawn_error)?;
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
-        return Ok((None, stderr));
-    }
-    Ok((Some(parse_image_digest(&output.stdout)?), stderr))
-}
-
-/// Reads the immutable index digest from the current image inspection schema.
-fn parse_image_digest(output: &[u8]) -> Result<String> {
-    let value: Value = serde_json::from_slice(output)
-        .context("could not parse image inspection output as JSON")?;
-    let image = value
-        .as_array()
-        .and_then(|images| images.first())
-        .ok_or_else(|| anyhow!("image inspection output did not contain an image"))?;
-    image
-        .pointer("/configuration/descriptor/digest")
-        .and_then(Value::as_str)
-        .filter(|digest| !digest.is_empty())
-        .map(ToString::to_string)
-        .ok_or_else(|| anyhow!("image inspection output did not contain an OCI image digest"))
-}
-
 fn execute(command: &mut Command) -> Result<ExitCode> {
     let status = command.status().map_err(spawn_error)?;
     Ok(exit_code(status))
-}
-
-/// Runs a build command, booting the container system first when it has not
-/// been started, so the routine first-build case does not fail and get
-/// retried. The system's state is detected with the same probe `silo run`
-/// uses; the boot is best effort, and the build itself reports whatever is
-/// wrong if it fails. The build's stderr is forwarded to silo's stderr
-/// live, so progress and errors stay visible, while a bounded copy of its
-/// tail is kept for inspection: if the build still fails because the system
-/// was not started — the probe missed — the system is booted and the build
-/// retried once.
-///
-/// # Errors
-///
-/// Returns an error when the container CLI is missing.
-fn execute_build(command: &mut Command) -> Result<ExitCode> {
-    execute_build_with(command, probe_image, start_container_system)
-}
-
-/// The probe/boot/retry logic behind [`execute_build`], separated so tests
-/// can substitute fakes for the `container` CLI.
-fn execute_build_with(
-    command: &mut Command,
-    probe: impl Fn() -> Result<(Option<String>, String)>,
-    boot: impl Fn() -> bool,
-) -> Result<ExitCode> {
-    // Boot before building when the probe says the system is not started.
-    // The boot's outcome is deliberately ignored: if it failed, the build
-    // itself fails and reports why, and the retry below boots again.
-    if let Ok((_, stderr)) = probe()
-        && system_not_started(&stderr)
-    {
-        boot();
-    }
-    let captured = run_captured(command)?;
-    if !captured.status.success()
-        && system_not_started(&String::from_utf8_lossy(&captured.stderr))
-        && boot()
-    {
-        // The system is up now; retry with normal stdio. If the boot
-        // failed, the first attempt's error was already shown and its exit
-        // code is passed through below.
-        command.stderr(Stdio::inherit());
-        return execute(command);
-    }
-    Ok(exit_code(captured.status))
-}
-
-/// Result of a command run with [`run_captured`]: the exit status and the
-/// stderr it produced (bounded to a tail large enough to recognize the
-/// not-started hint).
-struct CapturedOutput {
-    status: ExitStatus,
-    stderr: Vec<u8>,
-}
-
-/// Runs `command` with stderr piped, forwarding every chunk to silo's own
-/// stderr as it arrives while keeping a bounded copy of the tail for later
-/// inspection. Only stderr is piped — stdout stays inherited — so reading it
-/// to EOF before waiting cannot deadlock: the child only ever blocks on a
-/// full stderr pipe, which this loop keeps drained.
-///
-/// # Errors
-///
-/// Returns an error when the command cannot be spawned or waited on.
-fn run_captured(command: &mut Command) -> Result<CapturedOutput> {
-    command.stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(spawn_error)?;
-    let mut stderr = child.stderr.take().expect("stderr was piped");
-    let mut captured = Vec::new();
-    // `io::stderr()` is line-buffered, so flush after every chunk or
-    // newline-free progress output would not show up as it arrives.
-    let mut out = io::stderr();
-    let mut chunk = [0u8; 4096];
-    loop {
-        match stderr.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                let chunk = &chunk[..n];
-                let _ = out.write_all(chunk);
-                let _ = out.flush();
-                captured.extend_from_slice(chunk);
-                trim_captured(&mut captured);
-            }
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => break,
-        }
-    }
-    let status = child.wait().map_err(spawn_error)?;
-    Ok(CapturedOutput {
-        status,
-        stderr: captured,
-    })
-}
-
-/// Keeps only the tail of the captured stderr: the retry decision only looks
-/// at the final error text, and a chatty build must not accumulate unbounded
-/// output in memory.
-fn trim_captured(captured: &mut Vec<u8>) {
-    const MAX_CAPTURED_STDERR: usize = 256 * 1024;
-    if captured.len() > MAX_CAPTURED_STDERR {
-        captured.drain(..captured.len() - MAX_CAPTURED_STDERR);
-    }
 }
 
 fn exit_code(status: ExitStatus) -> ExitCode {
@@ -3732,25 +3276,6 @@ fn exit_code(status: ExitStatus) -> ExitCode {
         .clamp(0, 255);
     // `code` is clamped to 0..=255 above, so the conversion never fails.
     ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
-}
-
-fn build_dir() -> PathBuf {
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("silo-build-{pid}"))
-}
-
-fn build_command(dockerfile: &Path, context: &Path) -> Command {
-    let mut command = Command::new(CONTAINER_BIN);
-    command
-        .arg("build")
-        .arg("--file")
-        .arg(dockerfile)
-        .arg("--tag")
-        .arg(IMAGE_TAG)
-        .arg("--pull")
-        .arg("--no-cache")
-        .arg(context);
-    command
 }
 
 /// Returns the host user's uid and gid, forwarded to the container so files
@@ -3787,7 +3312,7 @@ fn id_of(flag: &str) -> Result<String> {
 /// Returns an error when the project root has no name (e.g. `/`), or its path
 /// or a mount's path cannot be expressed in a mount specification.
 #[allow(clippy::too_many_arguments)]
-fn isolated_create_command(
+fn isolated_create_command_for_image(
     interactive: bool,
     project_root: &Path,
     host_ids: &HostIds,
@@ -3795,7 +3320,8 @@ fn isolated_create_command(
     resources: &Container,
     id: &str,
     command: &[OsString],
-    shell: Option<Shell>,
+    shell: Shell,
+    image: &str,
 ) -> Result<Command> {
     let shared_dir = shared_dir_name(project_root)?;
     let project = Project {
@@ -3805,7 +3331,7 @@ fn isolated_create_command(
     };
     let identity = container_identity(
         &project,
-        IMAGE_TAG,
+        image,
         host_ids,
         config_mounts,
         resources,
@@ -3826,15 +3352,11 @@ fn isolated_create_command(
     append_identity_labels(&mut run, &identity, LABEL_ISOLATED_VALUE);
     append_creation_mounts(&mut run, project_root, &shared_dir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
-    append_sudo_access(&mut run, resources.sudo);
-    if let Some(shell) = shell {
-        run.arg("--env").arg(format!("SHELL={}", shell.path()));
-    }
-    run.arg(IMAGE_TAG);
+    append_silo_launch_contract(&mut run, resources.sudo, false);
+    run.arg("--env").arg(format!("SHELL={}", shell.path()));
+    run.arg(image);
     if command.is_empty() {
-        if let Some(shell) = shell {
-            run.arg(shell.path());
-        }
+        run.arg(shell.path());
     } else {
         run.args(command);
     }
@@ -3849,8 +3371,9 @@ fn isolated_start_command(id: &str) -> Command {
 }
 
 /// Builds the detached creation command for a shared project container.
-fn create_command(
+fn create_command_for_image(
     project: &Project,
+    image: &str,
     image_digest: &str,
     host_ids: &HostIds,
     config_mounts: &ConfigMounts,
@@ -3878,12 +3401,29 @@ fn create_command(
     append_identity_labels(&mut run, &identity, LABEL_SHARED_VALUE);
     append_creation_mounts(&mut run, &project.root, &project.workdir, config_mounts)?;
     append_host_ids(&mut run, host_ids);
-    append_sudo_access(&mut run, resources.sudo);
+    append_silo_launch_contract(&mut run, resources.sudo, config_mounts.forwarding.is_some());
     // Creation verifies the tag immediately before and the resolved digest
     // immediately after this command, closing concurrent retag races.
-    run.arg(IMAGE_TAG);
+    run.arg(image);
     run.arg(SHARED_INIT_COMMAND);
     Ok(run)
+}
+
+/// Makes Silo's runtime contract authoritative over derivative metadata and
+/// image-level environment defaults.
+fn append_silo_launch_contract(run: &mut Command, sudo: bool, forwarding: bool) {
+    run.args(["--user", "root", "--entrypoint", ENTRYPOINT_COMMAND])
+        .arg("--env")
+        .arg(format!("BREW_PREFIX={BREW_PREFIX}"))
+        .arg("--env")
+        .arg(format!("SILO_RUNTIME_DIR={CONTAINER_RUNTIME_DIR}"))
+        .arg("--env")
+        .arg(format!("SILO_SUDO={}", u8::from(sudo)))
+        .arg("--env")
+        .arg(format!(
+            "SILO_INTERNAL_SSH_FORWARDING={}",
+            u8::from(forwarding)
+        ));
 }
 
 /// Adds only explicitly configured limits, preserving Apple container's
@@ -3932,12 +3472,9 @@ fn append_creation_mounts(
     }
     if let Some(forwarding) = &config_mounts.forwarding {
         let source = mount_argument_path(forwarding.source())?;
-        run.arg("--env")
-            .arg("SILO_INTERNAL_SSH_FORWARDING=1")
-            .arg("--mount")
-            .arg(format!(
-                "type=bind,source={source},target=/run/silo-ssh,readonly"
-            ));
+        run.arg("--mount").arg(format!(
+            "type=bind,source={source},target=/run/silo-ssh,readonly"
+        ));
     }
     Ok(())
 }
@@ -3948,13 +3485,6 @@ fn append_host_ids(run: &mut Command, host_ids: &HostIds) {
         .arg(format!("SILO_UID={}", host_ids.uid))
         .arg("--env")
         .arg(format!("SILO_GID={}", host_ids.gid));
-}
-
-/// Grants the built-in user elevation only for containers that request it.
-fn append_sudo_access(run: &mut Command, enabled: bool) {
-    if enabled {
-        run.arg("--env").arg("SILO_SUDO=1");
-    }
 }
 
 /// Builds one session attachment command for the running shared container.

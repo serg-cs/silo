@@ -44,6 +44,13 @@
           <p>Silo has no persistent host daemon. When forwarding is active, the host SSH master remains connected only for the lifetime of the shared container and exits when that container stops.</p>
         </section>
 
+        <section id="image-contract">
+          <h2><a href="#image-contract">Image build and publication</a></h2>
+          <p>An image build uses two invocations in one freshly cleared builder. Silo first builds its embedded runtime base without cache and publishes it as <code>silo-base:latest</code>. It then composes the same base instructions into the derivative under an internal stage name, allowing those fresh layers to be reused while ensuring <code>silo-base:latest</code> never reaches a registry resolver. The stable base tag is an output for users, not an input to the derivative build. A custom Dockerfile keeps its own directory as the build context and must contain exactly one stage beginning with a literal <code>FROM silo-base:latest</code>.</p>
+          <p>Each result is initially tagged <code>silo-build:staging</code>. Silo starts that candidate through the normal entrypoint and checks the expected user, home, core lifecycle helpers, and supported shells. Only a successful candidate replaces the corresponding stable tag, so a failed build leaves the previous usable image intact.</p>
+          <div class="note"><p>Custom Dockerfiles are trusted project inputs. The smoke test catches obvious incompatibilities; it is not a filesystem policy or a sandbox for root-level build instructions.</p></div>
+        </section>
+
         <section id="identity">
           <h2><a href="#identity">Identity and ownership</a></h2>
           <p>A shared container name begins with <code>silo-</code> and ends with the first 24 hexadecimal characters of a SHA-256 digest of the canonical project path. The stable name makes concurrent Silo processes converge on the same workspace.</p>
@@ -68,7 +75,7 @@
 
         <section id="shared-lifecycle">
           <h2><a href="#shared-lifecycle">Shared session handoff</a></h2>
-          <p>The built-in image runs a small Silo supervisor as PID 1. Before starting an arbitrary user command, the host waits for an explicit guest readiness marker and reserves a session token through a safe helper.</p>
+          <p>The Silo base runs a small supervisor as PID 1. Before starting an arbitrary user command, the host waits for an explicit guest readiness marker and reserves a session token through a safe helper.</p>
           <p>The reservation closes a subtle race: without it, the supervisor could decide the container was idle after host inspection but just before the command attached. Only the reservation helper is retried; Silo never replays the user's command automatically.</p>
           <p>Once attached, a guest wrapper owns the session lease for the command and its children. The supervisor observes reservations and active leases and exits only when both reach zero. This allows shells, tests, and agents to overlap without one process shutting down another's container.</p>
           <p>When Silo receives an interrupt, termination, hangup, or quit signal, it forwards the signal to the attached runtime process, waits for cleanup, and restores the host terminal state.</p>
@@ -77,8 +84,7 @@
         <section id="isolated-lifecycle">
           <h2><a href="#isolated-lifecycle">Isolated lifecycle</a></h2>
           <p>An isolated run creates a unique container, starts it in the foreground, forwards relevant signals, and deletes the container after the child exits. Interrupted or failed creation paths also attempt cleanup.</p>
-          <p>The built-in isolated mode uses the same project mount, read-only overlays, binds, and managed state as shared mode. Its container filesystem is disposable, but configured state is not.</p>
-          <p>Custom images use the same one-shot host lifecycle but preserve their own image-defined command and user. Silo skips private managed state and rejects <code>~/</code> bind targets because those features depend on the built-in image's user contract.</p>
+          <p>Isolated mode uses the same project mount, read-only overlays, binds, managed state, Silo user, and selected derivative image as shared mode. Its container filesystem is disposable, but configured state is not.</p>
         </section>
 
         <section id="mount-resolution">
@@ -96,21 +102,21 @@
 
         <section id="forwarding">
           <h2><a href="#forwarding">Host loopback forwarding</a></h2>
-          <p>A container cannot reach a service bound only to the host's <code>127.0.0.1</code> through normal container networking. In the built-in shared mode, Silo:</p>
+          <p>A container cannot reach a service bound only to the host's <code>127.0.0.1</code> through normal container networking. In shared mode, every compatible derivative lets Silo:</p>
           <ol>
-            <li>Generates or reuses a managed client identity and a project-specific SSH host identity.</li>
-            <li>Mounts only the guest host key and a restricted <code>authorized_keys</code> file into the container.</li>
-            <li>Waits for the container's IPv4 address and its restricted SSH server.</li>
-            <li>Starts or reuses one authenticated SSH master with a reverse tunnel for each named port.</li>
-            <li>Binds every guest listener to <code>127.0.0.1</code> and targets the same <code>127.0.0.1</code> port on the host.</li>
+            <li>Generate or reuse a managed client identity and a project-specific SSH host identity.</li>
+            <li>Mount only the guest host key and a restricted <code>authorized_keys</code> file into the container.</li>
+            <li>Wait for the container's IPv4 address and its restricted SSH server.</li>
+            <li>Start or reuse one authenticated SSH master with a reverse tunnel for each named port.</li>
+            <li>Bind every guest listener to <code>127.0.0.1</code> and target the same <code>127.0.0.1</code> port on the host.</li>
           </ol>
           <pre><code>[forward]
 postgres = { port = 5432 }
 
-# Available in the built-in shared container:
+# Available in the shared container:
 127.0.0.1:5432</code></pre>
           <p>The SSH client uses Silo's managed identity, exact host-key verification, and no ambient SSH configuration or agent. The guest account cannot open a shell, allocate a terminal, forward an agent, or listen on an unconfigured port.</p>
-          <p>Custom images and isolated runs keep a narrower contract: Silo warns and ignores enabled forwards.</p>
+          <p>Isolated runs have no long-lived shared-container network, so Silo warns and ignores enabled forwards. Custom derivatives support forwarding whenever they use the shared lifecycle.</p>
           <p>The broker caps concurrent relay work, shares listeners safely across active sessions, and removes idle networks only after their leases close. Startup and cleanup are serialized per project to avoid deleting a network while another session is acquiring it.</p>
         </section>
 

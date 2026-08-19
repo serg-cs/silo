@@ -80,10 +80,10 @@ logs = ["sh", "-lc", "just logs | tail -n 100"]</code></pre>
           <pre data-copy><code>[forward]
 postgres = { port = 5432 }
 api = { port = 8080 }</code></pre>
-          <p>Use the same IPv4 loopback ports inside the built-in shared container:</p>
+          <p>Use the same IPv4 loopback ports inside the shared container:</p>
           <pre data-copy><code>psql -h 127.0.0.1 -p 5432
 curl "http://127.0.0.1:8080/health"</code></pre>
-          <p>Use the configured port directly: every forward keeps the same port number on the host and inside the container. Custom images and isolated runs ignore forwards with a warning.</p>
+          <p>Use the configured port directly: every forward keeps the same port number on the host and inside the container. Isolated runs ignore forwards with a warning; custom derivatives support them in shared mode.</p>
         </section>
 
         <section id="resources">
@@ -97,9 +97,9 @@ container.memory = "6G"</code></pre>
 
         <section id="sudo">
           <h2><a href="#sudo">Enable elevation deliberately</a></h2>
-          <p>The built-in image keeps sudo access disabled by default. Enable it persistently for a project with <code>container.sudo = true</code>, or opt in for one invocation:</p>
+          <p>The Silo base keeps sudo access disabled by default. Enable it persistently for a project with <code>container.sudo = true</code>, or opt in for one invocation:</p>
           <pre data-copy><code>silo run --sudo -- apt-get update</code></pre>
-          <p>Sudo is a container creation setting. In shared mode, concurrent sessions use the same <code>silo</code> user and therefore share the access selected when the container was created. A changed setting applies after recreation. Use <code>--isolated --sudo</code> when elevation must be confined to a one-shot container. Custom images retain their own user and privilege policy.</p>
+          <p>Sudo is a container creation setting. In shared mode, concurrent sessions use the same <code>silo</code> user and therefore share the access selected when the container was created. A changed setting applies after recreation. Use <code>--isolated --sudo</code> when elevation must be confined to a one-shot container. The policy applies equally to default and custom derivatives.</p>
         </section>
 
         <section id="project-writes">
@@ -125,28 +125,34 @@ silo state delete silo-state-p-&lt;id&gt;</code></pre>
         </section>
 
         <section id="custom-images">
-          <h2><a href="#custom-images">Design custom images for isolation</a></h2>
-          <p>Use a custom Dockerfile when the entire image contract should belong to the project. Keep bind targets absolute or project-relative and make their permissions compatible with the image-defined user.</p>
+          <h2><a href="#custom-images">Add project-specific tools</a></h2>
+          <p>Use a custom Dockerfile to replace Silo's default development extras while retaining its runtime behavior:</p>
+          <pre data-copy><code># Dockerfile.silo
+FROM silo-base:latest
+
+USER silo
+RUN brew install protobuf
+USER root</code></pre>
           <pre data-copy><code>image.dockerfile = "./Dockerfile.silo"
 
 [binds]
 artifacts = { source = "./artifacts", target = "./artifacts", access = "read-write" }</code></pre>
-          <p>Do not expect shared sessions, Silo's built-in shells, <code>/home/silo</code>, or project/user managed state. Silo warns when state entries are skipped.</p>
+          <p>The Dockerfile must have exactly one stage and use that literal base spelling; Silo rewrites it to an internal stage so it can never be resolved from a registry. Shared sessions, shells, <code>/home/silo</code>, sudo, forwarding, and project/user managed state remain available when the derivative preserves their base requirements. If you also want Silo's default agent and developer toolset, install the packages you need in your derivative; selecting a custom Dockerfile replaces the extras layer.</p>
         </section>
 
         <section id="troubleshooting">
           <h2><a href="#troubleshooting">Troubleshooting</a></h2>
 
-          <h3 id="image-not-built"><a href="#image-not-built">“image silo:latest not built yet”</a></h3>
+          <h3 id="image-not-built"><a href="#image-not-built">The selected image is not built yet</a></h3>
           <p>Build the currently configured image:</p>
           <pre data-copy><code>silo image build</code></pre>
-          <p>If a project selects a custom Dockerfile, run the build from that project so its configuration and relative path are active.</p>
+          <p>If a project selects a custom Dockerfile, run the build from that project so its configuration and relative path are active. Rebuild every selected derivative after upgrading Silo; stable local image tags are trusted rather than version-negotiated at run time.</p>
 
           <h3 id="runtime-not-started"><a href="#runtime-not-started">The Apple container system is unavailable</a></h3>
           <p>Check the runtime directly with <code>container system status</code>. Silo attempts to start the system for image builds and first-use paths that require it, but kernels and service failures belong to Apple's CLI.</p>
 
           <h3 id="forward-ssh"><a href="#forward-ssh">An SSH forward cannot start</a></h3>
-          <p>Confirm that <code>ssh</code> and <code>ssh-keygen</code> are installed on the host, rebuild the built-in image after upgrading Silo, and check that the named port is free inside the container. Forwarding is intentionally unavailable for custom images and <code>--isolated</code> runs.</p>
+          <p>Confirm that <code>ssh</code> and <code>ssh-keygen</code> are installed on the host, rebuild the selected image after upgrading Silo, and check that the named port is free inside the container. Forwarding is intentionally unavailable for <code>--isolated</code> runs.</p>
 
           <h3 id="unknown-config"><a href="#unknown-config">An unknown config key is ignored</a></h3>
           <p>Read the warning's full dotted key and file path, fix the likely typo, then run <code>silo config check</code>. Unknown values never participate in the effective configuration.</p>
@@ -154,8 +160,8 @@ artifacts = { source = "./artifacts", target = "./artifacts", access = "read-wri
           <h3 id="bind-source"><a href="#bind-source">A bind source cannot be resolved</a></h3>
           <p>Confirm that the source exists and is a directory. Relative global sources resolve from the global config directory; relative project sources resolve from the project root; <code>~</code> expands from the host home. Broken symlinks are rejected.</p>
 
-          <h3 id="custom-home"><a href="#custom-home">A custom image rejects a home-relative target</a></h3>
-          <p>Replace <code>~/path</code> with <code>./path</code> for a destination below the mounted project, or with an absolute container path appropriate for the image.</p>
+          <h3 id="custom-contract"><a href="#custom-contract">A custom image fails its contract check</a></h3>
+          <p>Confirm the Dockerfile has exactly one stage beginning with a literal <code>FROM silo-base:latest</code>, uses Docker's default backslash escape directive, and remains below 16 KiB after Silo adds its runtime base. It must leave the <code>silo</code> user, home, entrypoint, core helpers, and supported shells usable by the startup smoke test. ARG-based base forms are rejected. Silo leaves the previously published derivative tag available when the new candidate fails; changes outside the smoke test remain the custom image author's responsibility.</p>
 
           <h3 id="active-container"><a href="#active-container">A container cannot be deleted because it is active</a></h3>
           <p>Let its sessions exit and retry. Use <code>--force</code> only when terminating those shells, commands, or agents is intentional.</p>

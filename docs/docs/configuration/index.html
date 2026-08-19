@@ -59,12 +59,13 @@ silo config check    # validate the merged result</code></pre>
             <li><strong>Read-only paths replace as a collection.</strong> A project <code>workspace.read_only</code> array replaces the global array; an empty array disables inherited read-only workspace overlays without changing bind permissions.</li>
             <li><strong>Quick commands replace as a collection.</strong> If the project contains a <code>[quick]</code> table, it replaces the global table. An empty project table clears all global quick commands.</li>
           </ul>
-          <div class="note"><p>A project can inherit a global custom Dockerfile or replace it with another path, but there is no project-level sentinel that resets a global custom image back to the built-in image.</p></div>
+          <div class="note"><p>A project can inherit a global custom Dockerfile or replace it with another path, but there is no project-level sentinel that resets a global custom derivative back to Silo's default extras image.</p></div>
         </section>
 
         <section id="complete-example">
           <h2><a href="#complete-example">Complete example</a></h2>
           <pre data-copy><code># Every setting shown here is optional.
+# Use exactly one stage starting with a literal FROM silo-base:latest.
 # image.dockerfile = "/absolute/path/to/Dockerfile"
 container.cpus = 4
 container.memory = "6G"
@@ -98,16 +99,24 @@ agent = ["codex"]</code></pre>
           <div class="table-wrap"><table>
             <thead><tr><th>Key</th><th>Type and default</th><th>Behavior</th></tr></thead>
             <tbody>
-              <tr><td><code>image.dockerfile</code></td><td>Path; built-in image</td><td>Build this Dockerfile as <code>silo:latest</code>. Project-relative paths resolve from the project root. Use an absolute path in the global file.</td></tr>
+              <tr><td><code>image.dockerfile</code></td><td>Path; default extras</td><td>Build this single-stage Dockerfile as the tool layer above a literal <code>FROM silo-base:latest</code>. Project-relative paths resolve from the project root; use an absolute path in the global file.</td></tr>
               <tr><td><code>container.cpus</code></td><td>Positive integer; runtime default</td><td>Passes the CPU limit to containers at creation time.</td></tr>
               <tr><td><code>container.memory</code></td><td>Non-empty string; runtime default</td><td>Passes Apple's accepted memory syntax, such as <code>4G</code>.</td></tr>
-              <tr><td><code>container.sudo</code></td><td>Boolean; <code>false</code></td><td>Grants the built-in image's <code>silo</code> user passwordless sudo access. Custom images keep their own privilege policy.</td></tr>
-              <tr><td><code>shell</code></td><td><code>bash</code>, <code>zsh</code>, <code>fish</code>, or <code>nu</code>; automatic</td><td>Selects the interactive shell in the built-in image. Automatic mode mirrors a supported host <code>$SHELL</code> and otherwise uses Zsh.</td></tr>
+              <tr><td><code>container.sudo</code></td><td>Boolean; <code>false</code></td><td>Grants the base image's <code>silo</code> user passwordless sudo access in default and custom derivatives.</td></tr>
+              <tr><td><code>shell</code></td><td><code>bash</code>, <code>zsh</code>, <code>fish</code>, or <code>nu</code>; automatic</td><td>Selects an interactive shell supplied by the base image. Automatic mode mirrors a supported host <code>$SHELL</code> and otherwise uses Zsh.</td></tr>
               <tr><td><code>workspace.read_only</code></td><td>Relative directory array; <code>[".git"]</code></td><td>Overlays each existing workspace directory read-only. Paths are literal, may be nested, and must remain inside the project root; use <code>[]</code> to disable these overlays.</td></tr>
             </tbody>
           </table></div>
           <p>CPU, memory, sudo access, and resolved read-only paths participate in shared-container identity. A changed value is applied when a stopped workspace is recreated. If the workspace is already running, Silo warns and joins it with its existing creation settings. Missing read-only paths are ignored; <code>workspace.read_only = [".git", ".github"]</code> additionally protects a project directory, while <code>workspace.read_only = ["."]</code> protects the entire project.</p>
-          <div class="note"><p>The built-in image contains the <code>sudo</code> command, but its locked <code>silo</code> user cannot elevate unless <code>container.sudo = true</code> or <code>silo run --sudo</code> enables passwordless access.</p></div>
+          <div class="note"><p>The base image contains the <code>sudo</code> command, but its locked <code>silo</code> user cannot elevate unless <code>container.sudo = true</code> or <code>silo run --sudo</code> enables passwordless access.</p></div>
+          <h3>Custom Dockerfile contract</h3>
+          <pre data-copy><code>FROM silo-base:latest
+
+USER silo
+RUN brew install protobuf
+USER root</code></pre>
+          <p>The Dockerfile must contain exactly one stage, and its <code>FROM silo-base:latest</code> spelling must be literal; build-argument forms are rejected. Silo composes that reference into the generated Dockerfile as an internal stage, so <code>silo-base:latest</code> is never sent to a registry resolver. Because the embedded base uses backslash continuations, derivatives must keep Docker's default backslash escape directive. Apple's current builder also requires the composed Dockerfile to remain below 16 KiB. The configured directory remains the build context, including a Dockerfile-specific <code>.dockerignore</code> file. External images remain available through instructions such as <code>COPY --from=registry.example/tools:latest</code>.</p>
+          <p>Before publication, Silo starts the candidate through its normal entrypoint and checks the <code>silo</code> identity, home, core lifecycle helpers, and supported shells. This is intentionally a small compatibility check. A custom Dockerfile is trusted project input, and its author is responsible for permissions, links, packages, and other root-level changes that may break Silo behavior.</p>
           <div class="warning"><p>Do not add <code>.jj</code> when Jujutsu commands need to run in the container. Even inspection commands such as <code>jj status</code> acquire locks and may update Jujutsu metadata, so a read-only <code>.jj</code> overlay prevents normal operation.</p></div>
           <div class="warning"><p>Apple container supports only directories as bind-mount sources. An existing <code>workspace.read_only</code> entry that resolves to a regular file, such as <code>AGENTS.md</code>, prevents container creation with a clear error. Protect its containing directory or use a different enforcement mechanism for individual files.</p></div>
         </section>
@@ -125,9 +134,9 @@ web_api = { port = 8080, enabled = true }</code></pre>
               <tr><td><code>enabled</code></td><td>Optional boolean; defaults to <code>true</code>.</td></tr>
             </tbody>
           </table></div>
-          <p>In the built-in shared container, each configured port is available on the same IPv4 loopback port, so the example services are reachable at <code>127.0.0.1:5432</code> and <code>127.0.0.1:8080</code>.</p>
+          <p>In a shared container, each configured port is available on the same IPv4 loopback port, so the example services are reachable at <code>127.0.0.1:5432</code> and <code>127.0.0.1:8080</code>.</p>
           <p>Silo establishes an authenticated SSH reverse tunnel for only the named ports. Each guest listener binds to <code>127.0.0.1</code> and connects to the same <code>127.0.0.1</code> port on the host; forwarding does not expose other host services.</p>
-          <div class="warning"><p>Forwarding is not part of the custom-image or isolated-mode contract. If either is selected, Silo warns and ignores enabled forwards.</p></div>
+          <div class="warning"><p>Forwarding requires the shared lifecycle. Silo warns and ignores enabled forwards for <code>--isolated</code> runs, regardless of which derivative image is selected.</p></div>
         </section>
 
         <section id="binds">
@@ -171,11 +180,11 @@ disabled = { enabled = false }</code></pre>
             <thead><tr><th>Form</th><th>Resolves to</th><th>Example</th></tr></thead>
             <tbody>
               <tr><td><code>./…</code></td><td>The mounted project working directory</td><td><code>./target</code></td></tr>
-              <tr><td><code>~/…</code></td><td><code>/home/silo</code> in the built-in image</td><td><code>~/.cargo</code></td></tr>
+              <tr><td><code>~/…</code></td><td><code>/home/silo</code> in every compatible image</td><td><code>~/.cargo</code></td></tr>
               <tr><td><code>/…</code></td><td>An absolute container path</td><td><code>/output</code></td></tr>
             </tbody>
           </table></div>
-          <p>Targets must be non-empty UTF-8, may not contain commas, equals signs, or newlines, and may not use <code>..</code> to escape a relative anchor. Custom images reject home-relative host targets because they do not define Silo's <code>/home/silo</code> contract.</p>
+          <p>Targets must be non-empty UTF-8, may not contain commas, equals signs, or newlines, and may not contain <code>..</code>. Mounts may not replace <code>/home/silo</code>, Silo's lifecycle helper files, or its runtime state and configuration directories. These focused checks prevent direct startup breakage without trying to validate the full filesystem of a trusted custom image.</p>
           <p>Runtime mounts are ordered from parent to child. If two configured entries resolve to the same target, the deterministic later entry wins and Silo emits a warning.</p>
         </section>
 

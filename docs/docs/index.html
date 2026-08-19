@@ -48,7 +48,7 @@
         <section id="requirements">
           <h2><a href="#requirements">Requirements</a></h2>
           <p>Silo runs on Apple's <code>container</code> CLI. Its upstream supported environment is an Apple silicon Mac running macOS 26. Consult the <a href="https://github.com/apple/container#requirements" target="_blank" rel="noopener noreferrer">official runtime requirements</a> for current platform details.</p>
-          <p>Host loopback forwarding additionally requires the host <code>ssh</code> and <code>ssh-keygen</code> commands. It is available only in the built-in shared container.</p>
+          <p>Host loopback forwarding additionally requires the host <code>ssh</code> and <code>ssh-keygen</code> commands. It is available to compatible images in the shared lifecycle.</p>
         </section>
 
         <section id="install">
@@ -59,16 +59,17 @@
           <pre data-copy><code>cargo install --path . --locked</code></pre>
           <p>Cargo places the executable in <code>$CARGO_HOME/bin</code>, or <code>~/.cargo/bin</code> by default. Add that directory to <code>PATH</code> if your shell cannot find <code>silo</code>, then verify the installation:</p>
           <pre data-copy><code>silo --version</code></pre>
+          <p>After upgrading Silo, run <code>silo image build</code> again. Silo trusts its locally published image tags and does not run older images through a cross-version compatibility path.</p>
         </section>
 
         <section id="first-session">
           <h2><a href="#first-session">Your first session</a></h2>
-          <p>Build Silo's image before the first run. The built-in image is substantial because it includes several coding agents, browser tooling, language runtimes, shells, and common development utilities.</p>
+          <p>Build Silo's images before the first run. The runtime base supplies every feature Silo needs; the default extras layer adds coding agents, browser tooling, language runtimes, and common development utilities.</p>
           <pre data-copy><code>silo image build</code></pre>
           <p>Move into a Git or Jujutsu repository—or any working directory—and open a shell:</p>
           <pre data-copy><code>cd ~/code/my-project
 silo run</code></pre>
-          <p>Silo discovers a project root, mounts it read-write as the container's working directory, and starts a shared container. With the built-in image, the host user and group IDs are mirrored into the container so files remain usable on both sides.</p>
+          <p>Silo discovers a project root, mounts it read-write as the container's working directory, and starts a shared container. The host user and group IDs are mirrored into every Silo-compatible image so files remain usable on both sides.</p>
           <p>Run a single command by placing it after the required <code>--</code> separator:</p>
           <pre data-copy><code>silo run -- cargo test
 silo run -- codex --model gpt-5</code></pre>
@@ -99,11 +100,11 @@ silo config list</code></pre>
               <tbody>
                 <tr><td><code>silo run</code></td><td>Normal shells, commands, and concurrent agents</td><td>Stable per-project container; stops after the last session</td></tr>
                 <tr><td><code>silo run --isolated</code></td><td>Clean-room checks and one-off untrusted work</td><td>New foreground container; deleted when the session ends</td></tr>
-                <tr><td>Custom Dockerfile</td><td>A project-defined environment</td><td>Always isolated because Silo cannot assume the built-in image contract</td></tr>
+                <tr><td>Custom Dockerfile</td><td>A project-defined tool layer</td><td>Shared by default; isolated only with <code>--isolated</code></td></tr>
               </tbody>
             </table>
           </div>
-          <p>Both built-in lifecycles mount the project and can use configured binds and managed state. Custom images retain their own user, entrypoint, command, and filesystem assumptions, so their storage behavior is intentionally narrower.</p>
+          <p>Both lifecycles mount the project and can use configured binds and managed state. Because every selected image inherits the same Silo base, shell selection, sudo, forwarding, shared sessions, and storage work consistently with default and custom tool layers.</p>
         </section>
 
         <section id="next-steps">

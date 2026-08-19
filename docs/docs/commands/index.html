@@ -80,7 +80,7 @@ silo --version</code></pre>
             <div><dt><code>--isolated</code></dt><dd>Use a new one-shot container that is removed when the session ends.</dd></div>
             <div><dt><code>--cpus &lt;count&gt;</code></dt><dd>Override the configured positive CPU count for this invocation.</dd></div>
             <div><dt><code>--memory &lt;size&gt;</code></dt><dd>Override the configured memory using Apple container syntax, such as <code>4G</code>.</dd></div>
-            <div><dt><code>--sudo</code></dt><dd>Grant the built-in container's <code>silo</code> user passwordless sudo access for this invocation.</dd></div>
+            <div><dt><code>--sudo</code></dt><dd>Grant the selected image's <code>silo</code> user passwordless sudo access for this invocation.</dd></div>
             <div><dt><code>-- &lt;command&gt;...</code></dt><dd>Run the command and arguments inside the container instead of opening a shell.</dd></div>
           </dl>
           <h3>Examples</h3>
@@ -98,9 +98,9 @@ silo run --sudo -- apt-get update</code></pre>
           <div class="command-block">
             <div class="command-block-heading"><h3><code>silo image build</code></h3><span>Image command</span></div>
             <pre class="command-usage"><code>silo image build</code></pre>
-            <p>Builds <code>silo:latest</code> without cached layers. Silo uses its embedded Dockerfile unless <code>image.dockerfile</code> selects a project-specific file.</p>
+            <p>Uses one fresh builder for two invocations: Silo builds and validates <code>silo-base:latest</code> without cache, then composes that same base as an internal stage of the selected derivative so its completed layers can be reused without resolving the tag. With no <code>image.dockerfile</code>, the derivative is Silo's embedded development-extras image at <code>silo:latest</code>; configured Dockerfiles receive a deterministic local tag.</p>
           </div>
-          <p>Silo starts Apple's container system when necessary, serializes concurrent Silo builds, clears its temporary builder, and prunes dangling images afterward. A configured Dockerfile uses its containing directory as the build context.</p>
+          <p>Silo starts Apple's container system when necessary, serializes concurrent Silo builds, clears its temporary builder before and after the lifecycle, and prunes dangling images afterward. A configured Dockerfile keeps its containing directory as the build context and must have exactly one stage beginning with a literal <code>FROM silo-base:latest</code>. Silo rewrites that reference to its internal base stage, so it is never sent to a registry resolver. The Dockerfile must retain Docker's default backslash escape directive, and the composed file must remain below Apple's current 16 KiB limit. Each image is staged and given a small startup smoke test before its stable tag is replaced.</p>
           <p>See <a href="../configuration/#image-options">image configuration</a> for custom Dockerfiles, CPU, memory, and sudo settings.</p>
         </section>
 

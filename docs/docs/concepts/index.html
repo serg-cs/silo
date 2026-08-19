@@ -44,16 +44,17 @@
         </section>
 
         <section id="image">
-          <h2><a href="#image">One image supplies the environment</a></h2>
-          <p><code>silo image build</code> creates the local OCI image <code>silo:latest</code>. Unless configuration selects a custom Dockerfile, Silo builds its embedded Ubuntu-based development image.</p>
-          <p>The built-in image includes:</p>
+          <h2><a href="#image">A stable base supports replaceable tool layers</a></h2>
+          <p><code>silo image build</code> first creates <code>silo-base:latest</code>. This Ubuntu-based image owns the stable Silo contract: the <code>silo</code> user, supported shells, Homebrew, sudo, SSH forwarding server, supervisor, session helpers, entrypoint, and required filesystem paths.</p>
+          <p>Silo then builds one derivative. Without <code>image.dockerfile</code>, the embedded extras Dockerfile produces <code>silo:latest</code> with:</p>
           <ul>
             <li>Codex, Claude Code, and many other coding-agent CLIs.</li>
             <li>Bash, Zsh, Fish, and Nushell, with the host's supported <code>$SHELL</code> mirrored automatically and Zsh as the fallback.</li>
             <li>Rust, Node.js, Python, <code>uv</code>, Ruff, Playwright with Chromium, GitHub CLI, Jujutsu, and common linters.</li>
             <li>Practical terminal tools including Ripgrep, fd, fzf, jq, just, tmux, Helix, Vim, lazygit, Yazi, and Zoxide.</li>
           </ul>
-          <p>Rebuilding is explicit and uncached. Silo serializes builds because Apple's builder is user-global, cleans stale builder storage, and prunes dangling images after the build.</p>
+          <p>A configured Dockerfile replaces only that extras layer. It must have exactly one stage beginning with a literal <code>FROM silo-base:latest</code>. Silo runs the actual entrypoint and a small compatibility smoke test before publishing the derivative's deterministic local tag.</p>
+          <p>Rebuilding is explicit. One fresh builder first produces the base without cache, then the derivative reuses those completed base-stage layers and installs only its additions. Silo embeds the base under an internal stage name, so the published <code>silo-base:latest</code> tag is never resolved as a derivative input. Silo serializes builds because Apple's builder is user-global, stages each result before replacing its stable tag, cleans stale builder storage, and prunes dangling images after the build.</p>
         </section>
 
         <section id="sessions">
@@ -62,7 +63,7 @@
           <div class="table-wrap"><table>
             <thead><tr><th>Property</th><th>Shared</th><th>Isolated</th></tr></thead>
             <tbody>
-              <tr><td>Requested by</td><td><code>silo run</code></td><td><code>silo run --isolated</code> or any custom image</td></tr>
+              <tr><td>Requested by</td><td><code>silo run</code></td><td><code>silo run --isolated</code></td></tr>
               <tr><td>Container ID</td><td>Stable digest of the project path</td><td>Unique to the Silo process</td></tr>
               <tr><td>Concurrency</td><td>Multiple overlapping sessions</td><td>One foreground session</td></tr>
               <tr><td>Exit behavior</td><td>Stops after the final lease closes</td><td>Stops and is deleted</td></tr>
@@ -83,7 +84,7 @@
               <tr><td><code>state.user</code></td><td>Private Silo-managed storage keyed by name</td><td>Agent credentials or tool state intentionally reused across this user's projects</td></tr>
             </tbody>
           </table></div>
-          <p>Every bind declares <code>access = "read-only"</code> or <code>access = "read-write"</code>. Managed state is always writable. Relative targets beginning with <code>./</code> anchor to the project directory; <code>~/</code> anchors to the built-in container home; absolute targets stay absolute.</p>
+          <p>Every bind declares <code>access = "read-only"</code> or <code>access = "read-write"</code>. Managed state is always writable. Relative targets beginning with <code>./</code> anchor to the project directory; <code>~/</code> anchors to the Silo user home; absolute targets stay absolute.</p>
           <p>Managed state lives below <code>$XDG_STATE_HOME/silo/state</code>, or <code>~/.local/state/silo/state</code> when <code>XDG_STATE_HOME</code> is unavailable. Use <code>silo state</code> to inspect it and <code>silo state delete</code> to remove an unused entry safely.</p>
         </section>
 
@@ -99,16 +100,15 @@
         </section>
 
         <section id="custom-images">
-          <h2><a href="#custom-images">Custom images keep their own contract</a></h2>
-          <p>Setting <code>image.dockerfile</code> changes more than the packages. Silo preserves the image's user, entrypoint, command, and filesystem expectations instead of injecting the built-in supervisor and <code>/home/silo</code> contract.</p>
-          <ul>
-            <li>Custom-image runs always use the isolated lifecycle.</li>
-            <li>Project and user state entries are skipped because Silo cannot safely grant the image user access to private host-owned storage.</li>
-            <li>Enabled forwards are ignored with a warning.</li>
-            <li>Enabled binds remain available, but their target must be project-relative or absolute; <code>~/</code> has no Silo-defined meaning for a custom image.</li>
-            <li>The project root and configured read-only project overlays remain available.</li>
-          </ul>
-          <div class="warning"><p>A custom Dockerfile is therefore an environment escape hatch, not a drop-in extension of the built-in shared image.</p></div>
+          <h2><a href="#custom-images">Custom images extend the Silo contract</a></h2>
+          <p>Setting <code>image.dockerfile</code> replaces the default extras layer, not the runtime foundation. The configured Dockerfile must explicitly use this literal base reference:</p>
+          <pre data-copy><code>FROM silo-base:latest
+
+USER silo
+RUN brew install protobuf
+USER root</code></pre>
+          <p>Silo replaces that reference with an internal stage before building, which prevents any registry lookup for <code>silo-base:latest</code>. ARG-based base references and additional local stages are rejected. External images may still be used by instructions such as <code>COPY --from=registry.example/tools:latest</code>. Silo preserves the configured directory as the context and gives each Dockerfile, effective build context, and Dockerfile-specific ignore selection a deterministic local image tag. This keeps shared Dockerfile contents from colliding when projects supply different relative <code>COPY</code> inputs or ignore rules.</p>
+          <div class="warning"><p>A custom Dockerfile is trusted input. Keep the inherited <code>silo</code> user, entrypoint, lifecycle helpers, supported shells, and expected paths intact. Silo catches basic startup incompatibilities, but does not police permissions, links, package changes, or every way root-level build instructions can break later sessions.</p></div>
         </section>
 
         <nav class="page-links" aria-label="Adjacent documentation pages">

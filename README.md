@@ -11,6 +11,7 @@ Silo gives each project a clean container workspace without making every session
 
 - One stable, shared workspace per project
 - An agent-ready image with practical development tooling
+- A stable runtime base for project-specific tool images
 - Explicit persistent, shared, and host-mounted state
 - One-shot isolated sessions when a clean environment matters
 - Simple project and user-level configuration
@@ -25,6 +26,9 @@ cd ~/code/my-project
 silo image build
 silo run
 ```
+
+Run `silo image build` again after upgrading Silo so the local runtime matches
+the installed binary.
 
 For the complete setup guide and current behavior, continue to the **[documentation](https://serg-cs.github.io/silo/docs/)**.
 

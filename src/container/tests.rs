@@ -1,5 +1,16 @@
+use super::image::{
+    BASE_DOCKERFILE, BASE_IMAGE_TAG, BUILD_LOCK_PARENT, BuildCache, BuildDir, BuildLock,
+    CUSTOM_IMAGE_DIGEST_HEX_LEN, EXTRAS_DOCKERFILE, MAX_COMPOSED_DOCKERFILE_BYTES,
+    STAGING_IMAGE_TAG, build, build_command, builder_delete_command, cleanup_build_storage_with,
+    compose_derivative, copy_dockerignore, custom_image_reference, dockerfile_context,
+    execute_build_with, global_build_lock_root, image_prune_command, image_runtime_check_command,
+    image_tag_command, inspect_error, inspect_image_with, parse_image_digest, run_build_lifecycle,
+    run_captured, runtime_asset_build_args, trim_captured, validate_dockerfile,
+    write_build_context,
+};
 use super::*;
 use crate::config::{Mount, MountKind, Permission, Shell};
+use base64::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -7,6 +18,49 @@ use std::path::{Path, PathBuf};
 
 const TEST_IMAGE_DIGEST: &str =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+#[allow(clippy::too_many_arguments)]
+fn isolated_create_command(
+    interactive: bool,
+    project_root: &Path,
+    host_ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    resources: &Container,
+    id: &str,
+    command: &[OsString],
+    shell: Option<Shell>,
+) -> Result<Command> {
+    isolated_create_command_for_image(
+        interactive,
+        project_root,
+        host_ids,
+        config_mounts,
+        resources,
+        id,
+        command,
+        shell.unwrap_or(Shell::Zsh),
+        DEFAULT_IMAGE_TAG,
+    )
+}
+
+fn create_command(
+    project: &Project,
+    image_digest: &str,
+    host_ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    resources: &Container,
+    cidfile: &Path,
+) -> Result<Command> {
+    create_command_for_image(
+        project,
+        DEFAULT_IMAGE_TAG,
+        image_digest,
+        host_ids,
+        config_mounts,
+        resources,
+        cidfile,
+    )
+}
 
 fn resolved_host(name: &str, host: &str, dest: &str, access: Permission) -> ResolvedMount {
     ResolvedMount {
@@ -39,8 +93,8 @@ fn args_without_labels(command: &Command) -> Vec<&str> {
         .map(|argument| argument.to_str().expect("argument is UTF-8"));
     let mut filtered = Vec::new();
     while let Some(argument) = arguments.next() {
-        if argument == "--label" {
-            arguments.next().expect("label has a value");
+        if matches!(argument, "--label" | "--user" | "--entrypoint") {
+            arguments.next().expect("paired option has a value");
         } else {
             filtered.push(argument);
         }
@@ -61,48 +115,7 @@ fn command_labels(command: &Command) -> HashMap<&str, &str> {
 }
 
 #[test]
-fn dockerfile_embeds_ubuntu_latest() {
-    assert!(
-        DOCKERFILE
-            .lines()
-            .any(|line| line.trim() == "FROM ubuntu:latest")
-    );
-}
-
-#[test]
-fn image_tag_is_silo_latest() {
-    assert_eq!(IMAGE_TAG, "silo:latest");
-}
-
-#[test]
-fn custom_images_use_the_image_agnostic_lifecycle() {
-    let mut config = Config::default();
-    config.image.dockerfile = Some(PathBuf::from("/tmp/Dockerfile"));
-
-    assert!(uses_isolated_lifecycle(&config, false));
-}
-
-#[test]
-fn built_in_images_remain_shared_by_default() {
-    assert!(!uses_isolated_lifecycle(&Config::default(), false));
-    assert!(uses_isolated_lifecycle(&Config::default(), true));
-}
-
-#[test]
-fn shared_preflight_preserves_image_fallback() {
-    let image_checked = Cell::new(false);
-
-    runtime_preflight_with(false, || {
-        image_checked.set(true);
-        Err(anyhow!("image inspection is unavailable"))
-    })
-    .expect("shared runs can reuse the existing container");
-
-    assert!(!image_checked.get());
-}
-
-#[test]
-fn unsupported_forward_warning_distinguishes_isolated_and_custom_runs() {
+fn unsupported_forward_warning_only_applies_to_isolated_runs() {
     let mut config = Config::default();
     config.forward.insert(
         "postgres".to_string(),
@@ -116,12 +129,6 @@ fn unsupported_forward_warning_distinguishes_isolated_and_custom_runs() {
         unsupported_forward_warning(&config, true)
             .is_some_and(|warning| warning.contains("isolated run"))
     );
-    config.image.dockerfile = Some(PathBuf::from("/tmp/Dockerfile"));
-    assert!(
-        unsupported_forward_warning(&config, false)
-            .is_some_and(|warning| warning.contains("custom-image run"))
-    );
-    config.image.dockerfile = None;
     assert_eq!(unsupported_forward_warning(&config, false), None);
 }
 
@@ -167,128 +174,6 @@ fn non_utf8_host_shell_falls_back_to_zsh() {
 }
 
 #[test]
-fn build_command_targets_embedded_dockerfile() {
-    let command = build_command(Path::new("/tmp/Dockerfile"), Path::new("/tmp/context"));
-    let program = command.get_program().to_str().expect("program is UTF-8");
-    let args = args_without_labels(&command);
-    assert_eq!(program, CONTAINER_BIN);
-    assert_eq!(
-        args,
-        [
-            "build",
-            "--file",
-            "/tmp/Dockerfile",
-            "--tag",
-            "silo:latest",
-            "--pull",
-            "--no-cache",
-            "/tmp/context"
-        ]
-    );
-}
-
-#[test]
-fn build_maintenance_commands_target_global_apple_storage() {
-    assert_eq!(
-        args_without_labels(&builder_delete_command()),
-        ["builder", "delete", "--force"]
-    );
-    assert_eq!(
-        args_without_labels(&image_prune_command()),
-        ["image", "prune"]
-    );
-}
-
-#[test]
-fn build_lifecycle_deletes_before_and_cleans_after_success() {
-    let events = RefCell::new(Vec::new());
-    let result = run_build_lifecycle(
-        || {
-            events.borrow_mut().push("delete-before");
-            Ok(())
-        },
-        || {
-            events.borrow_mut().push("build");
-            Ok(ExitCode::SUCCESS)
-        },
-        || {
-            events.borrow_mut().push("cleanup-after");
-            Ok(())
-        },
-    )
-    .expect("the lifecycle succeeds");
-
-    assert_eq!(result, ExitCode::SUCCESS);
-    assert_eq!(
-        events.into_inner(),
-        ["delete-before", "build", "cleanup-after"]
-    );
-}
-
-#[test]
-fn build_lifecycle_aborts_when_stale_builder_cannot_be_deleted() {
-    let built = Cell::new(false);
-    let cleaned = Cell::new(false);
-    let error = run_build_lifecycle(
-        || Err(anyhow!("builder is busy")),
-        || {
-            built.set(true);
-            Ok(ExitCode::SUCCESS)
-        },
-        || {
-            cleaned.set(true);
-            Ok(())
-        },
-    )
-    .expect_err("pre-build deletion is required");
-
-    assert!(error.to_string().contains("builder is busy"));
-    assert!(!built.get());
-    assert!(!cleaned.get());
-}
-
-#[test]
-fn failed_build_keeps_its_status_when_cleanup_also_fails() {
-    let result = run_build_lifecycle(
-        || Ok(()),
-        || Ok(ExitCode::from(7)),
-        || Err(anyhow!("prune failed")),
-    )
-    .expect("the build status is preserved");
-
-    assert_eq!(result, ExitCode::from(7));
-}
-
-#[test]
-fn successful_build_reports_cleanup_failure() {
-    let error = run_build_lifecycle(
-        || Ok(()),
-        || Ok(ExitCode::SUCCESS),
-        || Err(anyhow!("prune failed")),
-    )
-    .expect_err("cleanup is part of successful completion");
-
-    assert!(error.to_string().contains("prune failed"));
-}
-
-#[test]
-fn build_cleanup_attempts_builder_and_image_reclamation() {
-    let pruned = Cell::new(false);
-    let error = cleanup_build_storage_with(
-        || Err(anyhow!("delete failed")),
-        || {
-            pruned.set(true);
-            Err(anyhow!("prune failed"))
-        },
-    )
-    .expect_err("both maintenance failures are reported");
-
-    assert!(pruned.get());
-    assert!(error.to_string().contains("delete failed"));
-    assert!(error.to_string().contains("prune failed"));
-}
-
-#[test]
 fn run_command_starts_interactive_shell() {
     let ids = HostIds {
         uid: "501".into(),
@@ -323,6 +208,14 @@ fn run_command_starts_interactive_shell() {
             "SILO_UID=501",
             "--env",
             "SILO_GID=20",
+            "--env",
+            "BREW_PREFIX=/home/linuxbrew/.linuxbrew",
+            "--env",
+            "SILO_RUNTIME_DIR=/run/silo",
+            "--env",
+            "SILO_SUDO=0",
+            "--env",
+            "SILO_INTERNAL_SSH_FORWARDING=0",
             "--env",
             "SHELL=/home/linuxbrew/.linuxbrew/bin/zsh",
             "silo:latest",
@@ -369,6 +262,14 @@ fn run_command_omits_pty_when_not_interactive() {
             "SILO_UID=501",
             "--env",
             "SILO_GID=20",
+            "--env",
+            "BREW_PREFIX=/home/linuxbrew/.linuxbrew",
+            "--env",
+            "SILO_RUNTIME_DIR=/run/silo",
+            "--env",
+            "SILO_SUDO=0",
+            "--env",
+            "SILO_INTERNAL_SSH_FORWARDING=0",
             "--env",
             "SHELL=/home/linuxbrew/.linuxbrew/bin/zsh",
             "silo:latest",
@@ -437,41 +338,47 @@ fn run_command_grants_only_configured_sudo_access() {
     .expect("default command builds");
 
     assert!(args_without_labels(&enabled).contains(&"SILO_SUDO=1"));
-    assert!(!args_without_labels(&disabled).contains(&"SILO_SUDO=1"));
+    assert!(args_without_labels(&disabled).contains(&"SILO_SUDO=0"));
 }
 
 #[test]
-fn custom_images_ignore_configured_sudo_access() {
-    let configured = Container {
-        sudo: true,
-        ..Container::default()
-    };
-
-    assert!(effective_container_settings(&configured, false).sudo);
-    assert!(!effective_container_settings(&configured, true).sudo);
-}
-
-#[test]
-fn custom_image_run_keeps_its_default_command_and_environment() {
+fn custom_image_runs_receive_the_full_silo_launch_contract() {
     let ids = HostIds {
         uid: "501".into(),
         gid: "20".into(),
     };
-    let command = isolated_create_command(
+    let command = isolated_create_command_for_image(
         false,
         Path::new("/tmp/project"),
         &ids,
         &ConfigMounts::default(),
-        &Container::default(),
+        &Container {
+            sudo: true,
+            ..Container::default()
+        },
         "silo-123",
         &[],
-        None,
+        Shell::Fish,
+        "silo:custom-0123456789abcdef01234567",
     )
     .expect("command builds");
-    let args = args_without_labels(&command);
+    let args: Vec<_> = command
+        .get_args()
+        .map(|argument| argument.to_str().expect("argument is UTF-8"))
+        .collect();
 
-    assert_eq!(args.last(), Some(&IMAGE_TAG));
-    assert!(!args.iter().any(|argument| argument.starts_with("SHELL=")));
+    assert!(args.windows(2).any(|pair| pair == ["--user", "root"]));
+    assert!(
+        args.windows(2)
+            .any(|pair| { pair == ["--entrypoint", "/usr/local/bin/silo-entrypoint"] })
+    );
+    assert!(args.contains(&"SILO_SUDO=1"));
+    assert!(args.contains(&"BREW_PREFIX=/home/linuxbrew/.linuxbrew"));
+    assert!(args.contains(&"SILO_RUNTIME_DIR=/run/silo"));
+    assert!(args.contains(&"SILO_INTERNAL_SSH_FORWARDING=0"));
+    assert!(args.contains(&"SHELL=/home/linuxbrew/.linuxbrew/bin/fish"));
+    assert!(args.contains(&"silo:custom-0123456789abcdef01234567"));
+    assert_eq!(args.last(), Some(&"/home/linuxbrew/.linuxbrew/bin/fish"));
 }
 
 #[test]
@@ -595,283 +502,6 @@ fn host_ids_reports_numeric_ids() {
 }
 
 #[test]
-fn inspect_error_reports_missing_image() {
-    let err = inspect_error("Error: image not found: silo:latest");
-    assert!(err.to_string().contains("not built yet"));
-}
-
-#[test]
-fn inspect_error_reports_probe_failures() {
-    let err = inspect_error("error: container runtime is not running");
-    assert!(!err.to_string().contains("not built yet"));
-    assert!(err.to_string().contains("runtime is not running"));
-}
-
-#[test]
-fn image_digest_parser_accepts_current_inspect_schema() {
-    let output =
-        format!(r#"[{{"configuration":{{"descriptor":{{"digest":"{TEST_IMAGE_DIGEST}"}}}}}}]"#);
-
-    assert_eq!(
-        parse_image_digest(output.as_bytes()).expect("current schema parses"),
-        TEST_IMAGE_DIGEST
-    );
-}
-
-#[test]
-fn image_digest_parser_rejects_missing_or_malformed_output() {
-    let missing =
-        parse_image_digest(br#"[{"configuration":{}}]"#).expect_err("missing digest is rejected");
-    let malformed = parse_image_digest(b"not json").expect_err("malformed JSON is rejected");
-
-    assert!(missing.to_string().contains("OCI image digest"));
-    assert!(malformed.to_string().contains("as JSON"));
-}
-
-#[test]
-fn system_not_started_matches_the_cli_hint() {
-    let stderr = "Error: XPC connection error\n\
-                  Ensure container system service has been started with \
-                  `container system start`.";
-    assert!(system_not_started(stderr), "{stderr}");
-}
-
-#[test]
-fn system_not_started_ignores_other_failures() {
-    assert!(!system_not_started(
-        "error: container runtime is not running"
-    ));
-    assert!(!system_not_started("Error: image not found: silo:latest"));
-    assert!(!system_not_started(""));
-}
-
-#[test]
-fn run_captured_keeps_stderr_and_status() {
-    let mut command = Command::new("sh");
-    command.args(["-c", "echo to-stderr >&2; exit 3"]);
-    let captured = run_captured(&mut command).expect("command runs");
-    assert_eq!(captured.status.code(), Some(3));
-    assert_eq!(
-        String::from_utf8(captured.stderr).expect("stderr is UTF-8"),
-        "to-stderr\n"
-    );
-}
-
-#[test]
-fn trim_captured_keeps_the_tail() {
-    let mut captured = vec![b'a'; 300 * 1024];
-    captured.extend_from_slice(b"not-started-hint");
-    trim_captured(&mut captured);
-    assert_eq!(captured.len(), 256 * 1024);
-    assert!(captured.ends_with(&b"not-started-hint"[..]));
-    assert!(captured.iter().take(4).all(|&byte| byte == b'a'));
-}
-
-#[test]
-fn trim_captured_leaves_small_output_untouched() {
-    let mut captured = b"small".to_vec();
-    trim_captured(&mut captured);
-    assert_eq!(captured, b"small");
-}
-
-/// Appends one line to `path`; the fake probe/boot closures and the shell
-/// commands in the orchestration tests write here to record event order.
-fn append_log(path: &Path, line: &str) {
-    use std::io::Write;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .expect("log opens");
-    writeln!(file, "{line}").expect("log writes");
-}
-
-fn read_log(path: &Path) -> Vec<String> {
-    fs::read_to_string(path)
-        .map(|text| text.lines().map(str::to_string).collect())
-        .unwrap_or_default()
-}
-
-const NOT_STARTED_HINT: &str =
-    "Ensure container system service has been started with `container system start`.";
-
-#[test]
-fn execute_build_boots_before_building_when_the_probe_says_not_started() {
-    let dir = TestDir::new("build-boot-first");
-    let log = dir.path().join("log");
-    let log_path = log.display();
-    let boots = Cell::new(0);
-    let mut command = Command::new("sh");
-    command.args(["-c", &format!("echo build >> '{log_path}'")]);
-    let result = execute_build_with(
-        &mut command,
-        || Ok((None, NOT_STARTED_HINT.to_string())),
-        || {
-            boots.set(boots.get() + 1);
-            append_log(&log, "boot");
-            true
-        },
-    )
-    .expect("build runs");
-    assert_eq!(result, ExitCode::from(0));
-    assert_eq!(boots.get(), 1);
-    assert_eq!(read_log(&log), ["boot", "build"]);
-}
-
-#[test]
-fn execute_build_does_not_boot_when_the_probe_says_the_system_is_up() {
-    let dir = TestDir::new("build-no-boot");
-    let log = dir.path().join("log");
-    let log_path = log.display();
-    let boots = Cell::new(0);
-    let mut command = Command::new("sh");
-    command.args(["-c", &format!("echo build >> '{log_path}'")]);
-    let result = execute_build_with(
-        &mut command,
-        || Ok((None, "Error: image not found: silo:latest".to_string())),
-        || {
-            boots.set(boots.get() + 1);
-            true
-        },
-    )
-    .expect("build runs");
-    assert_eq!(result, ExitCode::from(0));
-    assert_eq!(boots.get(), 0);
-    assert_eq!(read_log(&log), ["build"]);
-}
-
-#[test]
-fn execute_build_boots_and_retries_once_when_the_probe_misses() {
-    let dir = TestDir::new("build-retry");
-    let log = dir.path().join("log");
-    let marker = dir.path().join("built");
-    let log_path = log.display();
-    let marker_path = marker.display();
-    let boots = Cell::new(0);
-    // The probe thinks the system is up (the image is simply not found), so
-    // no pre-build boot happens; the build then fails with the not-started
-    // hint, the fallback boots, and the retried build succeeds.
-    let mut command = Command::new("sh");
-    command.args([
-        "-c",
-        &format!(
-            "echo build >> '{log_path}'; \
-         if [ ! -e '{marker_path}' ]; then \
-           touch '{marker_path}'; \
-           echo '{NOT_STARTED_HINT}' >&2; \
-           exit 1; \
-         fi"
-        ),
-    ]);
-    let result = execute_build_with(
-        &mut command,
-        || Ok((None, "Error: image not found: silo:latest".to_string())),
-        || {
-            boots.set(boots.get() + 1);
-            append_log(&log, "boot");
-            true
-        },
-    )
-    .expect("build runs");
-    assert_eq!(result, ExitCode::from(0));
-    assert_eq!(boots.get(), 1);
-    assert_eq!(read_log(&log), ["build", "boot", "build"]);
-}
-
-#[test]
-fn execute_build_passes_through_failures_unrelated_to_the_system() {
-    let boots = Cell::new(0);
-    let mut command = Command::new("sh");
-    command.args(["-c", "echo 'Error: Dockerfile is missing' >&2; exit 2"]);
-    let result = execute_build_with(
-        &mut command,
-        || Ok((None, "Error: image not found: silo:latest".to_string())),
-        || {
-            boots.set(boots.get() + 1);
-            true
-        },
-    )
-    .expect("build runs");
-    assert_eq!(result, ExitCode::from(2));
-    assert_eq!(boots.get(), 0);
-}
-
-#[test]
-fn execute_build_passes_through_the_first_exit_code_when_the_boot_fails() {
-    let boots = Cell::new(0);
-    let mut command = Command::new("sh");
-    command.args(["-c", &format!("echo '{NOT_STARTED_HINT}' >&2; exit 1")]);
-    let result = execute_build_with(
-        &mut command,
-        || Ok((None, "Error: image not found: silo:latest".to_string())),
-        || {
-            boots.set(boots.get() + 1);
-            false
-        },
-    )
-    .expect("build runs");
-    assert_eq!(result, ExitCode::from(1));
-    assert_eq!(boots.get(), 1);
-}
-
-#[test]
-fn inspect_image_boots_and_reprobes_when_the_system_is_not_started() {
-    let probes = Cell::new(0);
-    let boots = Cell::new(0);
-    let (digest, _) = inspect_image_with(
-        || {
-            probes.set(probes.get() + 1);
-            if probes.get() == 1 {
-                Ok((None, NOT_STARTED_HINT.to_string()))
-            } else {
-                Ok((Some(TEST_IMAGE_DIGEST.to_string()), String::new()))
-            }
-        },
-        || {
-            boots.set(boots.get() + 1);
-            true
-        },
-    )
-    .expect("probe runs");
-    assert_eq!(digest.as_deref(), Some(TEST_IMAGE_DIGEST));
-    assert_eq!(probes.get(), 2);
-    assert_eq!(boots.get(), 1);
-}
-
-#[test]
-fn inspect_image_reports_the_original_stderr_when_the_boot_fails() {
-    let boots = Cell::new(0);
-    let (digest, stderr) = inspect_image_with(
-        || Ok((None, NOT_STARTED_HINT.to_string())),
-        || {
-            boots.set(boots.get() + 1);
-            false
-        },
-    )
-    .expect("probe runs");
-    assert!(digest.is_none());
-    assert_eq!(stderr, NOT_STARTED_HINT);
-    assert_eq!(boots.get(), 1);
-}
-
-#[test]
-fn inspect_image_does_not_boot_when_the_system_is_up() {
-    let boots = Cell::new(0);
-    let (digest, stderr) = inspect_image_with(
-        || Ok((None, "Error: image not found: silo:latest".to_string())),
-        || {
-            boots.set(boots.get() + 1);
-            true
-        },
-    )
-    .expect("probe runs");
-    assert!(digest.is_none());
-    assert_eq!(stderr, "Error: image not found: silo:latest");
-    assert_eq!(boots.get(), 0);
-}
-
-#[cfg(unix)]
-#[test]
 fn exit_code_reports_signals_as_128_plus_signal() {
     use std::os::unix::process::ExitStatusExt;
     let status = ExitStatus::from_raw(0x0009); // killed by signal 9
@@ -881,37 +511,10 @@ fn exit_code_reports_signals_as_128_plus_signal() {
 }
 
 #[test]
-fn build_dir_removes_itself_on_drop() {
-    let build_dir = BuildDir::create().expect("build dir creation succeeds");
-    let path = build_dir.path().to_path_buf();
-    assert!(path.exists());
-    drop(build_dir);
-    assert!(!path.exists());
-}
-
-#[test]
-fn validate_dockerfile_rejects_empty_paths() {
-    let err = validate_dockerfile(Path::new("")).expect_err("empty path is invalid");
-    assert!(err.to_string().contains("empty"));
-}
-
-#[test]
-fn image_config_validation_checks_only_configured_dockerfiles() {
-    validate_image_config(&Config::default()).expect("built-in image config is valid");
-
-    let mut config = Config::default();
-    config.image.dockerfile = Some(PathBuf::new());
-    let message = validate_image_config(&config)
-        .expect_err("configured empty Dockerfile is invalid")
-        .to_string();
-    assert!(message.contains("empty"), "{message}");
-}
-
-#[test]
-fn effective_config_validation_rejects_custom_image_home_mounts() {
+fn effective_config_validation_accepts_silo_mounts_with_custom_images() {
     let dir = TestDir::new("validate-custom-image-mounts");
     let dockerfile = dir.path().join("Dockerfile");
-    fs::write(&dockerfile, "FROM scratch").expect("Dockerfile creation succeeds");
+    fs::write(&dockerfile, "FROM silo-base:latest\n").expect("Dockerfile creation succeeds");
     let mut config = Config::default();
     config.image.dockerfile = Some(dockerfile);
     config.mounts.insert(
@@ -924,14 +527,8 @@ fn effective_config_validation_rejects_custom_image_home_mounts() {
         },
     );
 
-    let message = validate_effective_config(&config)
-        .expect_err("custom image has no defined home for an enabled bind")
-        .to_string();
-    assert!(message.contains("bind `docs`"), "{message}");
-    assert!(
-        message.contains("custom images have no Silo-defined home"),
-        "{message}"
-    );
+    validate_effective_config(&config)
+        .expect("custom images share the Silo-defined home and mount contract");
 
     config.mounts.get_mut("docs").expect("mount exists").enabled = Some(false);
     validate_effective_config(&config).expect("disabled home-relative mount is ignored");
@@ -946,76 +543,90 @@ fn effective_config_validation_rejects_custom_image_home_mounts() {
     let mount = config.mounts.get_mut("docs").expect("mount exists");
     mount.kind = Some(MountKind::UserState);
     mount.target = Some(PathBuf::from("~/.cache"));
-    validate_effective_config(&config).expect("managed state is skipped for custom images");
+    validate_effective_config(&config).expect("managed state is available to custom images");
 }
 
 #[test]
-fn validate_dockerfile_rejects_missing_paths() {
-    let path = std::env::temp_dir().join(format!("silo-test-missing-{}", std::process::id()));
-    let _ = fs::remove_file(&path);
-    let err = validate_dockerfile(&path).expect_err("missing path is invalid");
-    assert!(err.to_string().contains("does not exist"));
+fn effective_config_rejects_mounts_over_silo_runtime_paths() {
+    for target in [
+        "/home/silo",
+        "/run",
+        "/etc/ssh",
+        "/etc/sudoers.d",
+        "/usr/local/bin/silo-supervisor",
+        "/var/run/silo",
+        "/var/run/sshd",
+    ] {
+        let mut config = Config::default();
+        config.mounts.insert(
+            "unsafe".into(),
+            Mount {
+                kind: Some(MountKind::UserState),
+                target: Some(PathBuf::from(target)),
+                ..Mount::default()
+            },
+        );
+
+        let message = validate_effective_config(&config)
+            .expect_err("runtime overlap is rejected")
+            .to_string();
+        assert!(message.contains("Silo-managed runtime path"), "{message}");
+    }
 }
 
 #[test]
-fn build_image_validates_custom_dockerfile_before_runtime_access() {
-    let dir = TestDir::new("missing-build-dockerfile");
+fn effective_config_rejects_absolute_parent_traversal_before_runtime_protection() {
     let mut config = Config::default();
-    config.image.dockerfile = Some(dir.path().join("Dockerfile"));
-
-    let err = build_image(&config).expect_err("missing Dockerfile prevents maintenance");
-
-    assert!(err.to_string().contains("does not exist"));
-}
-
-#[test]
-fn validate_dockerfile_rejects_directories() {
-    let path = std::env::temp_dir().join(format!("silo-test-dir-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).expect("test dir creation succeeds");
-    let err = validate_dockerfile(&path).expect_err("directory is not a file");
-    assert!(err.to_string().contains("is not a file"));
-    let _ = fs::remove_dir_all(&path);
-}
-
-#[test]
-fn validate_dockerfile_accepts_regular_files() {
-    let path = std::env::temp_dir().join(format!("silo-test-file-{}", std::process::id()));
-    let _ = fs::remove_file(&path);
-    fs::write(&path, "FROM scratch").expect("write succeeds");
-    validate_dockerfile(&path).expect("regular file is valid");
-    let _ = fs::remove_file(&path);
-}
-
-#[test]
-fn dockerfile_context_uses_the_dockerfile_directory() {
-    assert_eq!(
-        dockerfile_context(Path::new("/home/user/project/Dockerfile")),
-        Path::new("/home/user/project")
+    config.mounts.insert(
+        "entrypoint".to_string(),
+        Mount {
+            kind: Some(MountKind::Host),
+            source: Some(PathBuf::from("/tmp/source")),
+            target: Some(PathBuf::from("/usr/local/../local/bin/silo-entrypoint")),
+            access: Some(Permission::ReadOnly),
+            ..Mount::default()
+        },
     );
+
+    let message = validate_effective_config(&config)
+        .expect_err("parent traversal through a container symlink is rejected")
+        .to_string();
+
+    assert!(message.contains("entrypoint"));
+    assert!(message.contains("contains `..`"));
 }
 
 #[test]
-fn dockerfile_context_resolves_relative_parents() {
-    assert_eq!(
-        dockerfile_context(Path::new("images/dev/Dockerfile")),
-        Path::new("images/dev")
-    );
+fn effective_config_allows_mounts_beside_managed_runtime_paths() {
+    let mut config = Config::default();
+    for (name, target) in [
+        ("home", "~/.cargo"),
+        ("brew", "/home/linuxbrew"),
+        ("forward-assets", "/run/silo-ssh"),
+        ("system-tools", "/usr/bin"),
+        ("local-tools", "/usr/local/bin/custom-tools"),
+    ] {
+        config.mounts.insert(
+            name.into(),
+            Mount {
+                kind: Some(MountKind::UserState),
+                target: Some(PathBuf::from(target)),
+                ..Mount::default()
+            },
+        );
+    }
+
+    validate_effective_config(&config).expect("non-overlapping mounts remain supported");
 }
 
-#[test]
-fn dockerfile_context_falls_back_to_current_directory() {
-    assert_eq!(dockerfile_context(Path::new("Dockerfile")), Path::new("."));
-}
-
-/// Temporary directory that removes itself on drop, so cleanup also runs on
-/// test failures.
+/// Temporary directory that removes itself on drop.
 struct TestDir(PathBuf);
 
 impl TestDir {
     fn new(name: &str) -> Self {
-        let path =
-            std::env::temp_dir().join(format!("silo-container-test-{}-{name}", std::process::id()));
+        let root = Path::new("/tmp/agents");
+        fs::create_dir_all(root).expect("temporary root creation succeeds");
+        let path = root.join(format!("silo-container-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("test dir creation succeeds");
         Self(path)
@@ -1070,6 +681,14 @@ fn run_command_appends_the_passed_command() {
             "SILO_UID=501",
             "--env",
             "SILO_GID=20",
+            "--env",
+            "BREW_PREFIX=/home/linuxbrew/.linuxbrew",
+            "--env",
+            "SILO_RUNTIME_DIR=/run/silo",
+            "--env",
+            "SILO_SUDO=0",
+            "--env",
+            "SILO_INTERNAL_SSH_FORWARDING=0",
             "--env",
             "SHELL=/home/linuxbrew/.linuxbrew/bin/fish",
             "silo:latest",
@@ -1335,7 +954,7 @@ fn shared_create_bind_mounts_all_managed_storage() {
 }
 
 #[test]
-fn built_in_isolated_mount_filter_keeps_all_managed_mounts() {
+fn isolated_images_keep_all_managed_mounts() {
     let project = Path::new("/tmp/project");
     let mounts = vec![
         ResolvedMount {
@@ -1387,7 +1006,7 @@ fn built_in_isolated_mount_filter_keeps_all_managed_mounts() {
         &[],
         None,
     )
-    .expect("built-in isolated command accepts managed state");
+    .expect("isolated command accepts managed state");
     assert!(
         mount_specs(&command)
             .iter()
@@ -1397,8 +1016,8 @@ fn built_in_isolated_mount_filter_keeps_all_managed_mounts() {
 }
 
 #[test]
-fn custom_image_mount_filter_skips_all_managed_mounts() {
-    let dir = TestDir::new("custom-image-mount-filter");
+fn custom_images_resolve_the_same_mount_contract_as_the_default_image() {
+    let dir = TestDir::new("custom-image-mounts");
     let mounts = BTreeMap::from([
         (
             "cargo".into(),
@@ -1435,78 +1054,17 @@ fn custom_image_mount_filter_skips_all_managed_mounts() {
         ),
     ]);
 
-    let ResolvedIsolatedMounts {
-        named: mounts,
-        skipped,
-    } = resolve_isolated_named_mounts(&mounts, dir.path(), None, None, true)
-        .expect("custom-image mounts resolve without a managed state root");
-    assert_eq!(
-        skipped,
-        [
-            ("project", "cargo".into()),
-            ("user", "codex".into()),
-            ("user", "tools".into()),
-        ]
-    );
+    let state_home = dir.path().join("state");
+    let mounts = resolve_named_mounts(&mounts, dir.path(), Some(dir.path()), Some(&state_home))
+        .expect("all Silo mounts resolve for a custom image");
     assert_eq!(
         mounts
             .iter()
             .map(|mount| mount.name.as_str())
             .collect::<Vec<_>>(),
-        ["docs"]
+        ["docs", "tools", "cargo", "codex"]
     );
-    assert!(!needs_mount_lock(&mounts));
-}
-
-#[test]
-fn custom_image_mount_filter_rejects_home_relative_host_targets() {
-    let dir = TestDir::new("custom-image-home-target");
-    let mounts = BTreeMap::from([(
-        "docs".into(),
-        Mount {
-            kind: Some(MountKind::Host),
-            source: Some(dir.path().to_path_buf()),
-            target: Some(PathBuf::from("~/docs")),
-            ..Mount::default()
-        },
-    )]);
-
-    let message = resolve_isolated_named_mounts(&mounts, dir.path(), None, None, true)
-        .err()
-        .expect("custom images have no defined home for a home-relative target")
-        .to_string();
-
-    assert!(message.contains("bind `docs`"), "{message}");
-    assert!(
-        message.contains("custom images have no Silo-defined home"),
-        "{message}"
-    );
-    assert!(message.contains("project-relative `./...`"), "{message}");
-}
-
-#[test]
-fn custom_image_mount_filter_keeps_project_relative_host_targets() {
-    let dir = TestDir::new("custom-image-project-target");
-    let mounts = BTreeMap::from([(
-        "docs".into(),
-        Mount {
-            kind: Some(MountKind::Host),
-            source: Some(dir.path().to_path_buf()),
-            target: Some(PathBuf::from("./docs")),
-            ..Mount::default()
-        },
-    )]);
-
-    let resolved = resolve_isolated_named_mounts(&mounts, dir.path(), None, None, true)
-        .expect("the project location is defined for custom images");
-
-    assert_eq!(resolved.named.len(), 1);
-    assert_eq!(
-        resolved.named[0].dest,
-        Path::new(CONTAINER_HOME)
-            .join(dir.path().file_name().expect("test project has a name"))
-            .join("docs")
-    );
+    assert!(needs_mount_lock(&mounts));
 }
 
 #[test]
@@ -1745,6 +1303,33 @@ fn resolve_named_returns_empty_without_mounts() {
     let resolved = resolve_named_mounts(&BTreeMap::new(), dir.path(), Some(dir.path()), None)
         .expect("no named mounts resolve");
     assert!(resolved.is_empty());
+}
+
+#[test]
+fn resolve_named_rejects_mounts_over_silo_runtime_paths() {
+    let dir = TestDir::new("mount-runtime-overlap");
+    let mounts = BTreeMap::from([(
+        "runtime".to_string(),
+        Mount {
+            kind: Some(MountKind::Host),
+            source: Some(dir.path().to_path_buf()),
+            target: Some(PathBuf::from("/run/silo")),
+            ..Mount::default()
+        },
+    )]);
+
+    let message = resolve_named_mounts(&mounts, dir.path(), Some(dir.path()), None)
+        .expect_err("creation-time mount resolution protects the runtime")
+        .to_string();
+
+    assert!(
+        message.contains("bind or state entry `runtime`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Silo-managed runtime path `/run/silo`"),
+        "{message}"
+    );
 }
 
 #[cfg(unix)]
@@ -2150,37 +1735,6 @@ fn managed_mount_lock_serializes_competing_operations() {
 }
 
 #[test]
-fn build_lock_serializes_competing_image_builds() {
-    let dir = TestDir::new("image-build-lock");
-    let first = BuildLock::acquire_at(dir.path()).expect("first lock succeeds");
-    let root = dir.path().to_path_buf();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let contender = std::thread::spawn(move || {
-        let second = BuildLock::acquire_at(&root).expect("second lock succeeds");
-        sender.send(()).expect("notification sends");
-        drop(second);
-    });
-
-    assert!(
-        receiver.recv_timeout(Duration::from_millis(100)).is_err(),
-        "the competing Silo build must wait for global builder ownership"
-    );
-    drop(first);
-    receiver
-        .recv_timeout(Duration::from_secs(2))
-        .expect("the competing build resumes after unlock");
-    contender.join().expect("contender exits");
-}
-
-#[test]
-fn build_lock_location_is_stable_for_the_current_user() {
-    assert_eq!(
-        global_build_lock_root(),
-        Path::new(BUILD_LOCK_PARENT).join(format!("silo-build-{}", unsafe { libc::geteuid() }))
-    );
-}
-
-#[test]
 fn shared_build_lock_directory_is_private() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -2453,6 +2007,14 @@ fn create_command_starts_the_detached_supervisor() {
             "SILO_UID=501",
             "--env",
             "SILO_GID=20",
+            "--env",
+            "BREW_PREFIX=/home/linuxbrew/.linuxbrew",
+            "--env",
+            "SILO_RUNTIME_DIR=/run/silo",
+            "--env",
+            "SILO_SUDO=0",
+            "--env",
+            "SILO_INTERNAL_SSH_FORWARDING=0",
             "silo:latest",
             "/usr/local/bin/silo-supervisor",
         ]
@@ -2546,7 +2108,7 @@ fn shared_forward_assets_reach_creation_without_session_environment() {
             "type=bind,source=/tmp/silo-forward-assets,target=/run/silo-ssh,readonly"
         ]));
     assert!(shared_args.contains(&"SILO_INTERNAL_SSH_FORWARDING=1"));
-    assert!(shared_args.ends_with(&[IMAGE_TAG, SHARED_INIT_COMMAND]));
+    assert!(shared_args.ends_with(&[DEFAULT_IMAGE_TAG, SHARED_INIT_COMMAND]));
     assert!(!shared_args.contains(&"--network"));
 
     let exec = exec_command(false, &project, "abc123", &[], Shell::Zsh);
@@ -2590,7 +2152,7 @@ fn isolated_commands_do_not_receive_forwarding_assets() {
             .iter()
             .any(|argument| argument.contains("/run/silo-ssh"))
     );
-    assert!(!args.contains(&"SILO_INTERNAL_SSH_FORWARDING=1"));
+    assert!(args.contains(&"SILO_INTERNAL_SSH_FORWARDING=0"));
 }
 
 #[test]
@@ -2623,7 +2185,7 @@ fn user_mount_at_forwarding_path_does_not_enable_sshd() {
         args.iter()
             .any(|argument| argument.contains("target=/run/silo-ssh"))
     );
-    assert!(!args.contains(&"SILO_INTERNAL_SSH_FORWARDING=1"));
+    assert!(args.contains(&"SILO_INTERNAL_SSH_FORWARDING=0"));
 }
 
 #[test]
@@ -3123,7 +2685,7 @@ fn shared_inspection(project: &Project, identity: &ContainerIdentity) -> Contain
             (LABEL_LIFECYCLE.to_string(), LABEL_SHARED_VALUE.to_string()),
             (LABEL_SPEC.to_string(), identity.spec.clone()),
         ]),
-        image: Some(IMAGE_TAG.to_string()),
+        image: Some(DEFAULT_IMAGE_TAG.to_string()),
         image_digest: Some(TEST_IMAGE_DIGEST.to_string()),
         mount_sources: Vec::new(),
         resources: ContainerResources::default(),
@@ -3323,6 +2885,30 @@ fn comparison_failures_warn_and_reuse_the_running_container() {
 }
 
 #[test]
+fn unresolved_custom_image_warns_and_reuses_the_running_container() {
+    let dir = TestDir::new("running-missing-custom-image");
+    let project = test_project("/tmp/project");
+    let mut config = Config::default();
+    config.image.dockerfile = Some(dir.path().join("missing/Dockerfile"));
+    let inspection = shared_inspection(&project, &shared_identity(&project));
+
+    let container_use = running_container_use(&project, &config, &inspection);
+    let SharedContainerUse::Existing(warning) = container_use else {
+        panic!("image resolution failure must reuse the running container");
+    };
+    let warning = running_container_warning(&project.id, &warning);
+
+    assert!(
+        warning.contains("could not resolve image dockerfile"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("connecting to the existing container"),
+        "{warning}"
+    );
+}
+
+#[test]
 fn drift_warning_explains_that_current_settings_are_deferred() {
     let warning = running_container_warning(
         "silo-4070dfe2dfb71225713e6507",
@@ -3360,7 +2946,7 @@ fn isolated_orphan_cleanup_requires_complete_runtime_ownership_labels() {
     let project = test_project("/tmp/project");
     let identity = container_identity(
         &project,
-        IMAGE_TAG,
+        DEFAULT_IMAGE_TAG,
         &HostIds {
             uid: "501".into(),
             gid: "20".into(),
@@ -3384,7 +2970,7 @@ fn isolated_orphan_cleanup_requires_complete_runtime_ownership_labels() {
             (LABEL_PROJECT_ROOT.to_string(), identity.project_root),
             (LABEL_SPEC.to_string(), identity.spec),
         ]),
-        image: Some(IMAGE_TAG.to_string()),
+        image: Some(DEFAULT_IMAGE_TAG.to_string()),
         image_digest: None,
         mount_sources: Vec::new(),
         resources: ContainerResources::default(),
@@ -3555,36 +3141,6 @@ fn specification_digest_tracks_container_settings() {
 }
 
 #[test]
-fn embedded_image_contains_guest_lifecycle_programs() {
-    assert!(DOCKERFILE.contains("COPY silo-supervisor.sh"));
-    assert!(DOCKERFILE.contains("COPY silo-session.sh"));
-    assert!(DOCKERFILE.contains("COPY silo-reserve.sh"));
-    assert!(DOCKERFILE.contains("COPY silo-status.sh"));
-    assert!(DOCKERFILE.contains("COPY silo-stop-guard.sh"));
-    assert!(DOCKERFILE.contains("COPY silo-sshd_config"));
-    assert!(DOCKERFILE.contains("util-linux"));
-    assert!(DOCKERFILE.contains("sudo"));
-    assert!(DOCKERFILE.contains("${SILO_SUDO:-0}"));
-    assert!(DOCKERFILE.contains("rm -f /etc/sudoers.d/silo"));
-    assert!(SUPERVISOR.contains("flock --exclusive --nonblock"));
-    assert!(SUPERVISOR.contains("-ge 100"));
-    assert!(SESSION_WRAPPER.contains("flock --shared"));
-    assert!(SESSION_WRAPPER.contains("reservation_file"));
-    assert!(SESSION_RESERVER.contains("flock --shared"));
-    assert!(STATUS_HELPER.contains("count=$((count + 1))"));
-    assert!(STOP_GUARD.contains("flock --exclusive --nonblock"));
-    assert!(DOCKERFILE.contains("if [ \"$ssh_forwarding\" = 1 ]"));
-    assert!(DOCKERFILE.contains("unset SILO_INTERNAL_SSH_FORWARDING"));
-    assert!(!DOCKERFILE.contains("if [ -d /run/silo-ssh ]"));
-    assert!(DOCKERFILE.contains("sshd\" -t -f /etc/ssh/silo_sshd_config"));
-    assert!(DOCKERFILE.contains("touch /run/silo/ready"));
-    assert!(SESSION_WRAPPER.contains("exec \"$@\""));
-    assert!(!DOCKERFILE.contains("SILO_STATE_TARGETS"));
-    assert!(!DOCKERFILE.contains("silo-init-state"));
-    assert!(!DOCKERFILE.contains("os.lchown"));
-}
-
-#[test]
 fn ssh_forwarding_configuration_disables_login_and_non_remote_forwarding() {
     assert!(SSHD_CONFIG.contains("AddressFamily inet"));
     assert!(SSHD_CONFIG.contains("AllowTcpForwarding remote"));
@@ -3595,84 +3151,6 @@ fn ssh_forwarding_configuration_disables_login_and_non_remote_forwarding() {
     assert!(SSHD_CONFIG.contains("PermitRootLogin no"));
     assert!(SSHD_CONFIG.contains("AllowAgentForwarding no"));
     assert!(SSHD_CONFIG.contains("X11Forwarding no"));
-}
-
-#[test]
-fn embedded_image_installs_and_registers_supported_shells() {
-    for package in ["fish", "nushell", "zsh"] {
-        assert!(
-            DOCKERFILE
-                .lines()
-                .any(|line| line.trim().trim_end_matches(" \\").trim() == package),
-            "missing Homebrew package {package}"
-        );
-    }
-    assert!(DOCKERFILE.contains(BASH_PATH));
-    for name in ["zsh", "fish", "nu"] {
-        let path = format!("${{BREW_PREFIX}}/bin/{name}");
-        assert!(DOCKERFILE.contains(&path), "missing shell path {path}");
-    }
-    assert_eq!(Shell::Bash.path(), BASH_PATH);
-    assert_eq!(Shell::Zsh.path(), ZSH_PATH);
-    assert_eq!(Shell::Fish.path(), FISH_PATH);
-    assert_eq!(Shell::Nu.path(), NU_PATH);
-    assert!(DOCKERFILE.contains("CMD [\"zsh\"]"));
-    assert!(DOCKERFILE.contains("usermod --shell \"${BREW_PREFIX}/bin/zsh\" silo"));
-}
-
-#[test]
-fn embedded_image_installs_developer_tooling_and_yazi_dependencies() {
-    for package in [
-        "actionlint",
-        "antigravity-cli",
-        "claude-code",
-        "copilot-cli",
-        "fzf",
-        "gh",
-        "helix",
-        "jq",
-        "just",
-        "lazygit",
-        "playwright-cli",
-        "python",
-        "qwen-code",
-        "ruff",
-        "shellcheck",
-        "openssh",
-        "tmux",
-        "uv",
-        "vim",
-        "yamllint",
-    ] {
-        assert!(
-            DOCKERFILE
-                .lines()
-                .any(|line| line.trim().trim_end_matches(" \\").trim() == package),
-            "missing Homebrew package {package}"
-        );
-    }
-    assert!(
-        DOCKERFILE
-            .lines()
-            .any(|line| line.trim().trim_end_matches(" \\").trim() == "file"),
-        "missing system package file"
-    );
-}
-
-#[test]
-fn embedded_image_installs_playwright_cli_with_chromium() {
-    assert!(DOCKERFILE.contains("PLAYWRIGHT_BROWSERS_PATH=/home/silo/.cache/ms-playwright"));
-    assert!(DOCKERFILE.contains("playwright-cli install-browser --with-deps"));
-    assert!(DOCKERFILE.contains("sudo rm -f /etc/sudoers.d/silo"));
-    assert!(!DOCKERFILE.contains("npm install --global @playwright/test"));
-}
-
-#[test]
-fn embedded_image_removes_package_caches_in_their_install_layers() {
-    assert!(DOCKERFILE.contains("brew cleanup --prune=all"));
-    assert!(DOCKERFILE.contains("rm -rf \"$(brew --cache)\""));
-    assert!(DOCKERFILE.contains("sudo apt-get clean"));
-    assert!(DOCKERFILE.contains("sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*"));
 }
 
 #[test]
@@ -3700,7 +3178,7 @@ fn inventory_item(id: &str, project: &str, lifecycle: ContainerLifecycle) -> Con
         sessions: Some(0),
         project: PathBuf::from(project),
         spec: "a".repeat(64),
-        image: IMAGE_TAG.to_string(),
+        image: DEFAULT_IMAGE_TAG.to_string(),
         resources: ContainerResources {
             cpus: Some(4),
             memory_bytes: Some(1024 * 1024 * 1024),
@@ -3794,7 +3272,7 @@ fn selected_ownership_rejects_a_replacement_with_different_labels() {
         sessions: Some(0),
         project: project.root.clone(),
         spec: identity.spec.clone(),
-        image: IMAGE_TAG.to_string(),
+        image: DEFAULT_IMAGE_TAG.to_string(),
         resources: ContainerResources::default(),
     };
     validate_selected_ownership(&selected, &inspection).expect("selected identity matches");
@@ -4012,4 +3490,760 @@ fn delete_succeeded_rejects_other_failures() {
     let status = Command::new("false").status().expect("false runs");
     let stderr = "error: container silo-123 is running and can not be deleted";
     assert!(!delete_succeeded(status, stderr));
+}
+
+const NOT_STARTED_HINT: &str =
+    "Ensure container system service has been started with `container system start`.";
+
+fn command_args(command: &Command) -> Vec<&str> {
+    command
+        .get_args()
+        .map(|argument| argument.to_str().expect("argument is UTF-8"))
+        .collect()
+}
+
+fn append_log(path: &Path, line: &str) {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("log opens");
+    writeln!(file, "{line}").expect("log writes");
+}
+
+fn read_log(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .map(|text| text.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn embedded_layers_define_an_unversioned_runtime_base() {
+    assert!(
+        BASE_DOCKERFILE
+            .lines()
+            .any(|line| line.trim() == "FROM ubuntu:latest AS silo_internal_runtime_base")
+    );
+    assert_eq!(
+        EXTRAS_DOCKERFILE.lines().next(),
+        Some("FROM silo-base:latest")
+    );
+    assert!(!BASE_DOCKERFILE.contains("SILO_IMAGE_CONTRACT"));
+    assert!(!BASE_DOCKERFILE.contains("dev.silo.image-contract"));
+    assert!(!BASE_DOCKERFILE.contains("/usr/local/share/silo/image-contract"));
+    let combined = compose_derivative(
+        BASE_DOCKERFILE,
+        EXTRAS_DOCKERFILE,
+        Path::new("embedded silo-extras.dockerfile"),
+    )
+    .expect("the embedded derivative fits Apple's Dockerfile transport limit");
+    assert!(combined.len() < MAX_COMPOSED_DOCKERFILE_BYTES);
+}
+
+#[test]
+fn image_tags_separate_base_default_and_custom_layers() {
+    assert_eq!(BASE_IMAGE_TAG, "silo-base:latest");
+    assert_eq!(DEFAULT_IMAGE_TAG, "silo:latest");
+
+    let dir = TestDir::new("custom-tag");
+    let dockerfile = dir.path().join("Dockerfile");
+    fs::write(&dockerfile, "FROM silo-base:latest\n").expect("Dockerfile write succeeds");
+    let first = custom_image_reference(&dockerfile).expect("custom tag resolves");
+    let second = custom_image_reference(&dockerfile).expect("custom tag resolves again");
+
+    assert_eq!(first, second);
+    assert!(first.starts_with("silo:custom-"), "{first}");
+    assert_eq!(
+        first.len(),
+        "silo:custom-".len() + CUSTOM_IMAGE_DIGEST_HEX_LEN
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_dockerfile_symlinks_in_different_contexts_have_distinct_tags() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TestDir::new("context-tags");
+    let shared = dir.path().join("shared");
+    let first_context = dir.path().join("first");
+    let second_context = dir.path().join("second");
+    fs::create_dir_all(&shared).expect("shared directory creation succeeds");
+    fs::create_dir_all(&first_context).expect("first context creation succeeds");
+    fs::create_dir_all(&second_context).expect("second context creation succeeds");
+    let shared_dockerfile = shared.join("Dockerfile");
+    fs::write(&shared_dockerfile, "FROM silo-base:latest\n")
+        .expect("shared Dockerfile write succeeds");
+    let first_dockerfile = first_context.join("Dockerfile");
+    let second_dockerfile = second_context.join("Dockerfile");
+    symlink(&shared_dockerfile, &first_dockerfile).expect("first symlink succeeds");
+    symlink(&shared_dockerfile, &second_dockerfile).expect("second symlink succeeds");
+
+    assert_ne!(
+        custom_image_reference(&first_dockerfile).expect("first tag resolves"),
+        custom_image_reference(&second_dockerfile).expect("second tag resolves")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_dockerfile_aliases_with_distinct_ignore_rules_have_distinct_tags() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TestDir::new("dockerfile-ignore-tags");
+    let shared_dockerfile = dir.path().join("Dockerfile.shared");
+    fs::write(&shared_dockerfile, "FROM silo-base:latest\n")
+        .expect("shared Dockerfile write succeeds");
+    let first_dockerfile = dir.path().join("Dockerfile.first");
+    let second_dockerfile = dir.path().join("Dockerfile.second");
+    symlink(&shared_dockerfile, &first_dockerfile).expect("first symlink succeeds");
+    symlink(&shared_dockerfile, &second_dockerfile).expect("second symlink succeeds");
+    fs::write(
+        dir.path().join("Dockerfile.first.dockerignore"),
+        "first-only\n",
+    )
+    .expect("first ignore file write succeeds");
+    fs::write(
+        dir.path().join("Dockerfile.second.dockerignore"),
+        "second-only\n",
+    )
+    .expect("second ignore file write succeeds");
+
+    assert_ne!(
+        custom_image_reference(&first_dockerfile).expect("first tag resolves"),
+        custom_image_reference(&second_dockerfile).expect("second tag resolves")
+    );
+}
+
+#[test]
+fn build_commands_pull_only_the_runtime_base() {
+    let build_args = runtime_asset_build_args();
+    let base = build_command(
+        Path::new("/tmp/Dockerfile"),
+        Path::new("/tmp/context"),
+        BASE_IMAGE_TAG,
+        true,
+        BuildCache::Disabled,
+        &build_args,
+    );
+    let base_args = command_args(&base);
+    assert_eq!(
+        &base_args[..7],
+        [
+            "build",
+            "--file",
+            "/tmp/Dockerfile",
+            "--tag",
+            "silo-base:latest",
+            "--pull",
+            "--no-cache",
+        ]
+    );
+    assert_eq!(
+        base_args
+            .iter()
+            .filter(|argument| **argument == "--build-arg")
+            .count(),
+        RUNTIME_ASSETS.len()
+    );
+    assert_eq!(base_args.last(), Some(&"/tmp/context"));
+
+    let derivative = build_command(
+        Path::new("/tmp/Dockerfile"),
+        Path::new("/tmp/context"),
+        STAGING_IMAGE_TAG,
+        false,
+        BuildCache::Reuse,
+        &build_args,
+    );
+    let derivative_args = command_args(&derivative);
+    assert!(!derivative_args.contains(&"--pull"));
+    assert!(!derivative_args.contains(&"--no-cache"));
+    assert_eq!(
+        derivative_args
+            .iter()
+            .filter(|argument| **argument == "--build-arg")
+            .count(),
+        RUNTIME_ASSETS.len()
+    );
+    assert_eq!(derivative_args.last(), Some(&"/tmp/context"));
+}
+
+#[test]
+fn derivative_composition_uses_an_internal_base_stage() {
+    let source = Path::new("Dockerfile");
+    let derivative = "# syntax=docker/dockerfile:1\nARG TOOL_VERSION=latest\nFROM silo-base:latest AS app\nRUN echo \"$TOOL_VERSION\"\n";
+    let combined =
+        compose_derivative(BASE_DOCKERFILE, derivative, source).expect("valid derivative composes");
+
+    assert!(combined.starts_with("# syntax=docker/dockerfile:1\nARG TOOL_VERSION=latest\n"));
+    assert!(combined.contains("FROM ubuntu:latest AS silo_internal_runtime_base"));
+    assert!(combined.contains("FROM silo_internal_runtime_base AS app"));
+    assert!(!combined.contains("FROM silo-base:latest"));
+    assert!(combined.ends_with("RUN echo \"$TOOL_VERSION\"\n"));
+}
+
+#[test]
+fn derivative_validation_requires_one_literal_base_stage() {
+    let source = Path::new("Dockerfile");
+    for derivative in [
+        "FROM scratch\n",
+        "ARG BASE=silo-base:latest\nFROM ${BASE}\n",
+        "FROM silo-base\n",
+        "FROM silo-base:latest\nFROM scratch\n",
+        "FROM silo-base:latest AS silo_internal_runtime_base\n",
+    ] {
+        assert!(
+            compose_derivative(BASE_DOCKERFILE, derivative, source).is_err(),
+            "unexpectedly accepted {derivative:?}"
+        );
+    }
+}
+
+#[test]
+fn derivative_composition_preserves_modern_dockerfile_syntax() {
+    let derivative = "\u{feff}# syntax=docker/dockerfile:1\nFROM silo-base:latest\nRUN <<'EOF'\nprintf '%s\\n' silo-base:latest > /tmp/message\nEOF\nCOPY <<EOF /tmp/content\nhello\nEOF\n";
+    let combined = compose_derivative(BASE_DOCKERFILE, derivative, Path::new("Dockerfile"))
+        .expect("Dockerfile heredocs compose");
+
+    assert!(combined.contains("FROM silo_internal_runtime_base"));
+    assert!(!combined.starts_with('\u{feff}'));
+    assert!(combined.contains("RUN <<'EOF'\nprintf '%s\\n' silo-base:latest > /tmp/message\nEOF"));
+    assert!(combined.contains("COPY <<EOF /tmp/content\nhello\nEOF"));
+}
+
+#[test]
+fn derivative_validation_allows_unrelated_base_text_and_external_images() {
+    for derivative in [
+        "FROM silo-base:latest\nRUN echo silo-base:latest\n",
+        "FROM silo-base:latest\nRUN --mount=type=cache,target=/tmp/silo-base-cache true\n",
+        "FROM silo-base:latest\nCOPY --from=registry.example/tools/silo-base:latest /tool /tool\n",
+    ] {
+        compose_derivative(BASE_DOCKERFILE, derivative, Path::new("Dockerfile"))
+            .expect("unrelated base text remains valid");
+    }
+}
+
+#[test]
+fn derivative_validation_reports_the_offending_line() {
+    let error = compose_derivative(
+        BASE_DOCKERFILE,
+        "# custom extras\nFROM silo-base:edge\n",
+        Path::new("images/Dockerfile"),
+    )
+    .expect_err("noncanonical base is rejected");
+
+    assert!(error.to_string().contains("line 2"), "{error:#}");
+}
+
+#[test]
+fn derivative_validation_rejects_escape_directives_that_break_the_base() {
+    let source = Path::new("Dockerfile");
+    compose_derivative(
+        BASE_DOCKERFILE,
+        "# escape=\\\nFROM silo-base:latest\n",
+        source,
+    )
+    .expect("the default escape character remains compatible");
+
+    let error = compose_derivative(
+        BASE_DOCKERFILE,
+        "# escape=`\nFROM silo-base:latest\n",
+        source,
+    )
+    .expect_err("a different escape character would reparse the embedded base");
+
+    assert!(error.to_string().contains("line 1"), "{error:#}");
+    assert!(error.to_string().contains("escape=\\"), "{error:#}");
+}
+
+#[test]
+fn composed_dockerfile_size_is_checked_before_building() {
+    let dir = TestDir::new("oversized-composed-dockerfile");
+    let dockerfile = dir.path().join("Dockerfile");
+    let derivative = format!(
+        "FROM silo-base:latest\n# {}\n",
+        "x".repeat(MAX_COMPOSED_DOCKERFILE_BYTES)
+    );
+    fs::write(&dockerfile, derivative).expect("oversized Dockerfile write succeeds");
+
+    let error = validate_dockerfile(&dockerfile)
+        .expect_err("the composed Dockerfile must fit Apple's transport limit");
+
+    assert!(
+        error
+            .to_string()
+            .contains("after adding Silo's runtime base")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&MAX_COMPOSED_DOCKERFILE_BYTES.to_string())
+    );
+}
+
+#[test]
+fn runtime_check_uses_the_standard_entrypoint_for_a_small_smoke_test() {
+    let command = image_runtime_check_command(STAGING_IMAGE_TAG);
+    let args = command_args(&command);
+
+    assert!(args.windows(2).any(|pair| pair == ["--user", "root"]));
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--entrypoint", ENTRYPOINT_COMMAND])
+    );
+    assert!(args.windows(2).any(|pair| pair == ["--env", "SILO_SUDO=0"]));
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--env", "SILO_INTERNAL_SSH_FORWARDING=0"])
+    );
+    assert!(!args.contains(&"--mount"));
+    let image_index = args
+        .iter()
+        .position(|argument| *argument == STAGING_IMAGE_TAG)
+        .expect("staging image argument exists");
+    assert_eq!(&args[image_index + 1..image_index + 3], ["/bin/sh", "-c"]);
+    assert!(args[image_index + 3].contains("id -un"));
+    assert!(args[image_index + 3].contains("silo-status"));
+}
+
+#[test]
+fn maintenance_commands_target_global_apple_storage() {
+    assert_eq!(
+        command_args(&builder_delete_command()),
+        ["builder", "delete", "--force"]
+    );
+    assert_eq!(command_args(&image_prune_command()), ["image", "prune"]);
+    assert_eq!(
+        command_args(&image_tag_command(STAGING_IMAGE_TAG, DEFAULT_IMAGE_TAG)),
+        ["image", "tag", "silo-build:staging", "silo:latest"]
+    );
+}
+
+#[test]
+fn build_lifecycle_orders_work_and_preserves_failures() {
+    let events = RefCell::new(Vec::new());
+    let result = run_build_lifecycle(
+        || {
+            events.borrow_mut().push("delete-before");
+            Ok(())
+        },
+        || {
+            events.borrow_mut().push("build");
+            Ok(ExitCode::SUCCESS)
+        },
+        || {
+            events.borrow_mut().push("cleanup-after");
+            Ok(())
+        },
+    )
+    .expect("build lifecycle succeeds");
+    assert_eq!(result, ExitCode::SUCCESS);
+    assert_eq!(
+        events.into_inner(),
+        ["delete-before", "build", "cleanup-after"]
+    );
+
+    let failed = run_build_lifecycle(
+        || Ok(()),
+        || Ok(ExitCode::from(23)),
+        || Err(anyhow!("cleanup failed")),
+    )
+    .expect("build status wins over cleanup failure");
+    assert_eq!(failed, ExitCode::from(23));
+}
+
+#[test]
+fn build_lifecycle_reports_preflight_and_success_cleanup_failures() {
+    let built = Cell::new(false);
+    let error = run_build_lifecycle(
+        || Err(anyhow!("delete failed")),
+        || {
+            built.set(true);
+            Ok(ExitCode::SUCCESS)
+        },
+        || Ok(()),
+    )
+    .expect_err("preflight failure aborts the build");
+    assert!(error.to_string().contains("delete failed"));
+    assert!(!built.get());
+
+    let error = run_build_lifecycle(
+        || Ok(()),
+        || Ok(ExitCode::SUCCESS),
+        || Err(anyhow!("cleanup failed")),
+    )
+    .expect_err("successful build reports cleanup failure");
+    assert!(error.to_string().contains("cleanup failed"));
+}
+
+#[test]
+fn cleanup_attempts_builder_and_image_reclamation() {
+    let events = RefCell::new(Vec::new());
+    let error = cleanup_build_storage_with(
+        || {
+            events.borrow_mut().push("builder");
+            Err(anyhow!("builder failed"))
+        },
+        || {
+            events.borrow_mut().push("images");
+            Err(anyhow!("images failed"))
+        },
+    )
+    .expect_err("both cleanup failures are reported");
+
+    assert_eq!(events.into_inner(), ["builder", "images"]);
+    assert!(error.to_string().contains("builder failed"));
+    assert!(error.to_string().contains("images failed"));
+}
+
+#[test]
+fn image_digest_parser_ignores_labels_and_requires_a_digest() {
+    let without_labels =
+        format!(r#"[{{"configuration":{{"descriptor":{{"digest":"{TEST_IMAGE_DIGEST}"}}}}}}]"#);
+    assert_eq!(
+        parse_image_digest(without_labels.as_bytes()).expect("unlabelled image parses"),
+        TEST_IMAGE_DIGEST
+    );
+
+    let with_unrelated_label = format!(
+        r#"[{{"configuration":{{"descriptor":{{"digest":"{TEST_IMAGE_DIGEST}"}},"config":{{"Labels":{{"example":"value"}}}}}}}}]"#
+    );
+    assert_eq!(
+        parse_image_digest(with_unrelated_label.as_bytes()).expect("labelled image parses"),
+        TEST_IMAGE_DIGEST
+    );
+
+    assert!(parse_image_digest(br#"[{"configuration":{}}]"#).is_err());
+    assert!(parse_image_digest(b"not json").is_err());
+}
+
+#[test]
+fn inspect_errors_distinguish_missing_images_from_probe_failures() {
+    let missing = inspect_error(DEFAULT_IMAGE_TAG, "Error: image not found: silo:latest");
+    assert!(missing.to_string().contains("not built yet"));
+    let failed = inspect_error(DEFAULT_IMAGE_TAG, "container runtime is unavailable");
+    assert!(failed.to_string().contains("could not check"));
+}
+
+#[test]
+fn system_start_detection_matches_only_the_documented_hint() {
+    assert!(system_not_started(NOT_STARTED_HINT));
+    assert!(!system_not_started("Error: image not found: silo:latest"));
+    assert!(!system_not_started(""));
+}
+
+#[test]
+fn captured_stderr_is_forwarded_and_bounded() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf to-stderr >&2; exit 7"]);
+    let captured = run_captured(&mut command).expect("command runs");
+    assert_eq!(captured.status.code(), Some(7));
+    assert_eq!(captured.stderr, b"to-stderr");
+
+    let mut large = vec![b'a'; 300 * 1024];
+    large.extend_from_slice(b"tail");
+    trim_captured(&mut large);
+    assert_eq!(large.len(), 256 * 1024);
+    assert!(large.ends_with(b"tail"));
+}
+
+#[test]
+fn execute_build_boots_before_building_when_the_probe_reports_a_stopped_system() {
+    let dir = TestDir::new("build-boot-first");
+    let log = dir.path().join("log");
+    let log_path = log.display();
+    let boots = Cell::new(0);
+    let mut command = Command::new("sh");
+    command.args(["-c", &format!("echo build >> '{log_path}'")]);
+    let result = execute_build_with(
+        &mut command,
+        || Ok((None, NOT_STARTED_HINT.to_string())),
+        || {
+            boots.set(boots.get() + 1);
+            append_log(&log, "boot");
+            true
+        },
+    )
+    .expect("build runs");
+
+    assert_eq!(result, ExitCode::SUCCESS);
+    assert_eq!(boots.get(), 1);
+    assert_eq!(read_log(&log), ["boot", "build"]);
+}
+
+#[test]
+fn execute_build_retries_once_when_the_first_failure_reports_a_stopped_system() {
+    let dir = TestDir::new("build-retry");
+    let log = dir.path().join("log");
+    let marker = dir.path().join("built");
+    let log_path = log.display();
+    let marker_path = marker.display();
+    let boots = Cell::new(0);
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        &format!(
+            "echo build >> '{log_path}'; if [ ! -e '{marker_path}' ]; then touch '{marker_path}'; echo '{NOT_STARTED_HINT}' >&2; exit 1; fi"
+        ),
+    ]);
+    let result = execute_build_with(
+        &mut command,
+        || Ok((None, "Error: image not found".to_string())),
+        || {
+            boots.set(boots.get() + 1);
+            append_log(&log, "boot");
+            true
+        },
+    )
+    .expect("build runs");
+
+    assert_eq!(result, ExitCode::SUCCESS);
+    assert_eq!(boots.get(), 1);
+    assert_eq!(read_log(&log), ["build", "boot", "build"]);
+}
+
+#[test]
+fn execute_build_preserves_unrelated_failure_status() {
+    let boots = Cell::new(0);
+    let mut command = Command::new("sh");
+    command.args(["-c", "exit 23"]);
+    let result = execute_build_with(
+        &mut command,
+        || Ok((None, "Error: image not found".to_string())),
+        || {
+            boots.set(boots.get() + 1);
+            true
+        },
+    )
+    .expect("build runs");
+
+    assert_eq!(result, ExitCode::from(23));
+    assert_eq!(boots.get(), 0);
+}
+
+#[test]
+fn image_inspection_boots_and_reprobes_only_for_a_stopped_system() {
+    let probes = Cell::new(0);
+    let boots = Cell::new(0);
+    let (digest, _) = inspect_image_with(
+        || {
+            probes.set(probes.get() + 1);
+            if probes.get() == 1 {
+                Ok((None, NOT_STARTED_HINT.to_string()))
+            } else {
+                Ok((Some(TEST_IMAGE_DIGEST.to_string()), String::new()))
+            }
+        },
+        || {
+            boots.set(boots.get() + 1);
+            true
+        },
+    )
+    .expect("probe runs");
+    assert_eq!(digest.as_deref(), Some(TEST_IMAGE_DIGEST));
+    assert_eq!(probes.get(), 2);
+    assert_eq!(boots.get(), 1);
+
+    let (missing, stderr) = inspect_image_with(
+        || Ok((None, "Error: image not found".to_string())),
+        || panic!("ordinary misses must not boot"),
+    )
+    .expect("ordinary miss resolves");
+    assert!(missing.is_none());
+    assert_eq!(stderr, "Error: image not found");
+}
+
+#[test]
+fn build_directory_is_removed_on_drop() {
+    let dir = TestDir::new("build-directory");
+    let build_dir =
+        BuildDir::create_at(dir.path().join("build")).expect("build directory creation succeeds");
+    let path = build_dir.path().to_path_buf();
+    assert!(path.is_dir());
+    drop(build_dir);
+    assert!(!path.exists());
+}
+
+#[test]
+fn build_context_contains_only_the_embedded_base_dockerfile() {
+    let dir = TestDir::new("build-context");
+    let build_dir =
+        BuildDir::create_at(dir.path().join("build")).expect("build directory creation succeeds");
+
+    write_build_context(&build_dir).expect("build context write succeeds");
+
+    let entries = fs::read_dir(build_dir.path())
+        .expect("build context reads")
+        .map(|entry| entry.expect("build context entry reads").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, [OsString::from("silo-base.dockerfile")]);
+    assert_eq!(
+        fs::read_to_string(build_dir.path().join("silo-base.dockerfile"))
+            .expect("base Dockerfile reads"),
+        BASE_DOCKERFILE
+    );
+}
+
+#[test]
+fn dockerfile_validation_and_context_cover_supported_paths() {
+    assert!(validate_dockerfile(Path::new("")).is_err());
+    let dir = TestDir::new("dockerfile-validation");
+    assert!(validate_dockerfile(dir.path()).is_err());
+    let dockerfile = dir.path().join("Dockerfile");
+    assert!(validate_dockerfile(&dockerfile).is_err());
+    fs::write(&dockerfile, "FROM scratch\n").expect("Dockerfile write succeeds");
+    assert!(validate_dockerfile(&dockerfile).is_err());
+    fs::write(&dockerfile, "FROM silo-base:latest\n").expect("Dockerfile write succeeds");
+    validate_dockerfile(&dockerfile).expect("regular Dockerfile is valid");
+
+    assert_eq!(
+        dockerfile_context(Path::new("images/dev/Dockerfile")),
+        Path::new("images/dev")
+    );
+    assert_eq!(dockerfile_context(Path::new("Dockerfile")), Path::new("."));
+}
+
+#[test]
+fn dockerfile_specific_ignore_rules_follow_the_generated_dockerfile() {
+    let dir = TestDir::new("dockerfile-ignore");
+    let dockerfile = dir.path().join("Containerfile.dev");
+    let source = dir.path().join("Containerfile.dev.dockerignore");
+    let destination = dir.path().join("silo-derivative.dockerfile.dockerignore");
+    fs::write(&dockerfile, "FROM silo-base:latest\n").expect("Dockerfile write succeeds");
+    fs::write(&source, "ignored.txt\n").expect("ignore file write succeeds");
+
+    copy_dockerignore(&dockerfile, &destination).expect("ignore file copy succeeds");
+
+    assert_eq!(
+        fs::read_to_string(destination).expect("copied ignore file reads"),
+        "ignored.txt\n"
+    );
+}
+
+#[test]
+fn build_validates_custom_dockerfiles_before_runtime_access() {
+    let dir = TestDir::new("missing-build-dockerfile");
+    let mut config = Config::default();
+    config.image.dockerfile = Some(dir.path().join("Dockerfile"));
+
+    let error = build(&config).expect_err("missing Dockerfile prevents maintenance");
+    assert!(error.to_string().contains("does not exist"));
+}
+
+#[test]
+fn build_lock_serializes_competing_image_builds() {
+    let dir = TestDir::new("build-lock");
+    let first = BuildLock::acquire_at(dir.path()).expect("first lock succeeds");
+    let root = dir.path().to_path_buf();
+    let (acquired_tx, acquired_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let second = BuildLock::acquire_at(&root).expect("second lock succeeds");
+        acquired_tx.send(()).expect("acquisition is reported");
+        drop(second);
+    });
+
+    assert!(
+        acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+    drop(first);
+    acquired_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second lock proceeds after release");
+    handle.join().expect("lock thread joins");
+}
+
+#[test]
+fn build_lock_location_is_stable_for_the_current_user() {
+    assert_eq!(
+        global_build_lock_root(),
+        Path::new(BUILD_LOCK_PARENT).join(format!("silo-build-{}", unsafe { libc::geteuid() }))
+    );
+}
+
+#[test]
+fn embedded_runtime_contains_lifecycle_programs() {
+    for asset in RUNTIME_ASSETS {
+        assert!(
+            BASE_DOCKERFILE.contains(&format!("ARG {}", asset.build_arg)),
+            "missing {}",
+            asset.build_arg
+        );
+        assert!(BASE_DOCKERFILE.contains(asset.image_path));
+    }
+    let directory_install = BASE_DOCKERFILE
+        .find("install -d -o root -g root -m 0755 /etc/ssh /usr/local/bin")
+        .expect("runtime asset parent directories are created");
+    let ssh_config_write = BASE_DOCKERFILE
+        .find("> /etc/ssh/silo_sshd_config")
+        .expect("SSH configuration is decoded into place");
+    assert!(directory_install < ssh_config_write);
+    assert!(!BASE_DOCKERFILE.contains("COPY silo-"));
+    assert!(ENTRYPOINT.contains("-exec mountpoint -q {} \\; -prune"));
+    assert!(ENTRYPOINT.contains("-exec chown -h silo:silo {} +"));
+    assert!(ENTRYPOINT.contains("unset SILO_INTERNAL_SSH_FORWARDING"));
+    assert!(SUPERVISOR.contains("flock --exclusive --nonblock"));
+    assert!(SESSION_WRAPPER.contains("flock --shared"));
+    assert!(SESSION_RESERVER.contains("flock --shared"));
+    assert!(STATUS_HELPER.contains("count=$((count + 1))"));
+    assert!(STOP_GUARD.contains("flock --exclusive --nonblock"));
+}
+
+#[test]
+fn runtime_asset_build_arguments_round_trip_without_context_files() {
+    let build_args = runtime_asset_build_args();
+    assert_eq!(build_args.len(), RUNTIME_ASSETS.len());
+    for (asset, build_arg) in RUNTIME_ASSETS.iter().zip(build_args) {
+        let (name, encoded) = build_arg
+            .split_once('=')
+            .expect("runtime build argument has a value");
+        assert_eq!(name, asset.build_arg);
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(encoded)
+                .expect("runtime build argument is base64"),
+            asset.contents.as_bytes()
+        );
+    }
+}
+
+#[test]
+fn embedded_layers_keep_supported_shells_and_default_tools() {
+    for package in ["fish", "nushell", "zsh"] {
+        assert!(
+            BASE_DOCKERFILE
+                .lines()
+                .any(|line| line.trim().trim_end_matches(" \\").trim() == package),
+            "missing base package {package}"
+        );
+    }
+    assert!(BASE_DOCKERFILE.contains(BASH_PATH));
+    for name in ["zsh", "fish", "nu"] {
+        assert!(
+            BASE_DOCKERFILE.contains(&format!("${{BREW_PREFIX}}/bin/{name}")),
+            "missing supported shell {name}"
+        );
+    }
+    for package in [
+        "actionlint",
+        "claude-code",
+        "codex",
+        "jj",
+        "playwright-cli",
+        "rust",
+        "shellcheck",
+        "uv",
+    ] {
+        assert!(
+            EXTRAS_DOCKERFILE
+                .lines()
+                .any(|line| line.trim().trim_end_matches(" \\").trim() == package),
+            "missing extras package {package}"
+        );
+    }
+    assert!(EXTRAS_DOCKERFILE.contains("playwright-cli install-browser --with-deps"));
+    assert!(BASE_DOCKERFILE.contains("brew cleanup --prune=all"));
+    assert!(EXTRAS_DOCKERFILE.contains("brew cleanup --prune=all"));
 }

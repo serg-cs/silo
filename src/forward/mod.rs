@@ -52,7 +52,7 @@ impl GuestAssets {
     }
 }
 
-/// Host forwarding state prepared for one built-in shared-container run.
+/// Host forwarding state prepared for one compatible shared-container run.
 pub(crate) struct Session {
     tunnel: Option<Tunnel>,
 }

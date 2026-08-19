@@ -1165,7 +1165,18 @@ fn mount_rejects_invalid_name_and_target() {
     .expect_err("relative target is invalid");
     let msg = config.to_string();
     assert!(msg.contains("bind or state entry `bad name`"), "{msg}");
-    assert!(msg.contains("must not escape its target root"), "{msg}");
+    assert!(msg.contains("must not contain `..`"), "{msg}");
+}
+
+#[test]
+fn mount_rejects_absolute_parent_components_that_can_cross_symlinks() {
+    let error = Config::parse("[state.user.tools]\ntarget = \"/bin/../local/bin\"\n")
+        .expect_err("absolute parent traversal is unsafe in the container");
+
+    assert!(
+        error.to_string().contains("must not contain `..`"),
+        "{error}"
+    );
 }
 
 #[test]

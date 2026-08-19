@@ -37,7 +37,7 @@ pub struct Config {
     /// Project config may add entries or overlay global entries by name and
     /// field.
     pub forward: BTreeMap<String, Forward>,
-    /// Interactive shell used by the built-in image. When omitted, Silo
+    /// Interactive shell supplied by the Silo base image. When omitted, Silo
     /// mirrors a supported host `$SHELL` and falls back to Zsh.
     pub shell: Option<Shell>,
     /// Settings for the project workspace mounted into the container.
@@ -300,8 +300,8 @@ impl Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Image {
-    /// Path to a Dockerfile defining a custom image; `None` uses the
-    /// built-in image.
+    /// Path to a Dockerfile with a literal `FROM silo-base:latest`; `None`
+    /// uses Silo's embedded development-extras layer.
     pub dockerfile: Option<PathBuf>,
 }
 
@@ -315,7 +315,7 @@ pub struct Container {
     /// Memory allocated to the container, using Apple container's accepted
     /// syntax (for example `4G`). `None` uses its configured default.
     pub memory: Option<String>,
-    /// Grants the built-in image's `silo` user passwordless sudo access.
+    /// Grants the base image's `silo` user passwordless sudo access.
     pub sudo: bool,
 }
 
@@ -356,7 +356,7 @@ impl Forward {
     }
 }
 
-/// Shells guaranteed to be available in Silo's built-in image.
+/// Shells guaranteed to be available in every Silo-compatible image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Shell {
@@ -1067,8 +1067,16 @@ fn container_path_reason(path: &Path) -> Result<()> {
     if text.contains(['\n', '\r']) {
         return Err(anyhow!("path contains a newline"));
     }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "path must not contain `..`, which can cross container symlinks"
+        ));
+    }
     if path.is_relative() {
-        let anchored = text
+        text
             .strip_prefix("~/")
             .or_else(|| text.strip_prefix("./"))
             .ok_or_else(|| {
@@ -1076,12 +1084,6 @@ fn container_path_reason(path: &Path) -> Result<()> {
                     "path must start with `./` for the project, `~/` for the container home, or `/` for an absolute location"
                 )
             })?;
-        if Path::new(anchored)
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return Err(anyhow!("path must not escape its target root with `..`"));
-        }
     }
     Ok(())
 }
