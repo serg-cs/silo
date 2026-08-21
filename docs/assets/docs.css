@@ -1,0 +1,458 @@
+/* Structure long-form documentation for scanning and deep linking. */
+.docs-layout {
+  display: grid;
+  width: min(calc(100% - 2rem), var(--content-width));
+  margin: 0 auto;
+  padding-block: 3rem 7rem;
+  align-items: start;
+  grid-template-columns: 14rem minmax(0, var(--reading-width));
+  gap: clamp(2.5rem, 7vw, 7rem);
+}
+
+.docs-sidebar {
+  position: sticky;
+  top: 7rem;
+}
+
+.docs-sidebar-title {
+  margin: 0 0 0.8rem;
+  color: var(--text-muted);
+  font-size: 0.73rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.docs-sidebar nav {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.docs-sidebar a {
+  padding: 0.45rem 0.65rem;
+  border-radius: 0.38rem;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.docs-sidebar a:hover {
+  background: var(--surface-subtle);
+  color: var(--text);
+}
+
+.docs-sidebar a[aria-current="page"] {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.doc-content {
+  min-width: 0;
+}
+
+.doc-header {
+  margin-bottom: 4rem;
+  padding-bottom: 2.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.doc-header h1 {
+  max-width: 13ch;
+  margin: 0;
+  font-size: clamp(2.8rem, 7vw, 5.3rem);
+  letter-spacing: -0.06em;
+  line-height: 0.98;
+}
+
+.doc-header p {
+  max-width: 40rem;
+  margin: 1.5rem 0 0;
+  color: var(--text-muted);
+  font-size: 1.15rem;
+}
+
+.doc-content section + section {
+  margin-top: 4.5rem;
+}
+
+.doc-content h2 {
+  margin: 0 0 1.1rem;
+  font-size: clamp(1.75rem, 4vw, 2.35rem);
+  letter-spacing: -0.035em;
+  line-height: 1.15;
+}
+
+.doc-content h3 {
+  margin: 2.3rem 0 0.65rem;
+  font-size: 1.23rem;
+  letter-spacing: -0.02em;
+}
+
+.doc-content h2 a,
+.doc-content h3 a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.doc-content p,
+.doc-content li {
+  color: var(--text-muted);
+}
+
+.doc-content strong {
+  color: var(--text);
+}
+
+.doc-content ul,
+.doc-content ol {
+  padding-left: 1.35rem;
+}
+
+.doc-content li + li {
+  margin-top: 0.42rem;
+}
+
+.doc-content code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+}
+
+.doc-content :not(pre) > code {
+  padding: 0.12rem 0.32rem;
+  border: 1px solid var(--border);
+  border-radius: 0.3rem;
+  background: var(--surface-subtle);
+  color: var(--text);
+}
+
+pre {
+  overflow-x: auto;
+  margin: 1.4rem 0;
+  padding: 1rem 1.05rem;
+  border: 1px solid #2b3931;
+  border-radius: var(--radius);
+  background: var(--terminal);
+  color: var(--terminal-text);
+  font-family: var(--font-mono);
+  font-size: 0.94rem;
+  line-height: 1.58;
+  tab-size: 2;
+}
+
+.code-block {
+  position: relative;
+  margin: 1.4rem 0;
+}
+
+.code-block pre {
+  margin: 0;
+  padding-right: 5.2rem;
+}
+
+.copy-button {
+  position: absolute;
+  z-index: 1;
+  top: 0.65rem;
+  right: 0.65rem;
+  padding: 0.35rem 0.55rem;
+  border: 1px solid #44544a;
+  border-radius: 0.35rem;
+  background: #19221d;
+  color: #b9cac0;
+  font: 650 0.72rem var(--font-sans);
+  cursor: pointer;
+}
+
+.copy-button:hover {
+  border-color: #6d8276;
+  color: #ffffff;
+}
+
+.note,
+.warning {
+  margin: 1.5rem 0;
+  padding: 1rem 1.1rem;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--radius-small) var(--radius-small) 0;
+  background: var(--accent-soft);
+}
+
+.warning {
+  border-left-color: #b76129;
+  background: color-mix(in srgb, #d78045 14%, var(--surface));
+}
+
+.note p,
+.warning p {
+  margin: 0;
+  color: var(--text);
+}
+
+.note p + p,
+.warning p + p {
+  margin-top: 0.75rem;
+}
+
+.table-wrap {
+  overflow-x: auto;
+  margin: 1.5rem 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  font-size: 0.9rem;
+}
+
+th,
+td {
+  padding: 0.8rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  color: var(--text);
+  font-size: 0.76rem;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+}
+
+td {
+  color: var(--text-muted);
+}
+
+tr:last-child td {
+  border-bottom: 0;
+}
+
+/* Give the standalone command reference its own compact scanning system. */
+.command-layout {
+  grid-template-columns: 12rem minmax(0, 1fr);
+  gap: clamp(2.5rem, 6vw, 5.5rem);
+}
+
+.docs-sidebar code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+}
+
+.command-index {
+  display: grid;
+  margin: 1.5rem 0 2rem;
+  border-top: 1px solid var(--border);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.command-index a {
+  display: grid;
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  text-decoration: none;
+  gap: 0.25rem;
+}
+
+.command-index a:nth-child(odd) {
+  padding-right: 1.25rem;
+}
+
+.command-index a:nth-child(even) {
+  padding-left: 1.25rem;
+  border-left: 1px solid var(--border);
+}
+
+.command-index a:hover code {
+  color: var(--accent);
+}
+
+.command-index code {
+  color: var(--text);
+  font-size: 0.9rem;
+  font-weight: 750;
+}
+
+.command-index span {
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+
+.command-block {
+  margin: 1.5rem 0;
+  padding: 1.15rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.command-block-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.command-block-heading h3 {
+  margin: 0;
+}
+
+.command-block-heading > span {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.command-block pre {
+  margin: 0.9rem 0;
+}
+
+.command-block p:last-child {
+  margin-bottom: 0;
+}
+
+.command-usage {
+  border-color: color-mix(in srgb, var(--accent-bright) 35%, #2b3931);
+}
+
+.option-list,
+.command-list {
+  margin: 1.25rem 0 1.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.option-list > div,
+.command-list > div {
+  display: grid;
+  padding: 0.9rem 0;
+  border-bottom: 1px solid var(--border);
+  grid-template-columns: minmax(11rem, 0.7fr) minmax(0, 1.3fr);
+  gap: 1.5rem;
+}
+
+.command-list > div {
+  grid-template-columns: minmax(16rem, 0.85fr) minmax(0, 1.15fr);
+}
+
+.option-list dt,
+.command-list dt {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.option-list dd,
+.command-list dd {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.command-list dt > span {
+  display: block;
+  margin-top: 0.3rem;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.page-links {
+  display: grid;
+  margin-top: 4rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.page-link {
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-small);
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.page-link span {
+  display: block;
+  margin-bottom: 0.25rem;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.page-link:hover {
+  border-color: var(--border-strong);
+  color: var(--accent);
+}
+
+.page-links-next .page-link {
+  grid-column: 2;
+}
+
+@media (max-width: 900px) {
+  .docs-layout {
+    grid-template-columns: 1fr;
+    gap: 3rem;
+  }
+
+  .docs-sidebar {
+    position: static;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .docs-sidebar nav {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .command-index {
+    grid-template-columns: 1fr;
+  }
+
+  .command-index a:nth-child(odd),
+  .command-index a:nth-child(even) {
+    padding-inline: 0;
+    border-left: 0;
+  }
+}
+
+@media (max-width: 600px) {
+  .docs-sidebar nav {
+    grid-template-columns: 1fr;
+  }
+
+  .command-layout > .docs-sidebar {
+    display: none;
+  }
+
+  .table-wrap table {
+    min-width: 40rem;
+  }
+
+  .page-links {
+    grid-template-columns: 1fr;
+  }
+
+  .page-links-next .page-link {
+    grid-column: 1;
+  }
+
+  .option-list > div,
+  .command-list > div {
+    grid-template-columns: 1fr;
+    gap: 0.35rem;
+  }
+
+  .command-block-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+}

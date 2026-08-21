@@ -95,7 +95,7 @@ pub(crate) enum ContainersCommand {
     /// Stop and delete one Silo container.
     #[command(alias = "rm")]
     Delete {
-        /// Exact container ID, unique ID prefix, project path, or unique project name.
+        /// Exact container ID or unique project basename.
         selector: String,
         /// Terminate active sessions before deleting the container.
         #[arg(long)]
@@ -111,7 +111,7 @@ pub(crate) enum StateCommand {
     /// Permanently delete one unused state directory.
     #[command(alias = "rm")]
     Delete {
-        /// Exact state ID, unique ID prefix, project, or logical state name.
+        /// Exact state ID or globally unique logical state name.
         selector: String,
     },
 }

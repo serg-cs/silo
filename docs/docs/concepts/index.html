@@ -7,7 +7,8 @@
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/concepts/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="../../assets/styles.css">
+    <link rel="stylesheet" href="../../assets/base.css">
+    <link rel="stylesheet" href="../../assets/docs.css">
     <script src="../../assets/site.js" defer></script>
     <title>Concepts — Silo</title>
   </head>
@@ -35,17 +36,17 @@
           <h2><a href="#projects">Projects are the unit of identity</a></h2>
           <p>Every command that runs a container starts by resolving the current directory to a canonical path and discovering a project root:</p>
           <ol>
-            <li>The nearest ancestor containing a <code>.silo.toml</code> file wins. An explicit Silo marker takes precedence over every VCS directory in the ancestor chain.</li>
-            <li>Without a Silo marker, the nearest ancestor containing a real <code>.git</code> or <code>.jj</code> directory becomes the root.</li>
-            <li>Without either marker, the exact current directory is the project.</li>
+            <li>The nearest ancestor containing a <code>.silo.toml</code> file wins as an explicit Silo boundary.</li>
+            <li>Without a Silo marker, Silo asks Git for the top-level working tree with <code>git rev-parse --show-toplevel</code>. Git therefore handles normal repositories, linked worktrees, and submodules itself.</li>
+            <li>If Git is unavailable or does not report a valid ancestor, the exact current directory is the project.</li>
           </ol>
           <p>The canonical root determines the mounted source tree, the container working directory, the shared container ID, project-scoped state, and ownership labels. Two directories with the same basename remain separate projects when their canonical paths differ.</p>
-          <div class="note"><p>Put an empty or partial <code>.silo.toml</code> at a monorepo boundary when you want Silo's project root to differ from the VCS root.</p></div>
+          <div class="note"><p>Put an empty or partial <code>.silo.toml</code> at the directory you want to use when Silo's project root should differ from Git's root.</p></div>
         </section>
 
         <section id="image">
           <h2><a href="#image">A stable base supports replaceable tool layers</a></h2>
-          <p><code>silo image build</code> first creates <code>silo-base:latest</code>. This Ubuntu-based image owns the stable Silo contract: the <code>silo</code> user, supported shells, Homebrew, sudo, SSH forwarding server, supervisor, session helpers, entrypoint, and required filesystem paths.</p>
+          <p><code>silo image build</code> first creates <code>silo-base:latest</code>. This Ubuntu-based image owns the stable Silo contract: the <code>silo</code> user, supported shells, Homebrew, sudo, restricted SSH host-port tunnels, lifecycle helper, entrypoint, and required filesystem paths.</p>
           <p>Silo then builds one derivative. Without <code>image.dockerfile</code>, the embedded extras Dockerfile produces <code>silo:latest</code> with:</p>
           <ul>
             <li>Codex, Claude Code, and many other coding-agent CLIs.</li>
@@ -53,8 +54,7 @@
             <li>Rust, Node.js, Python, <code>uv</code>, Ruff, Playwright with Chromium, GitHub CLI, Jujutsu, and common linters.</li>
             <li>Practical terminal tools including Ripgrep, fd, fzf, jq, just, tmux, Helix, Vim, lazygit, Yazi, and Zoxide.</li>
           </ul>
-          <p>A configured Dockerfile replaces only that extras layer. It must have exactly one stage beginning with a literal <code>FROM silo-base:latest</code>. Silo runs the actual entrypoint and a small compatibility smoke test before publishing the derivative's deterministic local tag.</p>
-          <p>Rebuilding is explicit. One fresh builder first produces the base without cache, then the derivative reuses those completed base-stage layers and installs only its additions. Silo embeds the base under an internal stage name, so the published <code>silo-base:latest</code> tag is never resolved as a derivative input. Silo serializes builds because Apple's builder is user-global, stages each result before replacing its stable tag, cleans stale builder storage, and prunes dangling images after the build.</p>
+          <p>A configured Dockerfile replaces only the extras layer while preserving the base contract. Silo builds deliberately without a persistent cache and validates candidates before publication. See <a href="../how-it-works/#image-contract">image build and publication</a> for the exact base-and-extras, no-cache, staging, and cleanup behavior.</p>
         </section>
 
         <section id="sessions">
@@ -94,9 +94,9 @@
           <p>Jujutsu metadata remains writable because even inspection commands acquire locks and may update <code>.jj</code>. Adding <code>.jj</code> to <code>workspace.read_only</code> prevents normal Jujutsu operation.</p>
           <p>Projects that expect containerized tools to manage repository metadata can remove that path or disable the <code>workspace.read_only</code> overlays. Other project directories can be protected with the same literal, project-relative list:</p>
           <pre data-copy><code>workspace.read_only = [".github"]</code></pre>
-          <p>Use <code>workspace.read_only = []</code> instead to disable every read-only project overlay. Separately configured binds retain their own access modes.</p>
-          <p>A read-write bind that overlaps a protected path can make it writable again, and Silo warns when it detects that overlap.</p>
-          <div class="warning"><p>Read-only overlays cannot target individual files because Apple container accepts only directories as bind-mount sources.</p></div>
+          <p>Use <code>workspace.read_only = []</code> instead to disable every read-only project overlay. Entries that are malformed, missing, not directories, or resolve outside the project are silently ignored. A linked-worktree or submodule <code>.git</code> file is therefore not mounted; project discovery still works through Git, but metadata stored outside the selected root is not mounted automatically. Separately configured binds retain their own access modes.</p>
+          <p>Configuration validation rejects read-write binds and managed-state mounts that overlap a protected path in either direction. A writable child could replace protected content directly, while a writable parent could hide the read-only overlay.</p>
+          <div class="warning"><p>Read-only overlays cannot target individual files because Apple container accepts only directories as bind-mount sources. A skipped entry provides no protection and does not participate in writable-overlap checks.</p></div>
         </section>
 
         <section id="custom-images">
@@ -105,7 +105,8 @@
           <pre data-copy><code>FROM silo-base:latest
 
 USER silo
-RUN brew install protobuf
+# Add the project-specific tools you need here.
+RUN brew install go
 USER root</code></pre>
           <p>Silo replaces that reference with an internal stage before building, which prevents any registry lookup for <code>silo-base:latest</code>. ARG-based base references and additional local stages are rejected. External images may still be used by instructions such as <code>COPY --from=registry.example/tools:latest</code>. Silo preserves the configured directory as the context and gives each Dockerfile, effective build context, and Dockerfile-specific ignore selection a deterministic local image tag. This keeps shared Dockerfile contents from colliding when projects supply different relative <code>COPY</code> inputs or ignore rules.</p>
           <div class="warning"><p>A custom Dockerfile is trusted input. Keep the inherited <code>silo</code> user, entrypoint, lifecycle helpers, supported shells, and expected paths intact. Silo catches basic startup incompatibilities, but does not police permissions, links, package changes, or every way root-level build instructions can break later sessions.</p></div>

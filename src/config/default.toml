@@ -8,10 +8,8 @@
 # shell = "zsh"
 workspace.read_only = [".git"]
 
-# https://serg-cs.github.io/silo/docs/configuration/#forwards
-[forward]
-# postgres = { port = 5432, enabled = true }
-# redis = { port = 6379, enabled = false }
+# https://serg-cs.github.io/silo/docs/configuration/#host-ports
+# host_ports = [5432, 8080]
 
 # https://serg-cs.github.io/silo/docs/configuration/#binds
 [binds]

@@ -7,7 +7,8 @@
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/tips/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="../../assets/styles.css">
+    <link rel="stylesheet" href="../../assets/base.css">
+    <link rel="stylesheet" href="../../assets/docs.css">
     <script src="../../assets/site.js" defer></script>
     <title>Tips and troubleshooting — Silo</title>
   </head>
@@ -69,7 +70,7 @@ silo run</code></pre>
 test = ["just", "test"]
 lint = ["just", "lint"]
 agent = ["codex", "--full-auto"]</code></pre>
-          <p>Arguments append naturally—<code>silo test api</code> becomes <code>just test api</code>. Project commands inherit global names and replace only a same-named command. Use an empty array when the invocation itself should supply the complete command; invoking that shortcut without arguments opens the default shell.</p>
+          <p>Arguments append naturally—<code>silo test api</code> becomes <code>just test api</code>. Project commands inherit global names and replace only a same-named command.</p>
           <p>Since Silo executes an argument vector rather than a shell string, pipes, redirects, and environment assignments need an explicit shell:</p>
           <pre data-copy><code>[quick]
 logs = ["sh", "-lc", "just logs | tail -n 100"]</code></pre>
@@ -77,14 +78,12 @@ logs = ["sh", "-lc", "just logs | tail -n 100"]</code></pre>
 
         <section id="host-services">
           <h2><a href="#host-services">Connect to a host service</a></h2>
-          <p>Name only the loopback service the project needs:</p>
-          <pre data-copy><code>[forward]
-postgres = { port = 5432 }
-api = { port = 8080 }</code></pre>
+          <p>Allow only the loopback ports the project needs:</p>
+          <pre data-copy><code>host_ports = [5432, 8080]</code></pre>
           <p>Use the same IPv4 loopback ports inside the shared container:</p>
           <pre data-copy><code>psql -h 127.0.0.1 -p 5432
 curl "http://127.0.0.1:8080/health"</code></pre>
-          <p>Use the configured port directly: every forward keeps the same port number on the host and inside the container. Isolated runs ignore forwards with a warning; custom derivatives support them in shared mode.</p>
+          <p>Use each configured port directly: the tunnel keeps the same port number on the Mac and inside the container. Isolated runs ignore host ports with a warning; custom derivatives support them in shared mode.</p>
         </section>
 
         <section id="resources">
@@ -93,7 +92,7 @@ curl "http://127.0.0.1:8080/health"</code></pre>
           <pre data-copy><code>container.cpus = 4
 container.memory = "6G"</code></pre>
           <pre data-copy><code>silo run --cpus 8 --memory 12G -- cargo test</code></pre>
-          <p>Resource settings apply when a container is created. If they change while the shared project container is running, Silo warns and joins it with its existing limits. The new settings apply after the container is recreated.</p>
+          <p>Resource settings apply when a container is created. Silo joins an already-running shared project container without comparing or changing its limits. New settings apply after the container is recreated.</p>
         </section>
 
         <section id="sudo">
@@ -107,7 +106,7 @@ container.memory = "6G"</code></pre>
           <h2><a href="#project-writes">Choose protected paths for the workflow</a></h2>
           <p>Silo leaves the working tree writable while protecting existing Git metadata by default. If agents or other tools should modify Git metadata, disable the project overlays in the project file:</p>
           <pre data-copy><code>workspace.read_only = []</code></pre>
-          <p>Use literal relative paths to protect additional directories, for example <code>workspace.read_only = [".git", ".github"]</code>. Missing entries are harmless, while absolute paths and paths that escape the project root are rejected. Existing regular files are rejected because Apple container bind mounts require directory sources.</p>
+          <p>Use literal relative paths to protect additional directories, for example <code>workspace.read_only = [".git", ".github"]</code>. Silo silently ignores missing or malformed entries, regular files, and paths that resolve outside the project root because Apple container bind mounts require safe directory sources. Check that an entry resolves when its protection matters.</p>
           <p>Keep <code>.jj</code> writable when using Jujutsu in the container: read commands such as <code>jj status</code> still need metadata locks and can fail against a read-only overlay.</p>
         </section>
 
@@ -121,7 +120,7 @@ silo state</code></pre>
           <p>This sequence answers which files contributed, what Silo actually sees, whether the result is valid, which containers are active, and which durable directories exist.</p>
           <p>Delete runtime containers independently from durable state:</p>
           <pre data-copy><code>silo containers delete my-project
-silo state delete silo-state-p-&lt;id&gt;</code></pre>
+silo state delete &lt;full-state-id&gt;</code></pre>
           <div class="warning"><p>Container deletion is recoverable from source and configuration. Managed state deletion removes its data permanently.</p></div>
         </section>
 
@@ -132,13 +131,14 @@ silo state delete silo-state-p-&lt;id&gt;</code></pre>
 FROM silo-base:latest
 
 USER silo
-RUN brew install protobuf
+# Add the project-specific tools you need here.
+RUN brew install go
 USER root</code></pre>
           <pre data-copy><code>image.dockerfile = "./Dockerfile.silo"
 
 [binds]
 artifacts = { source = "./artifacts", target = "./artifacts", access = "read-write" }</code></pre>
-          <p>The Dockerfile must have exactly one stage and use that literal base spelling; Silo rewrites it to an internal stage so it can never be resolved from a registry. Shared sessions, shells, <code>/home/silo</code>, sudo, forwarding, and project/user managed state remain available when the derivative preserves their base requirements. If you also want Silo's default agent and developer toolset, install the packages you need in your derivative; selecting a custom Dockerfile replaces the extras layer.</p>
+          <p>The Dockerfile must have exactly one stage and use that literal base spelling; Silo rewrites it to an internal stage so it can never be resolved from a registry. Shared sessions, shells, <code>/home/silo</code>, sudo, host ports, and project/user managed state remain available when the derivative preserves their base requirements. If you also want Silo's default agent and developer toolset, install the packages you need in your derivative; selecting a custom Dockerfile replaces the extras layer.</p>
         </section>
 
         <section id="troubleshooting">
@@ -152,14 +152,14 @@ artifacts = { source = "./artifacts", target = "./artifacts", access = "read-wri
           <h3 id="runtime-not-started"><a href="#runtime-not-started">The Apple container system is unavailable</a></h3>
           <p>Check the runtime directly with <code>container system status</code>. Silo attempts to start the system for image builds and first-use paths that require it, but kernels and service failures belong to Apple's CLI.</p>
 
-          <h3 id="forward-ssh"><a href="#forward-ssh">An SSH forward cannot start</a></h3>
-          <p>Confirm that <code>ssh</code> and <code>ssh-keygen</code> are installed on the host, rebuild the selected image after upgrading Silo, and check that the named port is free inside the container. Forwarding is intentionally unavailable for <code>--isolated</code> runs.</p>
+          <h3 id="host-ports-ssh"><a href="#host-ports-ssh">The host-port tunnel cannot start</a></h3>
+          <p>Confirm that <code>ssh</code> and <code>ssh-keygen</code> are installed on the host, rebuild the selected image after upgrading Silo, and check that the configured port is free inside the container. Host ports are intentionally unavailable for <code>--isolated</code> runs.</p>
 
-          <h3 id="unknown-config"><a href="#unknown-config">An unknown config key is ignored</a></h3>
-          <p>Read the warning's full dotted key and file path, fix the likely typo, then run <code>silo config check</code>. Unknown values never participate in the effective configuration.</p>
+          <h3 id="unknown-config"><a href="#unknown-config">An unknown config key is rejected</a></h3>
+          <p>Read the error's field name, source path, and parser location, fix the likely typo, then run <code>silo config check</code>.</p>
 
           <h3 id="bind-source"><a href="#bind-source">A bind source cannot be resolved</a></h3>
-          <p>Confirm that the source exists and is a directory. Relative global sources resolve from the global config directory; relative project sources resolve from the project root; <code>~</code> expands from the host home. Broken symlinks are rejected.</p>
+          <p>Run <code>silo config check</code>, then confirm that the source exists and is a directory. Relative sources from both global and project configuration resolve from the selected project root; <code>~</code> expands from the host home. Broken symlinks are rejected. See <a href="../configuration/#validation">validation and diagnostics</a> for the complete preflight contract.</p>
 
           <h3 id="custom-contract"><a href="#custom-contract">A custom image fails its contract check</a></h3>
           <p>Confirm the Dockerfile has exactly one stage beginning with a literal <code>FROM silo-base:latest</code>, uses Docker's default backslash escape directive, and remains below 16 KiB after Silo adds its runtime base. It must leave the <code>silo</code> user, home, entrypoint, core helpers, and supported shells usable by the startup smoke test. ARG-based base forms are rejected. Silo leaves the previously published derivative tag available when the new candidate fails; changes outside the smoke test remain the custom image author's responsibility.</p>
@@ -171,7 +171,7 @@ artifacts = { source = "./artifacts", target = "./artifacts", access = "read-wri
           <p>List containers, end active sessions, and delete stopped containers that still reference the state directory. Silo intentionally offers no force-delete path for in-use durable storage.</p>
 
           <h3 id="quick-name"><a href="#quick-name">A quick command is unknown or unusable</a></h3>
-          <p>Inspect the effective <code>[quick]</code> table with <code>silo config list</code>. Project commands merge with global commands by name, and names cannot shadow built-ins or start with <code>-</code>. Assign an empty array when a shortcut should pass its invocation arguments through as the complete command.</p>
+          <p>Inspect the effective <code>[quick]</code> table with <code>silo config list</code>. Project commands merge with global commands by name. Names cannot be blank, shadow built-ins, or start with <code>-</code>; each array must begin with a non-blank executable.</p>
         </section>
 
         <nav class="page-links page-links-previous" aria-label="Previous documentation page">

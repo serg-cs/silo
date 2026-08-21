@@ -30,6 +30,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         git \
         libssl-dev \
         pkg-config \
+        procps \
         python3 \
         sudo \
         util-linux \
@@ -63,7 +64,7 @@ RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.co
 # ---- Silo runtime ------------------------------------------------------------
 USER root
 RUN usermod --shell "${BREW_PREFIX}/bin/zsh" silo \
-    && passwd --delete silo \
+    && usermod --password '*' silo \
     && install -d -m 0755 /run/sshd \
     && install -d -o root -g root -m 0755 "${BREW_PREFIX}/var/lib/sshd" \
     && for shell in \
@@ -75,28 +76,16 @@ RUN usermod --shell "${BREW_PREFIX}/bin/zsh" silo \
     done
 
 ARG SILO_INTERNAL_ASSET_ENTRYPOINT
-ARG SILO_INTERNAL_ASSET_SUPERVISOR
-ARG SILO_INTERNAL_ASSET_SESSION
-ARG SILO_INTERNAL_ASSET_RESERVE
-ARG SILO_INTERNAL_ASSET_STATUS
-ARG SILO_INTERNAL_ASSET_STOP_GUARD
+ARG SILO_INTERNAL_ASSET_LIFECYCLE
 ARG SILO_INTERNAL_ASSET_SSHD_CONFIG
 RUN install -d -o root -g root -m 0755 /etc/ssh /usr/local/bin \
     && printf '%s' "${SILO_INTERNAL_ASSET_ENTRYPOINT}" | base64 --decode > /usr/local/bin/silo-entrypoint \
-    && printf '%s' "${SILO_INTERNAL_ASSET_SUPERVISOR}" | base64 --decode > /usr/local/bin/silo-supervisor \
-    && printf '%s' "${SILO_INTERNAL_ASSET_SESSION}" | base64 --decode > /usr/local/bin/silo-session \
-    && printf '%s' "${SILO_INTERNAL_ASSET_RESERVE}" | base64 --decode > /usr/local/bin/silo-reserve \
-    && printf '%s' "${SILO_INTERNAL_ASSET_STATUS}" | base64 --decode > /usr/local/bin/silo-status \
-    && printf '%s' "${SILO_INTERNAL_ASSET_STOP_GUARD}" | base64 --decode > /usr/local/bin/silo-stop-guard \
+    && printf '%s' "${SILO_INTERNAL_ASSET_LIFECYCLE}" | base64 --decode > /usr/local/bin/silo-lifecycle \
     && printf '%s' "${SILO_INTERNAL_ASSET_SSHD_CONFIG}" | base64 --decode > /etc/ssh/silo_sshd_config \
     && chmod 0644 /etc/ssh/silo_sshd_config \
     && chmod 0755 \
         /usr/local/bin/silo-entrypoint \
-        /usr/local/bin/silo-supervisor \
-        /usr/local/bin/silo-session \
-        /usr/local/bin/silo-reserve \
-        /usr/local/bin/silo-status \
-        /usr/local/bin/silo-stop-guard
+        /usr/local/bin/silo-lifecycle
 
 WORKDIR /home/silo
 

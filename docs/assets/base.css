@@ -1,0 +1,302 @@
+/* Establish the quiet, product-led visual system shared by every page. */
+:root {
+  color-scheme: light dark;
+  --background: #f6f7f2;
+  --surface: #ffffff;
+  --surface-subtle: #edf0e9;
+  --surface-raised: #fafbf8;
+  --text: #17211c;
+  --text-muted: #5d6962;
+  --border: #d9dfd8;
+  --border-strong: #bac5bd;
+  --accent: #956300;
+  --accent-bright: #fcc010;
+  --accent-button-hover: #dfa900;
+  --accent-hover: #724c00;
+  --accent-soft: #fff3bd;
+  --accent-text: #5f4100;
+  --accent-contrast: #211a0d;
+  --terminal: #101713;
+  --terminal-text: #dbe9e1;
+  --terminal-muted: #91a49a;
+  --focus: #b07900;
+  --shadow: 0 18px 50px rgb(32 50 40 / 8%);
+  --radius-small: 0.5rem;
+  --radius: 0.9rem;
+  --radius-large: 1.35rem;
+  --content-width: 74rem;
+  --reading-width: 47rem;
+  --font-sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #111713;
+    --surface: #18201b;
+    --surface-subtle: #202a24;
+    --surface-raised: #1b241e;
+    --text: #edf3ee;
+    --text-muted: #a8b6ad;
+    --border: #344039;
+    --border-strong: #4a5b51;
+    --accent: #fcc010;
+    --accent-bright: #fcc010;
+    --accent-button-hover: #dfa900;
+    --accent-hover: #ffd34d;
+    --accent-soft: #3a2e08;
+    --accent-text: #ffe38a;
+    --accent-contrast: #211a0d;
+    --terminal: #0b100d;
+    --terminal-text: #d9e9e0;
+    --terminal-muted: #8ca097;
+    --focus: #fcc010;
+    --shadow: 0 18px 50px rgb(0 0 0 / 25%);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 6rem;
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.65;
+  text-rendering: optimizeLegibility;
+}
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+a {
+  color: var(--accent);
+  text-decoration-thickness: 0.08em;
+  text-underline-offset: 0.18em;
+}
+
+a:hover {
+  color: var(--accent-hover);
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+}
+
+.skip-link {
+  position: fixed;
+  z-index: 100;
+  top: 0.75rem;
+  left: 0.75rem;
+  padding: 0.65rem 0.9rem;
+  border-radius: var(--radius-small);
+  background: var(--text);
+  color: var(--background);
+  transform: translateY(-200%);
+}
+
+.skip-link:focus {
+  color: var(--background);
+  transform: translateY(0);
+}
+
+/* Keep global navigation compact while retaining no-JavaScript access. */
+.site-header {
+  position: sticky;
+  z-index: 20;
+  top: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  background: color-mix(in srgb, var(--background) 88%, transparent);
+  backdrop-filter: blur(16px);
+}
+
+.nav-shell {
+  display: flex;
+  width: min(calc(100% - 2rem), var(--content-width));
+  min-height: 4.5rem;
+  margin-inline: auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2rem;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.7rem;
+  color: var(--text);
+  font-size: 1.08rem;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+  text-decoration: none;
+}
+
+.brand:hover {
+  color: var(--text);
+}
+
+.brand img {
+  width: 2rem;
+  height: 2rem;
+}
+
+.site-nav {
+  display: flex;
+  align-items: center;
+  gap: 1.45rem;
+}
+
+.site-nav a {
+  color: var(--text-muted);
+  font-size: 0.92rem;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.site-nav a:hover,
+.site-nav a[aria-current="page"] {
+  color: var(--text);
+}
+
+.site-nav .github-link {
+  padding: 0.48rem 0.78rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-small);
+}
+
+.menu-button {
+  display: none;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-small);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+/* Finish each page with a low-key, consistent repository footer. */
+.site-footer {
+  border-top: 1px solid var(--border);
+}
+
+.footer-shell {
+  display: flex;
+  width: min(calc(100% - 2rem), var(--content-width));
+  min-height: 7rem;
+  margin-inline: auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.footer-shell p {
+  margin: 0;
+}
+
+.footer-links {
+  display: flex;
+  gap: 1.2rem;
+}
+
+.footer-links a {
+  color: var(--text-muted);
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.footer-links a:hover {
+  color: var(--text);
+}
+
+/* Collapse layouts carefully without hiding navigation or reference tables. */
+@media (max-width: 900px) {
+  .nav-shell {
+    position: relative;
+    gap: 1rem;
+  }
+
+  .site-nav {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 0.75rem 1rem;
+  }
+
+  .js .menu-button {
+    display: inline-flex;
+  }
+
+  .js .site-nav {
+    position: absolute;
+    top: calc(100% - 0.25rem);
+    right: 0;
+    display: none;
+    min-width: 13rem;
+    padding: 0.8rem;
+    align-items: stretch;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    flex-direction: column;
+  }
+  .js .site-nav.is-open {
+    display: flex;
+  }
+
+  .js .site-nav a {
+    padding: 0.55rem 0.65rem;
+  }
+}
+
+@media (max-width: 600px) {
+  .site-nav {
+    width: 100%;
+    padding-bottom: 0.75rem;
+    justify-content: flex-start;
+  }
+
+  .js .site-nav {
+    width: auto;
+    padding-bottom: 0.8rem;
+  }
+
+  .footer-shell {
+    padding-block: 1.5rem;
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

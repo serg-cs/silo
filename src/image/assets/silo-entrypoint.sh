@@ -1,9 +1,9 @@
 #!/bin/sh
 set -eu
 
-# Consume the creation-time forwarding marker before starting user processes.
-ssh_forwarding=${SILO_INTERNAL_SSH_FORWARDING:-0}
-unset SILO_INTERNAL_SSH_FORWARDING
+# Consume the creation-time host-port marker before starting user processes.
+host_ports=${SILO_INTERNAL_HOST_PORTS:-0}
+unset SILO_INTERNAL_HOST_PORTS
 
 # Remap silo to the host ids supplied by Silo.
 if [ -n "${SILO_UID:-}" ]; then
@@ -23,7 +23,7 @@ fi
 # Runtime-only coordination belongs to the container, not the host config.
 rm -rf /run/silo
 install -d -o silo -g silo -m 0700 \
-    /run/silo /run/silo/reservations /run/silo/sessions
+    /run/silo /run/silo/reservations
 
 # Re-own image-layer home contents without crossing configured mounts.
 find /home/silo -xdev \
@@ -38,7 +38,7 @@ install -d -o root -g root -m 0755 \
     /run/sshd "${BREW_PREFIX}/var/lib/sshd"
 
 # Start the restricted tunnel server only when container creation enabled it.
-if [ "$ssh_forwarding" = 1 ]; then
+if [ "$host_ports" = 1 ]; then
     "${BREW_PREFIX}/sbin/sshd" -t -f /etc/ssh/silo_sshd_config
     "${BREW_PREFIX}/sbin/sshd" -f /etc/ssh/silo_sshd_config -E /run/silo/sshd.log
 fi

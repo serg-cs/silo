@@ -2,7 +2,7 @@ use std::ffi::OsString;
 
 use clap::{Parser, error::ErrorKind};
 
-use super::{Cli, Command, ConfigCommand};
+use super::{Cli, Command, ConfigCommand, ContainersCommand, StateCommand};
 
 fn parse(args: &[&str]) -> Command {
     let arguments: Vec<OsString> = args.iter().map(OsString::from).collect();
@@ -168,4 +168,166 @@ fn run_flags_after_double_dash_are_command_arguments() {
             OsString::from("--sudo"),
         ]
     );
+}
+
+#[test]
+fn run_passes_through_arbitrary_commands() {
+    let Command::Run { command, .. } = parse(&["silo", "run", "--", "codex", "--model", "compact"])
+    else {
+        panic!("expected run command");
+    };
+    assert_eq!(
+        command,
+        [
+            OsString::from("codex"),
+            OsString::from("--model"),
+            OsString::from("compact"),
+        ]
+    );
+}
+
+#[test]
+fn run_rejects_commands_without_double_dash() {
+    for arguments in [
+        &["silo", "run", "codex"][..],
+        &["silo", "run", "codex", "-t"][..],
+        &["silo", "run", "-t"][..],
+    ] {
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("the command requires a preceding `--`");
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{arguments:?}");
+    }
+}
+
+#[test]
+fn run_without_a_command_keeps_the_default_shell() {
+    for arguments in [&["silo", "run"][..], &["silo", "run", "--"][..]] {
+        let Command::Run { command, .. } = parse(arguments) else {
+            panic!("expected run command");
+        };
+        assert!(command.is_empty(), "{arguments:?}");
+    }
+}
+
+#[test]
+fn run_preserves_double_dash_inside_the_command() {
+    let Command::Run { command, .. } = parse(&["silo", "run", "--", "codex", "--", "--flag"])
+    else {
+        panic!("expected run command");
+    };
+    assert_eq!(
+        command,
+        [
+            OsString::from("codex"),
+            OsString::from("--"),
+            OsString::from("--flag"),
+        ]
+    );
+}
+
+#[test]
+fn unknown_first_token_is_a_quick_command() {
+    let Command::Quick(arguments) = parse(&["silo", "codex", "--model", "compact"]) else {
+        panic!("expected quick command");
+    };
+    assert_eq!(
+        arguments,
+        [
+            OsString::from("codex"),
+            OsString::from("--model"),
+            OsString::from("compact"),
+        ]
+    );
+}
+
+#[test]
+fn builtin_subcommands_win_over_quick_commands() {
+    assert!(matches!(parse(&["silo", "run"]), Command::Run { .. }));
+    assert!(matches!(
+        parse(&["silo", "image", "build"]),
+        Command::Image { .. }
+    ));
+    assert!(matches!(
+        parse(&["silo", "containers"]),
+        Command::Containers { command: None }
+    ));
+}
+
+#[test]
+fn containers_stop_is_not_available() {
+    let error = Cli::try_parse_from(["silo", "containers", "stop", "silo-abcd"])
+        .err()
+        .expect("stop is not a management command");
+    assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+}
+
+#[test]
+fn container_delete_aliases_parse_force() {
+    for command in ["delete", "rm"] {
+        let Command::Containers {
+            command: Some(ContainersCommand::Delete { selector, force }),
+        } = parse(&["silo", "containers", command, "project", "--force"])
+        else {
+            panic!("expected container deletion");
+        };
+        assert_eq!(selector, "project");
+        assert!(force);
+    }
+}
+
+#[test]
+fn state_defaults_to_list_and_parses_delete_aliases() {
+    assert!(matches!(
+        parse(&["silo", "state"]),
+        Command::State { command: None }
+    ));
+    assert!(matches!(
+        parse(&["silo", "state", "list"]),
+        Command::State {
+            command: Some(StateCommand::List)
+        }
+    ));
+    for command in ["delete", "rm"] {
+        let Command::State {
+            command: Some(StateCommand::Delete { selector }),
+        } = parse(&["silo", "state", command, "cargo"])
+        else {
+            panic!("expected state deletion");
+        };
+        assert_eq!(selector, "cargo");
+    }
+}
+
+#[test]
+fn mounts_is_not_a_management_alias() {
+    let Command::Quick(arguments) = parse(&["silo", "mounts"]) else {
+        panic!("mounts should not be a built-in command");
+    };
+    assert_eq!(arguments, ["mounts"]);
+}
+
+#[test]
+fn isolated_run_uses_only_the_documented_flag() {
+    let Command::Run {
+        isolated: true,
+        command,
+        ..
+    } = parse(&["silo", "run", "--isolated", "--", "nu", "-c", "version"])
+    else {
+        panic!("expected isolated run");
+    };
+    assert_eq!(
+        command,
+        [
+            OsString::from("nu"),
+            OsString::from("-c"),
+            OsString::from("version"),
+        ]
+    );
+
+    let error = Cli::try_parse_from(["silo", "run", "--rm"])
+        .err()
+        .expect("the removed alias is rejected");
+    assert_eq!(error.kind(), ErrorKind::UnknownArgument);
 }

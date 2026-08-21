@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -5,14 +6,32 @@ use parse_dockerfile::Dockerfile;
 
 use super::{BASE_IMAGE_TAG, MAX_COMPOSED_DOCKERFILE_BYTES};
 
-pub(super) const INTERNAL_BASE_STAGE: &str = "silo_internal_runtime_base";
+const INTERNAL_BASE_STAGE: &str = "silo_internal_runtime_base";
+
+/// Validates a configured Dockerfile and its composed runtime contract.
+pub(super) fn validate_dockerfile(dockerfile: &Path) -> Result<()> {
+    if dockerfile.as_os_str().is_empty() {
+        return Err(anyhow!("image dockerfile path is empty"));
+    }
+    if !dockerfile.exists() {
+        return Err(anyhow!(
+            "image dockerfile `{}` does not exist",
+            dockerfile.display()
+        ));
+    }
+    if !dockerfile.is_file() {
+        return Err(anyhow!(
+            "image dockerfile `{}` is not a file",
+            dockerfile.display()
+        ));
+    }
+    let content = fs::read_to_string(dockerfile)
+        .with_context(|| format!("failed to read image dockerfile `{}`", dockerfile.display()))?;
+    compose_derivative(super::BASE_DOCKERFILE, &content, dockerfile).map(|_| ())
+}
 
 /// Validates and joins Silo's base with a single trusted extras stage.
-pub(in crate::container) fn compose_derivative(
-    base: &str,
-    derivative: &str,
-    source: &Path,
-) -> Result<String> {
+pub(super) fn compose_derivative(base: &str, derivative: &str, source: &Path) -> Result<String> {
     // Parser spans are relative to content after an optional UTF-8 BOM.
     let derivative = derivative.strip_prefix('\u{feff}').unwrap_or(derivative);
     let parsed = parse_derivative(derivative, source)?;

@@ -3,11 +3,12 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="How Silo discovers projects, identifies containers, coordinates sessions, resolves storage, and forwards host services.">
+    <meta name="description" content="How Silo discovers projects, identifies containers, coordinates sessions, resolves storage, and provides restricted host ports.">
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/how-it-works/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="../../assets/styles.css">
+    <link rel="stylesheet" href="../../assets/base.css">
+    <link rel="stylesheet" href="../../assets/docs.css">
     <script src="../../assets/site.js" defer></script>
     <title>How it works — Silo</title>
   </head>
@@ -28,48 +29,44 @@
         <header class="doc-header">
           <p class="eyebrow">Under the hood</p>
           <h1>How Silo works.</h1>
-          <p>Silo is a focused host-side coordinator. It delegates virtual machines and OCI images to Apple's runtime while making project identity, concurrent sessions, storage, and host access deterministic.</p>
+          <p>Silo is a focused host-side coordinator. It delegates virtual machines and OCI images to Apple's runtime while making project identity, concurrent sessions, storage, and host ports deterministic.</p>
         </header>
 
         <section id="run-flow">
           <h2><a href="#run-flow">From command to workspace</a></h2>
           <ol>
-            <li><strong>Discover.</strong> Canonicalize the current directory and select a <code>.silo.toml</code> marker, the nearest Git or Jujutsu root, or the current directory itself.</li>
-            <li><strong>Configure.</strong> Load built-in defaults, global TOML, and the project TOML; warn about unknown or unreachable entries; then apply invocation resource flags.</li>
-            <li><strong>Validate.</strong> Resolve the lifecycle, image contract, binds, managed state, configured read-only workspace paths, container settings, and enabled forwards.</li>
-            <li><strong>Prepare.</strong> Confirm the image/runtime state and establish managed storage and SSH forwarding assets where needed.</li>
+            <li><strong>Discover.</strong> Canonicalize the current directory, prefer the nearest <code>.silo.toml</code> marker, otherwise ask Git for its top-level working tree, and silently fall back to the current directory.</li>
+            <li><strong>Configure.</strong> Let <code>config-rs</code> merge global TOML followed by project TOML and fill omitted field defaults, then apply invocation resource flags.</li>
+            <li><strong>Validate.</strong> Reject unknown or unreachable entries, then resolve the lifecycle, image contract, binds, managed state, read-only workspace paths, container settings, and host ports.</li>
+            <li><strong>Prepare.</strong> Confirm the image/runtime state and establish managed storage and SSH host-port assets where needed.</li>
             <li><strong>Run.</strong> Reuse or create the shared project container, or create a one-shot isolated container, then attach the requested shell or command.</li>
             <li><strong>Clean up.</strong> Restore the terminal, release the session lease, and remove isolated runtime resources.</li>
           </ol>
-          <p>Silo has no persistent host daemon. When forwarding is active, the host SSH master remains connected only for the lifetime of the shared container and exits when that container stops.</p>
+          <p>Silo has no persistent host daemon. When host ports are active, the host SSH master remains connected only for the lifetime of the shared container and exits when that container stops.</p>
         </section>
 
         <section id="image-contract">
           <h2><a href="#image-contract">Image build and publication</a></h2>
-          <p>An image build uses two invocations in one freshly cleared builder. Silo first builds its embedded runtime base without cache and publishes it as <code>silo-base:latest</code>. It then composes the same base instructions into the derivative under an internal stage name, allowing those fresh layers to be reused while ensuring <code>silo-base:latest</code> never reaches a registry resolver. The stable base tag is an output for users, not an input to the derivative build. A custom Dockerfile keeps its own directory as the build context and must contain exactly one stage beginning with a literal <code>FROM silo-base:latest</code>.</p>
+          <p>An image build uses two invocations in one freshly cleared builder. Silo first builds its embedded runtime base with <code>--pull</code> and <code>--no-cache</code>, validates it, and publishes it as <code>silo-base:latest</code>. It then composes the same base instructions into the derivative under an internal stage name. The derivative can reuse only the base layers completed during this build lifecycle; Silo does not retain a base cache between builds. The stable base tag is an output for users, never an input sent to a registry resolver.</p>
+          <p>The derivative preserves a deliberate base-and-extras split. Without <code>image.dockerfile</code>, Silo adds its embedded development toolset and publishes <code>silo:latest</code>. A custom Dockerfile replaces those extras, keeps its containing directory as the build context, and must contain exactly one stage beginning with a literal <code>FROM silo-base:latest</code>. Silo rewrites that instruction to the internal base stage.</p>
           <p>Each result is initially tagged <code>silo-build:staging</code>. Silo starts that candidate through the normal entrypoint and checks the expected user, home, core lifecycle helpers, and supported shells. Only a successful candidate replaces the corresponding stable tag, so a failed build leaves the previous usable image intact.</p>
+          <p>Silo serializes builds because Apple's builder is user-global. It force-deletes that builder before and after the lifecycle and prunes every dangling image afterward; no persistent Silo build cache is retained.</p>
+          <div class="note"><p>No-cache behavior, reproducible inputs, and cleanup scope are separate concerns. Pinning the upstream base, installer, and package inputs would improve repeatability without adding a cache or changing the base-and-extras design. If Apple's runtime offers sufficiently scoped cleanup in the future, Silo could also narrow cleanup without changing image contents.</p></div>
           <div class="note"><p>Custom Dockerfiles are trusted project inputs. The smoke test catches obvious incompatibilities; it is not a filesystem policy or a sandbox for root-level build instructions.</p></div>
         </section>
 
         <section id="identity">
           <h2><a href="#identity">Identity and ownership</a></h2>
           <p>A shared container name begins with <code>silo-</code> and ends with the first 24 hexadecimal characters of a SHA-256 digest of the canonical project path. The stable name makes concurrent Silo processes converge on the same workspace.</p>
-          <p>Silo also writes ownership, schema, project, project-root, lifecycle, and specification labels. Before it starts, stops, replaces, or deletes a resource, it inspects those labels and rejects anything that does not match the expected identity.</p>
+          <p>Silo writes four labels: owner, canonical project root, lifecycle, and a unique instance token. Before it joins, stops, replaces, or deletes a container, it validates those labels against the runtime ID and rejects anything that does not match the selected instance.</p>
           <div class="note"><p>A matching name alone is never sufficient evidence that Silo owns a container or network.</p></div>
           <p>Management commands inventory only unambiguously Silo-owned resources. They report malformed entries as warnings rather than guessing.</p>
         </section>
 
-        <section id="specification">
-          <h2><a href="#specification">The container specification</a></h2>
-          <p>Shared-container reuse depends on more than its project ID. Silo hashes creation-time inputs into a specification label, including:</p>
-          <ul>
-            <li>The image digest and lifecycle.</li>
-            <li>Host user and group IDs.</li>
-            <li>Project root and working directory.</li>
-            <li>Read-only workspace overlays, bind and state sources, targets, and access modes.</li>
-            <li>Forwarding SSH assets and ports, CPU count, memory, and creation command.</li>
-          </ul>
-          <p>If a running container does not match the desired specification, or Silo cannot verify the current image and configuration, Silo warns and joins the existing workspace without applying changed creation settings. Existing forwarding is left untouched; changed forwarding settings wait for recreation. A stopped container is removed and recreated with the current specification. Image changes during creation are detected and retried within a bounded window.</p>
+        <section id="reuse">
+          <h2><a href="#reuse">Running-container reuse</a></h2>
+          <p>A valid running shared container is the current workspace instance. Silo joins it immediately without rebuilding current configuration or comparing creation settings. Changes to the image, mounts, resources, sudo, or host ports take effect after the existing shared container stops and a later command creates a new one.</p>
+          <p>A stopped owned container is removed and recreated from the current configuration. During creation, Silo checks the selected image digest before and after the runtime command, and retries bounded conflicts instead of accepting a concurrently retagged image.</p>
           <p>Reusing a running container preserves its ephemeral state. When a stopped container is recreated, container-local state is lost; the source tree, binds, and configured managed state are host-backed and remain available.</p>
         </section>
 
@@ -89,41 +86,40 @@
 
         <section id="mount-resolution">
           <h2><a href="#mount-resolution">Mount resolution and storage</a></h2>
-          <p>Enabled bind sources are expanded, canonicalized, and verified as directories at run time. Managed state receives deterministic host paths and opaque IDs. Silo creates parent directories with private permissions, guards mutations with file locks, and stores project-path metadata beside project-scoped state.</p>
+          <p>Configured bind sources are expanded, canonicalized, and verified as directories at run time. Managed state receives deterministic host paths and opaque IDs. Silo creates parent directories with private permissions, guards mutations with file locks, and stores project-path metadata beside project-scoped state.</p>
           <p>Before using or deleting managed state, Silo checks that directories are real rather than symlinks, ownership metadata matches the expected project, and the derived ID/path are consistent. Deletion additionally asks the runtime whether any container still references the directory.</p>
-          <p>Runtime mounts are sorted from shallower to deeper targets so nested overrides are deterministic. A later duplicate target wins, and read-write binds or state at or below configured read-only workspace paths produce warnings.</p>
+          <p>Every host-backed directory uses Apple's structured <code>--mount</code> bind syntax. Runtime mounts are sorted from shallower to deeper targets so intentional nested mounts are deterministic. Configuration validation resolves targets against the actual project workdir, rejects duplicate effective targets, and rejects read-write binds or state that overlap configured read-only workspace paths in either direction.</p>
         </section>
 
         <section id="read-only-overlays">
           <h2><a href="#read-only-overlays">Read-only project overlays</a></h2>
-          <p>For each configured relative path, Silo canonicalizes the host directory and mounts it separately at the corresponding path inside the writable project tree. It applies an overlay only when the resolved path remains inside the canonical project root; a missing path, broken symlink, or symlink escaping the project is not mounted. Existing regular files fail resolution because Apple container does not support them as bind-mount sources.</p>
-          <p>This is a focused guardrail, not a full sandbox policy. Tools can still edit source files, and an explicit read-write bind can overlap the protected destination. Silo warns about known overlap but preserves deterministic runtime mount order.</p>
+          <p>For each configured relative path, Silo canonicalizes the host directory and mounts it separately at the corresponding path inside the writable project tree. Malformed paths, duplicates, missing paths, regular files, broken symlinks, and symlinks escaping the project are silently ignored. Only effective directories inside the canonical project root participate in writable-overlap validation.</p>
+          <p>This is a focused guardrail, not a full sandbox policy. Tools can still edit source files, while configuration validation prevents a read-write bind or managed-state mount from replacing protected content or hiding its read-only overlay behind a writable parent.</p>
         </section>
 
-        <section id="forwarding">
-          <h2><a href="#forwarding">Host loopback forwarding</a></h2>
+        <section id="host-ports">
+          <h2><a href="#host-ports">Host ports</a></h2>
           <p>A container cannot reach a service bound only to the host's <code>127.0.0.1</code> through normal container networking. In shared mode, every compatible derivative lets Silo:</p>
           <ol>
             <li>Generate or reuse a managed client identity and a project-specific SSH host identity.</li>
             <li>Mount only the guest host key and a restricted <code>authorized_keys</code> file into the container.</li>
             <li>Wait for the container's IPv4 address and its restricted SSH server.</li>
-            <li>Start or reuse one authenticated SSH master with a reverse tunnel for each named port.</li>
+            <li>Start or reuse one authenticated SSH master with a reverse tunnel for each configured port.</li>
             <li>Bind every guest listener to <code>127.0.0.1</code> and target the same <code>127.0.0.1</code> port on the host.</li>
           </ol>
-          <pre><code>[forward]
-postgres = { port = 5432 }
+          <pre><code>host_ports = [5432]
 
 # Available in the shared container:
 127.0.0.1:5432</code></pre>
           <p>The SSH client uses Silo's managed identity, exact host-key verification, and no ambient SSH configuration or agent. The guest account cannot open a shell, allocate a terminal, forward an agent, or listen on an unconfigured port.</p>
-          <p>Isolated runs have no long-lived shared-container network, so Silo warns and ignores enabled forwards. Custom derivatives support forwarding whenever they use the shared lifecycle.</p>
-          <p>The broker caps concurrent relay work, shares listeners safely across active sessions, and removes idle networks only after their leases close. Startup and cleanup are serialized per project to avoid deleting a network while another session is acquiring it.</p>
+          <p>Tunnel setup belongs to container creation. A later session that joins the running container does not inspect or repair the host SSH process; stopping and recreating the shared container establishes it again.</p>
+          <p>Isolated runs have no long-lived shared-container network, so Silo warns and ignores configured host ports. Custom derivatives support host ports whenever they use the shared lifecycle.</p>
         </section>
 
         <section id="runtime-boundary">
           <h2><a href="#runtime-boundary">Runtime boundary</a></h2>
           <p>Apple's <code>container</code> CLI owns Linux kernels, image storage, networking, VM execution, and low-level mount behavior. Silo owns only the resources carrying its validated labels and delegates commands through the CLI.</p>
-          <p>Image building is the exception where Silo intentionally treats Apple's user-global builder and dangling build images as disposable storage. Container and managed-state operations remain ownership-scoped and conservative.</p>
+          <p>Image building is the exception where Silo intentionally uses Apple's user-global builder and cleanup facilities. This can disrupt direct Apple Container workflows; the exact lifecycle and scope are documented in <a href="#image-contract">image build and publication</a>. Container and managed-state operations remain ownership-scoped and conservative.</p>
         </section>
 
         <nav class="page-links" aria-label="Adjacent documentation pages">

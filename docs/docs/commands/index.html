@@ -7,7 +7,8 @@
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/commands/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="../../assets/styles.css">
+    <link rel="stylesheet" href="../../assets/base.css">
+    <link rel="stylesheet" href="../../assets/docs.css">
     <script src="../../assets/site.js" defer></script>
     <title>Command reference — Silo</title>
   </head>
@@ -90,7 +91,7 @@ silo run --isolated -- ./scripts/check.sh
 silo run --cpus 8 --memory 12G -- cargo build
 silo run --sudo -- apt-get update</code></pre>
           <div class="note"><p>The separator is required: use <code>silo run -- cargo test</code>, not <code>silo run cargo test</code>.</p></div>
-          <div class="note"><p>CPU, memory, and sudo access are container creation settings. If the shared container is already running with different settings, Silo warns and joins it without applying the overrides. The settings take effect after the container is recreated.</p></div>
+          <div class="note"><p>CPU, memory, and sudo access are container creation settings. Silo joins an already-running shared container without comparing or applying these overrides. The settings take effect after the container is recreated.</p></div>
         </section>
 
         <section id="image">
@@ -98,9 +99,10 @@ silo run --sudo -- apt-get update</code></pre>
           <div class="command-block">
             <div class="command-block-heading"><h3><code>silo image build</code></h3><span>Image command</span></div>
             <pre class="command-usage"><code>silo image build</code></pre>
-            <p>Uses one fresh builder for two invocations: Silo builds and validates <code>silo-base:latest</code> without cache, then composes that same base as an internal stage of the selected derivative so its completed layers can be reused without resolving the tag. With no <code>image.dockerfile</code>, the derivative is Silo's embedded development-extras image at <code>silo:latest</code>; configured Dockerfiles receive a deterministic local tag.</p>
+            <p>Build and validate the runtime base followed by the selected derivative. With no <code>image.dockerfile</code>, Silo publishes its embedded development-extras image as <code>silo:latest</code>; configured Dockerfiles receive a deterministic local tag.</p>
           </div>
-          <p>Silo starts Apple's container system when necessary, serializes concurrent Silo builds, clears its temporary builder before and after the lifecycle, and prunes dangling images afterward. A configured Dockerfile keeps its containing directory as the build context and must have exactly one stage beginning with a literal <code>FROM silo-base:latest</code>. Silo rewrites that reference to its internal base stage, so it is never sent to a registry resolver. The Dockerfile must retain Docker's default backslash escape directive, and the composed file must remain below Apple's current 16 KiB limit. Each image is staged and given a small startup smoke test before its stable tag is replaced.</p>
+          <p>Silo starts Apple's container system when necessary and serializes concurrent Silo builds. See <a href="../how-it-works/#image-contract">image build and publication</a> for the authoritative no-cache, base-and-extras, staging, validation, and cleanup lifecycle.</p>
+          <div class="warning"><p>The builder and dangling-image cleanup is user-global, not scoped to Silo-created build data. It force-deletes Apple's current builder and prunes every dangling image, so coordinate this command with any direct use of Apple Container. Builds also consume <code>ubuntu:latest</code>, Homebrew HEAD, and current formulae; identical Silo source is not guaranteed to rebuild identically later.</p></div>
           <p>See <a href="../configuration/#image-options">image configuration</a> for custom Dockerfiles, CPU, memory, and sudo settings.</p>
         </section>
 
@@ -108,19 +110,19 @@ silo run --sudo -- apt-get update</code></pre>
           <h2><a href="#config">Inspect and edit configuration</a></h2>
           <p><code>silo config</code> without a subcommand behaves like <code>silo config list</code>.</p>
           <dl class="command-list">
-            <div><dt><code>silo config list</code><span>Alias: <code>ls</code></span></dt><dd>Print the merged effective TOML, including normalized bind, state, and forwarding defaults.</dd></div>
+            <div><dt><code>silo config list</code><span>Alias: <code>ls</code></span></dt><dd>Serialize the merged effective configuration as TOML.</dd></div>
             <div><dt><code>silo config edit</code></dt><dd>Open the active project configuration, or the global file when no project file exists.</dd></div>
             <div><dt><code>silo config edit --global</code></dt><dd>Always open or create the global configuration.</dd></div>
             <div><dt><code>silo config default</code></dt><dd>Print the bundled starter configuration without reading project or filesystem state.</dd></div>
-            <div><dt><code>silo config path</code></dt><dd>Print active files in precedence order, labeled as global or project configuration.</dd></div>
-            <div><dt><code>silo config check</code></dt><dd>Validate the effective schema, Dockerfile, storage compatibility, and cross-field rules.</dd></div>
+            <div><dt><code>silo config path</code></dt><dd>Print active configuration sources in precedence order. When no files are active, report the embedded defaults and succeed.</dd></div>
+            <div><dt><code>silo config check</code></dt><dd>Run the full side-effect-free preflight, including custom-image rules and host filesystem resolution.</dd></div>
           </dl>
-          <p>Editing uses <code>$VISUAL</code>, then <code>$EDITOR</code>, then <code>vi</code>. Silo reloads and validates the effective configuration after the editor exits, and warns about unknown keys.</p>
+          <p>Editing uses <code>$VISUAL</code>, then <code>$EDITOR</code>, then <code>vi</code>. Silo reloads and validates the effective configuration after the editor exits; unknown keys are errors.</p>
           <h3>Common inspection flow</h3>
           <pre data-copy><code>silo config path
 silo config list
 silo config check</code></pre>
-          <p>See the <a href="../configuration/">configuration reference</a> for the complete schema and merge behavior.</p>
+          <p><code>silo config check</code> works without a project file in an ordinary directory, but rejects filesystem root <code>/</code> because it cannot serve as a workspace. See <a href="../configuration/#validation">validation and diagnostics</a> for the exact contract, and the <a href="../configuration/">configuration reference</a> for the complete schema and merge behavior.</p>
         </section>
 
         <section id="containers">
@@ -129,17 +131,17 @@ silo config check</code></pre>
           <dl class="command-list">
             <div>
               <dt><code>silo containers list</code><span>Alias: <code>ls</code></span></dt>
-              <dd>List Silo-owned containers with their identity, lifecycle, state, project, image, and allocated resources.</dd>
+              <dd>List Silo-owned containers with their full ID, lifecycle, state, and canonical project path.</dd>
             </div>
             <div>
               <dt><code>silo containers delete &lt;selector&gt; [--force]</code><span>Alias: <code>rm</code></span></dt>
-              <dd>Stop and delete exactly one Silo container selected by ID, unique ID prefix, project path, or unique project basename.</dd>
+              <dd>Stop and delete exactly one Silo container selected by its exact ID or an unambiguous project basename.</dd>
             </div>
           </dl>
           <h3>Examples</h3>
           <pre data-copy><code>silo containers
 silo containers delete my-project
-silo containers rm silo-a0b1c2 --force</code></pre>
+silo containers rm silo-a0b1c2d3e4f5678901234567 --force</code></pre>
           <p>Without <code>--force</code>, Silo refuses to terminate an active session or shared-session handoff. Container deletion does not remove managed state.</p>
           <div class="warning"><p><code>--force</code> can terminate active shells, commands, or agents.</p></div>
         </section>
@@ -154,7 +156,7 @@ silo containers rm silo-a0b1c2 --force</code></pre>
             </div>
             <div>
               <dt><code>silo state delete &lt;selector&gt;</code><span>Alias: <code>rm</code></span></dt>
-              <dd>Permanently delete one unused state directory selected by ID, unique ID prefix, project, or logical name.</dd>
+              <dd>Permanently delete one unused state directory selected by its exact ID or a globally unique logical name.</dd>
             </div>
           </dl>
           <p>Silo refuses deletion when the identity or storage path is inconsistent, the target is not a real directory, or any container still references it. There is no force option.</p>
@@ -177,7 +179,7 @@ agent = ["codex", "--model", "gpt-5"]</code></pre>
 
 silo agent --full-auto
 # Runs codex --model gpt-5 --full-auto</code></pre>
-          <p>Quick names cannot begin with <code>-</code> or shadow built-in commands such as <code>run</code>, <code>config</code>, or <code>help</code>. Use <code>silo run -- &lt;command&gt;</code> when no shortcut exists.</p>
+          <p>Quick names must contain a non-whitespace character, cannot begin with <code>-</code>, and cannot shadow built-in commands such as <code>run</code>, <code>config</code>, or <code>help</code>. Each command array must begin with a non-whitespace executable. Use <code>silo run -- &lt;command&gt;</code> when no shortcut exists.</p>
         </section>
       </article>
     </main>
