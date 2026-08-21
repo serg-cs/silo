@@ -6,9 +6,8 @@
 //! every key has a default, so a missing or partial file always yields a
 //! usable [`Config`]. Project settings are partial and replace explicitly
 //! present global options. Precedence is `defaults < global config < project
-//! config < CLI flags`. Named binds, state entries, and forwards are the
-//! exceptions to whole-collection replacement: project entries overlay global
-//! entries by name and field.
+//! config < CLI flags`. Named binds, state entries, forwards, and quick
+//! commands overlay global entries by name; structured entries merge by field.
 //!
 //! `workspace.read_only` protects selected project directories. `binds`
 //! exposes existing host directories with explicit access, while `state`
@@ -22,10 +21,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, anyhow};
+use config_rs::{Config as LayeredConfig, File, FileFormat, FileSourceString};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Contents of the concise starter config file created on first use.
 const DEFAULT_CONFIG: &str = include_str!("default.toml");
+const CONTAINER_CPUS_PATH: &str = "container.cpus";
+const CONTAINER_MEMORY_PATH: &str = "container.memory";
+const CONTAINER_SUDO_PATH: &str = "container.sudo";
+
+type LayeredConfigBuilder = config_rs::builder::ConfigBuilder<config_rs::builder::DefaultState>;
 
 /// User configuration, loaded once at startup and passed to commands.
 #[derive(Debug, Clone, Default)]
@@ -52,24 +57,23 @@ pub struct Config {
     pub quick: BTreeMap<String, Vec<String>>,
 }
 
-/// Partial configuration read from a project's `.silo.toml`.
-///
-/// Collection fields are optional so omission can inherit the global value.
-/// Quick commands replace as a collection; binds and state merge by entry.
-#[derive(Debug, Default)]
-struct ProjectConfig {
-    image: ProjectImage,
-    container: ProjectContainer,
-    forward: Option<BTreeMap<String, ProjectForward>>,
+/// One strict, partial TOML layer prepared before generic merging.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+struct ConfigLayer {
+    image: LayerImage,
+    container: LayerContainer,
+    forward: BTreeMap<String, LayerForward>,
     shell: Option<Shell>,
-    workspace: ProjectWorkspace,
-    mounts: BTreeMap<String, Mount>,
-    quick: Option<BTreeMap<String, Vec<String>>>,
+    workspace: LayerWorkspace,
+    binds: BTreeMap<String, Bind>,
+    state: StateTables,
+    quick: BTreeMap<String, Vec<String>>,
 }
 
 /// User-facing global configuration before binds and scoped state are
 /// normalized for runtime processing.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct ConfigDocument {
     image: Image,
@@ -80,20 +84,6 @@ struct ConfigDocument {
     binds: BTreeMap<String, Bind>,
     state: StateTables,
     quick: BTreeMap<String, Vec<String>>,
-}
-
-/// User-facing project overrides before named entries are normalized.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct ProjectDocument {
-    image: ProjectImage,
-    container: ProjectContainer,
-    forward: Option<BTreeMap<String, ProjectForward>>,
-    shell: Option<Shell>,
-    workspace: ProjectWorkspace,
-    binds: BTreeMap<String, Bind>,
-    state: StateTables,
-    quick: Option<BTreeMap<String, Vec<String>>>,
 }
 
 impl<'de> Deserialize<'de> for Config {
@@ -114,70 +104,65 @@ impl<'de> Deserialize<'de> for Config {
     }
 }
 
-impl<'de> Deserialize<'de> for ProjectConfig {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let document = ProjectDocument::deserialize(deserializer)?;
-        Ok(Self {
-            image: document.image,
-            container: document.container,
-            forward: document.forward,
-            shell: document.shell,
-            workspace: document.workspace,
-            mounts: normalize_mounts(document.binds, document.state)?,
-            quick: document.quick,
-        })
-    }
-}
-
-/// Image overrides supplied by a project. An omitted Dockerfile inherits the
-/// global setting; project configuration intentionally has no reset sentinel.
-#[derive(Debug, Default, Deserialize)]
+/// Image values supplied by one configuration layer.
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
-struct ProjectImage {
+struct LayerImage {
     dockerfile: Option<PathBuf>,
 }
 
-/// Container overrides supplied by a project. Each omitted value inherits
-/// the corresponding global setting.
-#[derive(Debug, Default, Deserialize)]
+/// Container values supplied by one configuration layer.
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
-struct ProjectContainer {
+struct LayerContainer {
     cpus: Option<usize>,
     memory: Option<String>,
     sudo: Option<bool>,
 }
 
-/// Partial forward supplied by a project configuration.
-#[derive(Debug, Default, Deserialize)]
+/// Partial forward supplied by one configuration layer.
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
-struct ProjectForward {
+struct LayerForward {
     port: Option<u16>,
     enabled: Option<bool>,
 }
 
-impl Config {
-    /// Applies invocation-specific container settings after global and
-    /// project configuration have been merged.
-    pub fn apply_container_overrides(
-        &mut self,
-        cpus: Option<usize>,
-        memory: Option<String>,
-        sudo: bool,
-    ) {
-        if let Some(cpus) = cpus {
-            self.container.cpus = Some(cpus);
-        }
-        if let Some(memory) = memory {
-            self.container.memory = Some(memory);
-        }
-        if sudo {
-            self.container.sudo = true;
-        }
+/// Typed invocation values applied after every file-backed layer.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigOverrides {
+    cpus: Option<usize>,
+    memory: Option<String>,
+    /// `false` means the one-way CLI flag was not supplied, not an override.
+    sudo: bool,
+}
+
+impl ConfigOverrides {
+    pub fn for_run(cpus: Option<usize>, memory: Option<String>, sudo: bool) -> Self {
+        Self { cpus, memory, sudo }
     }
 
+    fn apply(&self, mut builder: LayeredConfigBuilder) -> Result<LayeredConfigBuilder> {
+        let cpus = self
+            .cpus
+            .map(u64::try_from)
+            .transpose()
+            .context("CLI CPU count does not fit the configuration value range")?;
+        builder = builder
+            .set_override_option(CONTAINER_CPUS_PATH, cpus)
+            .context("failed to apply the CLI CPU override")?
+            .set_override_option(CONTAINER_MEMORY_PATH, self.memory.clone())
+            .context("failed to apply the CLI memory override")?;
+        if self.sudo {
+            builder = builder
+                .set_override(CONTAINER_SUDO_PATH, true)
+                .context("failed to apply the CLI sudo override")?;
+        }
+        Ok(builder)
+    }
+}
+
+impl Config {
     /// Renders the merged configuration in the compact style used by the
     /// starter file. Runtime-delegated values and empty sections are omitted,
     /// while concrete bind and state defaults are made explicit.
@@ -297,7 +282,7 @@ impl Config {
 }
 
 /// Image settings.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Image {
     /// Path to a Dockerfile with a literal `FROM silo-base:latest`; `None`
@@ -306,7 +291,7 @@ pub struct Image {
 }
 
 /// Settings applied when creating a container.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Container {
     /// Number of CPUs allocated to the container. `None` uses Apple
@@ -320,7 +305,7 @@ pub struct Container {
 }
 
 /// Settings for the project workspace mounted into the container.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Workspace {
     /// Project-relative directories overlaid read-only in the container.
@@ -335,15 +320,15 @@ impl Default for Workspace {
     }
 }
 
-/// Partial workspace settings supplied by a project configuration.
-#[derive(Debug, Default, Deserialize)]
+/// Partial workspace settings supplied by one configuration layer.
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
-struct ProjectWorkspace {
+struct LayerWorkspace {
     read_only: Option<Vec<PathBuf>>,
 }
 
 /// One named host loopback port exposed to a container.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Forward {
     pub port: u16,
@@ -417,7 +402,7 @@ impl Mount {
 }
 
 /// Config-facing managed state grouped by its persistence scope.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct StateTables {
     project: BTreeMap<String, StateEntry>,
@@ -425,7 +410,7 @@ struct StateTables {
 }
 
 /// One existing host directory exposed inside the container.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct Bind {
     enabled: Option<bool>,
@@ -435,7 +420,7 @@ struct Bind {
 }
 
 /// One Silo-managed writable state directory.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct StateEntry {
     enabled: Option<bool>,
@@ -586,36 +571,59 @@ pub enum Permission {
     ReadWrite,
 }
 
-impl Config {
-    /// Loads the config from its default location, creating a default file
-    /// on first use.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the config file exists but cannot be read or
-    /// parsed. Unknown keys produce warnings and are otherwise ignored.
-    pub fn load() -> Result<Self> {
-        let Some(path) = config_path() else {
-            // No home directory to read from; run on defaults.
-            return Ok(Self::default());
-        };
-        Self::load_from(&path)
-    }
+/// Converts a strict layer into a merge source without losing TOML semantics.
+///
+/// The text round trip is deliberate. The config-rs typed serializer builds
+/// path expressions from map keys and cannot represent an empty sequence, so
+/// using it directly would reinterpret dotted quick-command names and omit
+/// `[]`. TOML preserves both after Silo has already enforced the layer's types.
+fn layer_source<T>(document: &T, description: &str) -> Result<File<FileSourceString, FileFormat>>
+where
+    T: Serialize,
+{
+    let text = toml::to_string(document)
+        .with_context(|| format!("failed to prepare {description} for merging"))?;
+    Ok(File::from_str(&text, FileFormat::Toml))
+}
 
+fn build_defaults() -> Result<LayeredConfig> {
+    let source = layer_source(&ConfigDocument::default(), "built-in defaults")?;
+    LayeredConfig::builder()
+        .add_source(source)
+        .build()
+        .context("failed to build the default configuration")
+}
+
+fn build_layered(
+    base: LayeredConfig,
+    layer: &ConfigLayer,
+    description: &str,
+) -> Result<LayeredConfig> {
+    let source = layer_source(layer, description)?;
+    LayeredConfig::builder()
+        .add_source(base)
+        .add_source(source)
+        .build()
+        .with_context(|| format!("failed to merge {description}"))
+}
+
+impl Config {
     /// Loads the global configuration and applies `.silo.toml` from
     /// `project_root` when it exists.
     ///
-    /// Relative project Dockerfile and host-mount source paths are resolved
-    /// from the project root. Mounts merge by name and field; quick commands
-    /// still replace their global collection when explicitly supplied.
+    /// Host-side paths are resolved relative to their declaring file. Named
+    /// forwards, mounts, and quick commands merge by name and field.
     ///
     /// # Errors
     ///
     /// Returns an error when either configuration file cannot be read,
     /// parsed, or validated.
-    pub fn load_for_project(project_root: &Path) -> Result<Self> {
-        let config = Self::load()?;
-        Self::apply_project_file(config, project_root)
+    pub fn load_for_project(project_root: &Path, overrides: &ConfigOverrides) -> Result<Self> {
+        let layered = match config_path() {
+            Some(path) => Self::load_layered_from(&path)?,
+            None => build_defaults()?,
+        };
+        Self::apply_project_layer(layered, project_root, overrides)
     }
 
     /// Loads the config from `path`, creating a default file there on first
@@ -625,101 +633,74 @@ impl Config {
     ///
     /// Returns an error when the config file exists but cannot be read or
     /// parsed. Unknown keys produce warnings and are otherwise ignored.
+    #[cfg(test)]
     pub fn load_from(path: &Path) -> Result<Self> {
+        let layered = Self::load_layered_from(path)?;
+        Self::extract_validated(&layered)
+    }
+
+    fn load_layered_from(path: &Path) -> Result<LayeredConfig> {
         if !path.exists() {
             write_default(path);
-            return Ok(Self::default());
+            return build_defaults();
         }
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file `{}`", path.display()))?;
-        let (mut config, unknown_keys) = Self::deserialize_with_unknown_keys(&text)
+        let (mut layer, unknown_keys) = deserialize_toml::<ConfigLayer>(&text)
             .with_context(|| format!("invalid config in `{}`", path.display()))?;
-        config.resolve_mount_sources(path.parent().unwrap_or(Path::new(".")));
-        config
-            .validate()
+        layer
+            .resolve_paths(path.parent().unwrap_or(Path::new(".")))
+            .with_context(|| format!("invalid config in `{}`", path.display()))?;
+
+        // Validate the global stage before a project can mask any problem.
+        let layered = build_layered(build_defaults()?, &layer, "global configuration")
+            .with_context(|| format!("invalid config in `{}`", path.display()))?;
+        Self::extract_validated(&layered)
             .with_context(|| format!("invalid config in `{}`", path.display()))?;
         warn_unknown_keys(path, &unknown_keys);
-        Ok(config)
+        Ok(layered)
     }
 
-    /// Applies the project file to an already loaded global configuration.
-    fn apply_project_file(mut config: Self, project_root: &Path) -> Result<Self> {
+    fn apply_project_layer(
+        layered: LayeredConfig,
+        project_root: &Path,
+        overrides: &ConfigOverrides,
+    ) -> Result<Self> {
         let path = project_root.join(".silo.toml");
-        if !path.is_file() {
-            return Ok(config);
+        let mut builder = LayeredConfig::builder().add_source(layered);
+        let mut unknown_keys = None;
+        if path.is_file() {
+            let text = fs::read_to_string(&path).with_context(|| {
+                format!("failed to read project config file `{}`", path.display())
+            })?;
+            let (mut layer, ignored) = deserialize_toml::<ConfigLayer>(&text)
+                .with_context(|| format!("invalid project config in `{}`", path.display()))?;
+            layer
+                .resolve_paths(project_root)
+                .with_context(|| format!("invalid project config in `{}`", path.display()))?;
+            let source = layer_source(&layer, "project configuration")
+                .with_context(|| format!("invalid project config in `{}`", path.display()))?;
+            builder = builder.add_source(source);
+            unknown_keys = Some(ignored);
         }
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read project config file `{}`", path.display()))?;
-        let (mut project, unknown_keys) = deserialize_toml::<ProjectConfig>(&text)
-            .with_context(|| format!("invalid project config in `{}`", path.display()))?;
-        project.resolve_paths(project_root);
-        config
-            .apply_project(project)
-            .with_context(|| format!("invalid project config in `{}`", path.display()))?;
-        config
-            .validate()
-            .with_context(|| format!("invalid project config in `{}`", path.display()))?;
-        warn_unknown_keys(&path, &unknown_keys);
-        Ok(config)
-    }
 
-    /// Replaces every global option explicitly supplied by the project.
-    fn apply_project(&mut self, project: ProjectConfig) -> Result<()> {
-        if let Some(dockerfile) = project.image.dockerfile {
-            self.image.dockerfile = Some(dockerfile);
-        }
-        if let Some(cpus) = project.container.cpus {
-            self.container.cpus = Some(cpus);
-        }
-        if let Some(memory) = project.container.memory {
-            self.container.memory = Some(memory);
-        }
-        if let Some(sudo) = project.container.sudo {
-            self.container.sudo = sudo;
-        }
-        if let Some(forwards) = project.forward {
-            for (name, overlay) in forwards {
-                if let Some(entry) = self.forward.get_mut(&name) {
-                    if let Some(port) = overlay.port {
-                        entry.port = port;
-                    }
-                    if overlay.enabled.is_some() {
-                        entry.enabled = overlay.enabled;
-                    }
-                } else {
-                    let port = overlay.port.ok_or_else(|| {
-                        anyhow!(
-                            "project forward `{name}` must define `port` when adding a new entry"
-                        )
-                    })?;
-                    self.forward.insert(
-                        name,
-                        Forward {
-                            port,
-                            enabled: overlay.enabled,
-                        },
-                    );
-                }
+        // Keep invocation values final so a valid CLI value may intentionally
+        // replace an otherwise-invalid project value for this run.
+        let layered = overrides
+            .apply(builder)?
+            .build()
+            .context("failed to merge configuration layers")?;
+        let config = Self::extract_validated(&layered).with_context(|| {
+            if path.is_file() {
+                format!("invalid project config in `{}`", path.display())
+            } else {
+                "invalid effective configuration".to_string()
             }
+        })?;
+        if let Some(unknown_keys) = unknown_keys {
+            warn_unknown_keys(&path, &unknown_keys);
         }
-        if let Some(shell) = project.shell {
-            self.shell = Some(shell);
-        }
-        if let Some(read_only) = project.workspace.read_only {
-            self.workspace.read_only = read_only;
-        }
-        for (name, overlay) in project.mounts {
-            match self.mounts.get_mut(&name) {
-                Some(base) => merge_mount(base, overlay),
-                None => {
-                    self.mounts.insert(name, overlay);
-                }
-            }
-        }
-        if let Some(quick) = project.quick {
-            self.quick = quick;
-        }
-        Ok(())
+        Ok(config)
     }
 
     /// Parses the config from TOML text, filling missing keys with defaults.
@@ -738,17 +719,38 @@ impl Config {
     /// ignored by Serde so file-loading callers can warn about likely typos.
     #[cfg(test)]
     fn parse_with_unknown_keys(text: &str) -> Result<(Self, Vec<String>)> {
-        let (config, unknown_keys) = Self::deserialize_with_unknown_keys(text)?;
-        config.validate()?;
+        let (layer, unknown_keys) = deserialize_toml::<ConfigLayer>(text)?;
+        let layered = build_layered(build_defaults()?, &layer, "test configuration")?;
+        let config = Self::extract_validated(&layered)?;
         Ok((config, unknown_keys))
     }
 
-    fn deserialize_with_unknown_keys(text: &str) -> Result<(Self, Vec<String>)> {
-        Ok(deserialize_toml::<Self>(text)?)
+    #[cfg(test)]
+    fn parse_with_overrides(text: &str, overrides: &ConfigOverrides) -> Result<Self> {
+        let (layer, _) = deserialize_toml::<ConfigLayer>(text)?;
+        let layered = build_layered(build_defaults()?, &layer, "test configuration")?;
+        let layered = overrides
+            .apply(LayeredConfig::builder().add_source(layered))?
+            .build()
+            .context("failed to merge test overrides")?;
+        Self::extract_validated(&layered)
     }
 
-    fn resolve_mount_sources(&mut self, base: &Path) {
-        resolve_mount_sources(&mut self.mounts, base);
+    fn extract_validated(layered: &LayeredConfig) -> Result<Self> {
+        let config = layered
+            .clone()
+            .try_deserialize::<Self>()
+            .map_err(anyhow::Error::from)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[cfg(test)]
+    fn apply_project_file(config: &Self, project_root: &Path) -> Result<Self> {
+        let text = config.effective_toml()?;
+        let (layer, _) = deserialize_toml::<ConfigLayer>(&text)?;
+        let layered = build_layered(build_defaults()?, &layer, "test global configuration")?;
+        Self::apply_project_layer(layered, project_root, &ConfigOverrides::default())
     }
 
     /// Returns an error when a quick command name can never be reached: a
@@ -999,57 +1001,39 @@ fn unknown_key_warning(path: &Path, key: &str) -> String {
     )
 }
 
-impl ProjectConfig {
-    /// Makes relative project-owned paths independent of the invocation's
-    /// current working directory. Empty paths remain empty so validation can
-    /// report the intended error instead of resolving them to the root.
-    fn resolve_paths(&mut self, project_root: &Path) {
-        if let Some(dockerfile) = &mut self.image.dockerfile
-            && !dockerfile.as_os_str().is_empty()
-            && dockerfile.is_relative()
-        {
-            *dockerfile = project_root.join(&*dockerfile);
+impl ConfigLayer {
+    /// Resolves host paths against this layer before merging. Resolved paths
+    /// must remain representable in TOML and Apple container arguments.
+    fn resolve_paths(&mut self, base: &Path) -> Result<()> {
+        if let Some(dockerfile) = &mut self.image.dockerfile {
+            if !dockerfile.as_os_str().is_empty() && dockerfile.is_relative() {
+                *dockerfile = base.join(&*dockerfile);
+            }
+            ensure_utf8_config_path(dockerfile, "`image.dockerfile`")?;
         }
-        resolve_mount_sources(&mut self.mounts, project_root);
+        for (name, entry) in &mut self.binds {
+            let Some(source) = &mut entry.source else {
+                continue;
+            };
+            if !source.as_os_str().is_empty()
+                && source.is_relative()
+                && !source.as_os_str().to_string_lossy().starts_with('~')
+            {
+                *source = base.join(&*source);
+            }
+            ensure_utf8_config_path(source, &format!("source for bind `{name}`"))?;
+        }
+        Ok(())
     }
 }
 
-fn merge_mount(base: &mut Mount, overlay: Mount) {
-    let overlay_kind = overlay.kind();
-    if overlay_kind.is_some() && overlay_kind != base.kind() {
-        base.source = None;
-        base.target = None;
-        base.access = None;
+fn ensure_utf8_config_path(path: &Path, label: &str) -> Result<()> {
+    if path.to_str().is_none() {
+        return Err(anyhow!(
+            "resolved {label} path is not valid UTF-8; Silo requires UTF-8 configuration paths"
+        ));
     }
-    if overlay.enabled.is_some() {
-        base.enabled = overlay.enabled;
-    }
-    if overlay.kind.is_some() {
-        base.kind = overlay.kind;
-    }
-    if overlay.source.is_some() {
-        base.source = overlay.source;
-    }
-    if overlay.target.is_some() {
-        base.target = overlay.target;
-    }
-    if overlay.access.is_some() {
-        base.access = overlay.access;
-    }
-}
-
-fn resolve_mount_sources(mounts: &mut BTreeMap<String, Mount>, base: &Path) {
-    for entry in mounts.values_mut() {
-        let Some(source) = &mut entry.source else {
-            continue;
-        };
-        if !source.as_os_str().is_empty()
-            && source.is_relative()
-            && !source.as_os_str().to_string_lossy().starts_with('~')
-        {
-            *source = base.join(&*source);
-        }
-    }
+    Ok(())
 }
 
 const CONTAINER_HOME: &str = "/home/silo";

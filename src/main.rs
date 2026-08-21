@@ -41,9 +41,21 @@ fn main() -> ExitCode {
         Ok(project) => project,
         Err(err) => return fail(&err),
     };
+    // Add run-only values as the final configuration source.
+    let overrides = match &cli.command {
+        Command::Run {
+            cpus, memory, sudo, ..
+        } => config::ConfigOverrides::for_run(
+            cpus.map(std::num::NonZeroUsize::get),
+            memory.clone(),
+            *sudo,
+        ),
+        _ => config::ConfigOverrides::default(),
+    };
+
     // Loaded once for every config-consuming command. Precedence is built-in
     // defaults < global config < project config < CLI flags.
-    let mut config = match load_config(&project.root) {
+    let config = match load_config(&project.root, &overrides) {
         Ok(config) => config,
         Err(err) => return fail(&err),
     };
@@ -53,15 +65,8 @@ fn main() -> ExitCode {
             command: ImageCommand::Build,
         } => container::build_image(&config),
         Command::Run {
-            isolated,
-            cpus,
-            memory,
-            sudo,
-            command,
-        } => {
-            config.apply_container_overrides(cpus.map(std::num::NonZeroUsize::get), memory, sudo);
-            container::run_image(&config, &project, &command, isolated)
-        }
+            isolated, command, ..
+        } => container::run_image(&config, &project, &command, isolated),
         Command::Containers { .. } | Command::State { .. } => {
             unreachable!("management commands returned before config")
         }
@@ -79,7 +84,9 @@ fn run_config_command(command: Option<&ConfigCommand>) -> anyhow::Result<ExitCod
     }
     let project_root = container::current_project_root()?;
     match command {
-        None | Some(ConfigCommand::List) => load_config(&project_root)?.print_effective(),
+        None | Some(ConfigCommand::List) => {
+            load_config(&project_root, &config::ConfigOverrides::default())?.print_effective()
+        }
         Some(ConfigCommand::Edit { global }) => {
             config::edit(&project_root, *global)?;
             load_validated_config(&project_root)?;
@@ -96,8 +103,11 @@ fn run_config_command(command: Option<&ConfigCommand>) -> anyhow::Result<ExitCod
 
 /// Loads the effective project config and emits non-fatal quick-name
 /// diagnostics shared by run, inspection, checking, and post-edit validation.
-fn load_config(project_root: &std::path::Path) -> anyhow::Result<config::Config> {
-    let config = config::Config::load_for_project(project_root)?;
+fn load_config(
+    project_root: &std::path::Path,
+    overrides: &config::ConfigOverrides,
+) -> anyhow::Result<config::Config> {
+    let config = config::Config::load_for_project(project_root, overrides)?;
     // Unreachable quick commands do not block otherwise valid commands.
     if let Err(err) = config.check_quick_names(&builtin_commands()) {
         eprintln!("warning: {err:#}");
@@ -108,7 +118,7 @@ fn load_config(project_root: &std::path::Path) -> anyhow::Result<config::Config>
 /// Extends schema validation with filesystem and cross-field compatibility
 /// checks shared by `config check` and post-edit validation.
 fn load_validated_config(project_root: &std::path::Path) -> anyhow::Result<config::Config> {
-    let config = load_config(project_root)?;
+    let config = load_config(project_root, &config::ConfigOverrides::default())?;
     container::validate_effective_config(&config)?;
     Ok(config)
 }
@@ -406,7 +416,7 @@ mod tests {
     #[test]
     fn quick_command_appends_invocation_args_to_the_configured_command() {
         let config = config::Config::parse(
-            "[quick]\ncodex = [\"codex\"]\ncx = [\"codex\", \"--model\", \"compact\"]\n",
+            "[quick]\ncodex = [\"codex\"]\ncx = [\"codex\", \"--model\", \"compact\"]\npassthrough = []\n",
         )
         .expect("config parses");
         let args: Vec<OsString> = ["codex", "--model", "compact"]
@@ -423,6 +433,21 @@ mod tests {
                 OsString::from("compact"),
                 OsString::from("--flag"),
             ]
+        );
+
+        let args = vec![
+            OsString::from("passthrough"),
+            OsString::from("cargo"),
+            OsString::from("test"),
+        ];
+        assert_eq!(
+            quick_command(&config, &args).expect("empty prefix passes through arguments"),
+            [OsString::from("cargo"), OsString::from("test")]
+        );
+        assert!(
+            quick_command(&config, &[OsString::from("passthrough")])
+                .expect("empty prefix and invocation select the default shell")
+                .is_empty()
         );
     }
 

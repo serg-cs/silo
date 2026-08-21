@@ -69,7 +69,8 @@ silo run</code></pre>
 test = ["just", "test"]
 lint = ["just", "lint"]
 agent = ["codex", "--full-auto"]</code></pre>
-          <p>Arguments append naturally—<code>silo test api</code> becomes <code>just test api</code>. Since Silo executes an argument vector rather than a shell string, pipes, redirects, and environment assignments need an explicit shell:</p>
+          <p>Arguments append naturally—<code>silo test api</code> becomes <code>just test api</code>. Project commands inherit global names and replace only a same-named command. Use an empty array when the invocation itself should supply the complete command; invoking that shortcut without arguments opens the default shell.</p>
+          <p>Since Silo executes an argument vector rather than a shell string, pipes, redirects, and environment assignments need an explicit shell:</p>
           <pre data-copy><code>[quick]
 logs = ["sh", "-lc", "just logs | tail -n 100"]</code></pre>
         </section>
@@ -170,7 +171,7 @@ artifacts = { source = "./artifacts", target = "./artifacts", access = "read-wri
           <p>List containers, end active sessions, and delete stopped containers that still reference the state directory. Silo intentionally offers no force-delete path for in-use durable storage.</p>
 
           <h3 id="quick-name"><a href="#quick-name">A quick command is unknown or unusable</a></h3>
-          <p>Inspect the effective <code>[quick]</code> table with <code>silo config list</code>. Remember that a project table replaces the global table and that names cannot shadow built-ins or start with <code>-</code>.</p>
+          <p>Inspect the effective <code>[quick]</code> table with <code>silo config list</code>. Project commands merge with global commands by name, and names cannot shadow built-ins or start with <code>-</code>. Assign an empty array when a shortcut should pass its invocation arguments through as the complete command.</p>
         </section>
 
         <nav class="page-links page-links-previous" aria-label="Previous documentation page">

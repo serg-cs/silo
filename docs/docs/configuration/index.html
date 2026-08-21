@@ -55,9 +55,9 @@ silo config check    # validate the merged result</code></pre>
           <p>Most project values replace the same global value only when present. Omitted values inherit. Four collections have explicit rules:</p>
           <ul>
             <li><strong>Forwards merge by name and field.</strong> A project may change only <code>enabled</code> or <code>port</code> on an inherited forward. A new project forward must provide <code>port</code>.</li>
-            <li><strong>Binds and state merge by name and field.</strong> A project may retarget or disable an inherited entry. Moving the same name between <code>binds</code>, <code>state.project</code>, and <code>state.user</code> resets fields that do not apply to the new category.</li>
+            <li><strong>Binds and state merge by name and field.</strong> A project may retarget or disable an inherited entry within its existing category. Reusing a name under a different bind or state category is an error.</li>
             <li><strong>Read-only paths replace as a collection.</strong> A project <code>workspace.read_only</code> array replaces the global array; an empty array disables inherited read-only workspace overlays without changing bind permissions.</li>
-            <li><strong>Quick commands replace as a collection.</strong> If the project contains a <code>[quick]</code> table, it replaces the global table. An empty project table clears all global quick commands.</li>
+            <li><strong>Quick commands merge by name.</strong> A project may add commands or replace the complete argument array for an inherited name. An empty project table changes nothing; an empty array clears that name's fixed command prefix.</li>
           </ul>
           <div class="note"><p>A project can inherit a global custom Dockerfile or replace it with another path, but there is no project-level sentinel that resets a global custom derivative back to Silo's default extras image.</p></div>
         </section>
@@ -66,7 +66,7 @@ silo config check    # validate the merged result</code></pre>
           <h2><a href="#complete-example">Complete example</a></h2>
           <pre data-copy><code># Every setting shown here is optional.
 # Use exactly one stage starting with a literal FROM silo-base:latest.
-# image.dockerfile = "/absolute/path/to/Dockerfile"
+# image.dockerfile = "containers/Dockerfile"
 container.cpus = 4
 container.memory = "6G"
 container.sudo = false
@@ -99,7 +99,7 @@ agent = ["codex"]</code></pre>
           <div class="table-wrap"><table>
             <thead><tr><th>Key</th><th>Type and default</th><th>Behavior</th></tr></thead>
             <tbody>
-              <tr><td><code>image.dockerfile</code></td><td>Path; default extras</td><td>Build this single-stage Dockerfile as the tool layer above a literal <code>FROM silo-base:latest</code>. Project-relative paths resolve from the project root; use an absolute path in the global file.</td></tr>
+              <tr><td><code>image.dockerfile</code></td><td>Path; default extras</td><td>Build this single-stage Dockerfile as the tool layer above a literal <code>FROM silo-base:latest</code>. Relative paths resolve from the directory containing the configuration file.</td></tr>
               <tr><td><code>container.cpus</code></td><td>Positive integer; runtime default</td><td>Passes the CPU limit to containers at creation time.</td></tr>
               <tr><td><code>container.memory</code></td><td>Non-empty string; runtime default</td><td>Passes Apple's accepted memory syntax, such as <code>4G</code>.</td></tr>
               <tr><td><code>container.sudo</code></td><td>Boolean; <code>false</code></td><td>Grants the base image's <code>silo</code> user passwordless sudo access in default and custom derivatives.</td></tr>
@@ -171,7 +171,7 @@ disabled = { enabled = false }</code></pre>
             <li><strong>Project</strong> state is keyed by canonical project path and entry name.</li>
             <li><strong>User</strong> state is keyed by entry name and is intentionally reused across this user's projects.</li>
           </ul>
-          <p>Bind and state names must start with an ASCII letter or digit and then contain only letters, digits, <code>_</code>, or <code>-</code>. One name cannot appear in more than one bind or state category in the same file.</p>
+          <p>Bind and state names must start with an ASCII letter or digit and then contain only letters, digits, <code>_</code>, or <code>-</code>. One logical name cannot appear in more than one bind or state category, including across global and project configuration.</p>
         </section>
 
         <section id="target-paths">
@@ -194,6 +194,7 @@ disabled = { enabled = false }</code></pre>
 check = ["just", "check"]
 cx = ["codex", "--model", "gpt-5"]</code></pre>
           <p>Each key is the token typed after <code>silo</code>. Each value is a TOML array containing the executable and any fixed arguments. Invocation arguments are appended without shell interpolation.</p>
+          <p>Global and project quick commands merge by name. A project array replaces only the inherited command with the same name. An empty array creates a pass-through shortcut: invocation arguments become the complete command, while invoking the shortcut without arguments opens the default shell.</p>
           <p>Names beginning with <code>-</code> or colliding with built-in commands are unreachable; Silo warns and asks you to rename them. Built-in subcommands always win.</p>
         </section>
 
@@ -207,7 +208,7 @@ cx = ["codex", "--model", "gpt-5"]</code></pre>
             <li>The configured Dockerfile's existence and file type.</li>
             <li>Custom-image and home-relative bind incompatibilities.</li>
           </ul>
-          <p>Bind source existence is checked again at <code>silo run</code>, because the filesystem can change after validation. Unknown config keys are warnings rather than hard errors, with both the file and ignored key named.</p>
+          <p>Resolved Dockerfile and bind-source host paths must be valid UTF-8. Bind source existence is checked again at <code>silo run</code>, because the filesystem can change after validation. Unknown config keys are warnings rather than hard errors, with both the file and ignored key named.</p>
         </section>
 
         <nav class="page-links" aria-label="Adjacent documentation pages">

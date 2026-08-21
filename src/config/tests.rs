@@ -27,6 +27,13 @@ impl Drop for TestDir {
     }
 }
 
+#[cfg(unix)]
+fn non_utf8_child(parent: &Path) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+
+    parent.join(std::ffi::OsString::from_vec(b"non-utf8-\xff".to_vec()))
+}
+
 #[test]
 fn empty_config_uses_builtin_image() {
     let config = Config::parse("").expect("empty config parses");
@@ -52,6 +59,17 @@ fn container_settings_are_configurable() {
 }
 
 #[test]
+fn configuration_files_do_not_coerce_scalar_types() {
+    for text in [
+        "container.sudo = \"yes\"\n",
+        "container.cpus = 4.7\n",
+        "forward.web = { port = \"8080\" }\n",
+    ] {
+        Config::parse(text).expect_err("TOML configuration types remain strict");
+    }
+}
+
+#[test]
 fn container_resources_reject_impossible_values() {
     let cpu = Config::parse("[container]\ncpus = 0\n")
         .expect_err("zero CPUs cannot run a container")
@@ -66,15 +84,24 @@ fn container_resources_reject_impossible_values() {
 
 #[test]
 fn container_overrides_replace_only_supplied_values() {
-    let mut config = Config::parse("[container]\ncpus = 8\nmemory = \"32G\"\n")
-        .expect("container resources parse");
-
-    config.apply_container_overrides(Some(4), None, false);
+    let config = Config::parse_with_overrides(
+        "[container]\ncpus = 8\nmemory = \"32G\"\nsudo = true\n",
+        &ConfigOverrides::for_run(Some(4), None, false),
+    )
+    .expect("container resources and overrides merge");
     assert_eq!(config.container.cpus, Some(4));
     assert_eq!(config.container.memory.as_deref(), Some("32G"));
+    assert!(
+        config.container.sudo,
+        "an absent flag preserves file config"
+    );
 
-    config.apply_container_overrides(None, Some("16G".to_string()), true);
-    assert_eq!(config.container.cpus, Some(4));
+    let config = Config::parse_with_overrides(
+        "[container]\ncpus = 8\nmemory = \"32G\"\n",
+        &ConfigOverrides::for_run(None, Some("16G".to_string()), true),
+    )
+    .expect("container resources and overrides merge");
+    assert_eq!(config.container.cpus, Some(8));
     assert_eq!(config.container.memory.as_deref(), Some("16G"));
     assert!(config.container.sudo);
 }
@@ -223,7 +250,7 @@ fn project_can_add_and_overlay_forwards() {
         Config::parse("[forward]\npostgres = { port = 5432 }\nmetrics = { port = 9090 }\n")
             .expect("global forwards parse");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("project merges forwards");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("project merges forwards");
     assert_eq!(merged.forward["postgres"].port, 5432);
     assert!(!merged.forward["postgres"].is_enabled());
     assert_eq!(merged.forward["metrics"].port, 19090);
@@ -245,17 +272,19 @@ fn project_forward_additions_require_a_port() {
         Config::parse("[forward]\npostgres = { port = 5432 }\n").expect("global forward parses");
     let error = format!(
         "{:#}",
-        Config::apply_project_file(global, dir.path()).expect_err("incomplete forward fails")
+        Config::apply_project_file(&global, dir.path()).expect_err("incomplete forward fails")
     );
-    assert!(error.contains("must define `port`"), "{error}");
+    assert!(
+        error.contains("port must be between 1024 and 65535"),
+        "{error}"
+    );
 }
 
 #[test]
 fn project_forward_ports_are_recognized() {
-    let (_, unknown_keys) = deserialize_toml::<ProjectConfig>(
-        "[forward]\npostgres = { enabled = true, port = 5432 }\n",
-    )
-    .expect("project forward parses");
+    let (_, unknown_keys) =
+        deserialize_toml::<ConfigLayer>("[forward]\npostgres = { enabled = true, port = 5432 }\n")
+            .expect("project forward parses");
 
     assert!(unknown_keys.is_empty());
 }
@@ -406,7 +435,7 @@ fn effective_toml_prints_the_merged_and_resolved_project_config() {
     .expect("project config write succeeds");
 
     let global_config = Config::load_from(&global).expect("global config loads");
-    let config = Config::apply_project_file(global_config, dir.path())
+    let config = Config::apply_project_file(&global_config, dir.path())
         .expect("project config overlays global config");
     let text = config
         .effective_toml()
@@ -517,6 +546,19 @@ fn load_from_resolves_relative_host_sources_from_config_directory() {
     assert_eq!(
         config.mounts["docs"].source.as_deref(),
         Some(dir.path().join("content").as_path())
+    );
+}
+
+#[test]
+fn load_from_resolves_relative_dockerfiles_from_config_directory() {
+    let dir = TestDir::new("relative-global-dockerfile");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "image.dockerfile = \"images/Dockerfile\"\n").expect("write succeeds");
+
+    let config = Config::load_from(&path).expect("config loads");
+    assert_eq!(
+        config.image.dockerfile.as_deref(),
+        Some(dir.path().join("images/Dockerfile").as_path())
     );
 }
 
@@ -856,7 +898,7 @@ fn omitted_project_mounts_inherit_global_entries() {
     )
     .expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
 
     assert_eq!(merged.mounts.len(), 1);
     assert_eq!(
@@ -872,7 +914,7 @@ fn project_shell_overrides_global_shell() {
     fs::write(dir.path().join(".silo.toml"), "shell = \"fish\"\n").expect("project config writes");
     let global = Config::parse("shell = \"bash\"\n").expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
 
     assert_eq!(merged.shell, Some(Shell::Fish));
 }
@@ -884,7 +926,7 @@ fn omitted_project_shell_inherits_global_shell() {
         .expect("project config writes");
     let global = Config::parse("shell = \"nu\"\n").expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
 
     assert_eq!(merged.shell, Some(Shell::Nu));
 }
@@ -900,11 +942,28 @@ fn project_container_settings_override_independently() {
     let global = Config::parse("[container]\ncpus = 6\nmemory = \"8G\"\nsudo = true\n")
         .expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
 
     assert_eq!(merged.container.cpus, Some(6));
     assert_eq!(merged.container.memory.as_deref(), Some("16G"));
     assert!(!merged.container.sudo);
+}
+
+#[test]
+fn cli_override_can_replace_an_invalid_project_value() {
+    let dir = TestDir::new("cli-repairs-project-value");
+    fs::write(dir.path().join(".silo.toml"), "container.cpus = 0\n")
+        .expect("project config writes");
+    let layered = build_defaults().expect("defaults build");
+
+    let merged = Config::apply_project_layer(
+        layered,
+        dir.path(),
+        &ConfigOverrides::for_run(Some(4), None, false),
+    )
+    .expect("CLI override repairs the effective configuration");
+
+    assert_eq!(merged.container.cpus, Some(4));
 }
 
 #[test]
@@ -917,14 +976,14 @@ fn omitted_project_sudo_inherits_global_setting() {
     .expect("project config writes");
     let global = Config::parse("container.sudo = true\n").expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
 
     assert!(merged.container.sudo);
 }
 
 #[test]
 fn project_schema_reports_unknown_nested_keys() {
-    let (_, unknown_keys) = deserialize_toml::<ProjectConfig>(
+    let (_, unknown_keys) = deserialize_toml::<ConfigLayer>(
         "workspace.read_only = [\".git\"]\n[image]\ndockerfiel = \"Dockerfile\"\n",
     )
     .expect("project config parses");
@@ -945,7 +1004,7 @@ fn project_mount_overlay_changes_one_field_and_can_disable_another() {
     )
     .expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
 
     assert_eq!(merged.mounts["notes"].kind(), Some(MountKind::Host));
     assert_eq!(
@@ -968,7 +1027,7 @@ fn project_mount_source_is_resolved_from_project_root() {
     )
     .expect("project config writes");
 
-    let merged = Config::apply_project_file(Config::default(), dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&Config::default(), dir.path()).expect("configs merge");
 
     assert_eq!(
         merged.mounts["cache"].source.as_deref(),
@@ -976,8 +1035,30 @@ fn project_mount_source_is_resolved_from_project_root() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn changing_mount_intent_resets_host_specific_fields() {
+fn resolved_config_paths_require_utf8_declaring_directories() {
+    let base = non_utf8_child(Path::new("/tmp/agents"));
+    for (text, expected) in [
+        (
+            "image.dockerfile = \"images/Dockerfile\"\n",
+            "resolved `image.dockerfile` path is not valid UTF-8",
+        ),
+        (
+            "[binds.docs]\nsource = \"content\"\n",
+            "resolved source for bind `docs` path is not valid UTF-8",
+        ),
+    ] {
+        let (mut layer, _) = deserialize_toml::<ConfigLayer>(text).expect("layer parses");
+        let error = layer
+            .resolve_paths(&base)
+            .expect_err("non-UTF-8 resolved path is rejected");
+        assert!(error.to_string().contains(expected), "{error:#}");
+    }
+}
+
+#[test]
+fn changing_mount_category_is_rejected() {
     let dir = TestDir::new("project-changes-mount-kind");
     fs::write(
         dir.path().join(".silo.toml"),
@@ -989,17 +1070,17 @@ fn changing_mount_intent_resets_host_specific_fields() {
     )
     .expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
-    let mount = &merged.mounts["tools"];
-    assert_eq!(mount.kind(), Some(MountKind::UserState));
-    assert_eq!(mount.source, None);
-    assert_eq!(mount.target.as_deref(), Some(Path::new("~/tools")));
-    assert_eq!(mount.access, None);
-    assert_eq!(mount.effective_access(), Permission::ReadWrite);
+    let error = Config::apply_project_file(&global, dir.path())
+        .expect_err("a logical mount cannot change category");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("entry `tools` is defined in more than one bind or state category"),
+        "{message}"
+    );
 }
 
 #[test]
-fn project_quick_table_replaces_global_table() {
+fn project_quick_table_merges_with_global_table() {
     let dir = TestDir::new("project-replaces-quick");
     fs::write(
         dir.path().join(".silo.toml"),
@@ -1009,22 +1090,41 @@ fn project_quick_table_replaces_global_table() {
     let global =
         Config::parse("[quick]\nglobal = [\"global-command\"]\n").expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
 
-    assert!(!merged.quick.contains_key("global"));
+    assert_eq!(merged.quick["global"], ["global-command"]);
     assert_eq!(merged.quick["project"], ["project-command"]);
 }
 
 #[test]
-fn empty_project_quick_table_clears_global_table() {
+fn project_quick_entries_replace_by_literal_name_and_can_clear_the_prefix() {
+    let dir = TestDir::new("project-overlays-quick-entry");
+    fs::write(
+        dir.path().join(".silo.toml"),
+        "[quick]\nbuild = []\n\"tools.check\" = [\"just\", \"check\"]\n",
+    )
+    .expect("project config writes");
+    let global = Config::parse(
+        "[quick]\nbuild = [\"cargo\", \"build\"]\n\"tools.check\" = [\"cargo\", \"check\"]\n",
+    )
+    .expect("global config parses");
+
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
+
+    assert!(merged.quick["build"].is_empty());
+    assert_eq!(merged.quick["tools.check"], ["just", "check"]);
+}
+
+#[test]
+fn empty_project_quick_table_inherits_global_commands() {
     let dir = TestDir::new("project-clears-quick");
     fs::write(dir.path().join(".silo.toml"), "[quick]\n").expect("project config writes");
     let global =
         Config::parse("[quick]\nglobal = [\"global-command\"]\n").expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
 
-    assert!(merged.quick.is_empty());
+    assert_eq!(merged.quick["global"], ["global-command"]);
 }
 
 #[test]
@@ -1038,7 +1138,7 @@ fn project_dockerfile_overrides_and_resolves_from_project_root() {
     let global = Config::parse("[image]\ndockerfile = \"/global/Dockerfile\"\n")
         .expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
     let expected = dir.path().join("containers/Dockerfile");
 
     assert_eq!(merged.image.dockerfile.as_deref(), Some(expected.as_path()));
@@ -1053,7 +1153,7 @@ fn empty_project_file_keeps_global_configuration() {
     )
     .expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
 
     assert_eq!(merged.workspace.read_only, [PathBuf::from("policy")]);
     assert_eq!(merged.quick["global"], ["global-command"]);
@@ -1070,7 +1170,7 @@ fn project_read_only_list_replaces_the_global_list() {
     let global = Config::parse("workspace.read_only = [\".git\", \".github\"]\n")
         .expect("global config parses");
 
-    let merged = Config::apply_project_file(global, dir.path()).expect("configs merge");
+    let merged = Config::apply_project_file(&global, dir.path()).expect("configs merge");
 
     assert_eq!(merged.workspace.read_only, [PathBuf::from("policy")]);
 }
@@ -1081,7 +1181,7 @@ fn invalid_project_config_reports_its_path_and_location() {
     let path = dir.path().join(".silo.toml");
     fs::write(&path, "mounts = {").expect("project config writes");
 
-    let err = Config::apply_project_file(Config::default(), dir.path())
+    let err = Config::apply_project_file(&Config::default(), dir.path())
         .expect_err("invalid project config errors");
     let msg = format!("{err:#}");
 
