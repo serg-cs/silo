@@ -43,3 +43,40 @@ fn list_output_is_compact_and_preserves_full_identity() {
         "ID\tSCOPE\tNAME\tPROJECT\tSOURCE\nstate-full-id\tuser\tcache\t-\t/state/cache"
     );
 }
+
+#[test]
+fn json_output_uses_null_for_state_without_a_project() {
+    let mounts = [
+        mount("state-user", "cache", StateOwner::User),
+        mount(
+            "state-project",
+            "cargo",
+            StateOwner::Project(Path::new("/work/project").into()),
+        ),
+    ];
+    let value = serde_json::to_value(state_output(&mounts)).expect("JSON serializes");
+
+    assert_eq!(
+        value,
+        serde_json::json!([
+            {
+                "id": "state-user",
+                "scope": "user",
+                "name": "cache",
+                "project": null,
+                "source": "/state/cache"
+            },
+            {
+                "id": "state-project",
+                "scope": "project",
+                "name": "cargo",
+                "project": "/work/project",
+                "source": "/state/cargo"
+            }
+        ])
+    );
+    assert_eq!(
+        serde_json::to_value(state_output(&[])).expect("empty JSON serializes"),
+        serde_json::json!([])
+    );
+}

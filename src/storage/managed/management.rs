@@ -1,27 +1,42 @@
 //! Managed-state inventory presentation and safe administration.
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 
 use super::{
     ManagedMount, StateOwner, acquire_mount_lock, managed_mount, mount_inventory,
     prune_empty_project_state_directory, validate_managed_mount,
 };
 use crate::apple::container_mount_source_in_use;
-use crate::output::{tsv_field, write_stdout};
+use crate::output::{tsv_field, write_json, write_stdout};
+
+#[derive(Serialize)]
+struct StateOutput<'a> {
+    id: &'a str,
+    scope: &'static str,
+    name: &'a str,
+    project: Option<Cow<'a, str>>,
+    source: Cow<'a, str>,
+}
 
 /// Prints every persistent state directory owned by Silo.
-pub(crate) fn print_state() -> Result<ExitCode> {
+pub(crate) fn print_state(json: bool) -> Result<ExitCode> {
     let inventory = mount_inventory()?;
-    let text = if inventory.items.is_empty() {
-        "No Silo managed state.\n".to_string()
+    if json {
+        write_json(&state_output(&inventory.items))?;
     } else {
-        format!("{}\n", render_state_list(&inventory.items))
-    };
-    write_stdout(&text)?;
+        let text = if inventory.items.is_empty() {
+            "No Silo managed state.\n".to_string()
+        } else {
+            format!("{}\n", render_state_list(&inventory.items))
+        };
+        write_stdout(&text)?;
+    }
     for warning in inventory.warnings {
         eprintln!("warning: {warning}");
     }
@@ -88,6 +103,22 @@ fn render_state_list(items: &[ManagedMount]) -> String {
         )
     }));
     lines.join("\n")
+}
+
+fn state_output(items: &[ManagedMount]) -> Vec<StateOutput<'_>> {
+    items
+        .iter()
+        .map(|mount| StateOutput {
+            id: &mount.id,
+            scope: mount.owner.as_str(),
+            name: &mount.name,
+            project: mount
+                .owner
+                .project()
+                .map(|project| project.to_string_lossy()),
+            source: mount.path.to_string_lossy(),
+        })
+        .collect()
 }
 /// Selects an exact ID or one globally unique logical state name.
 fn select_mount<'a>(items: &'a [ManagedMount], selector: &str) -> Result<&'a ManagedMount> {

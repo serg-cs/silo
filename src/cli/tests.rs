@@ -21,9 +21,48 @@ fn config_defaults_to_effective_list() {
         assert!(matches!(
             parse(&["silo", "config", name]),
             Command::Config {
-                command: Some(ConfigCommand::List)
+                command: Some(ConfigCommand::List { json: false })
             }
         ));
+    }
+}
+
+#[test]
+fn explicit_list_commands_accept_json() {
+    for group in ["config", "containers", "state"] {
+        for list in ["list", "ls"] {
+            let command = parse(&["silo", group, list, "--json"]);
+            let (Command::Config {
+                command: Some(ConfigCommand::List { json }),
+            }
+            | Command::Containers {
+                command: Some(ContainersCommand::List { json }),
+            }
+            | Command::State {
+                command: Some(StateCommand::List { json }),
+            }) = command
+            else {
+                panic!("expected {group} list command");
+            };
+            assert!(json, "{group} {list}");
+        }
+    }
+}
+
+#[test]
+fn json_is_restricted_to_explicit_list_commands() {
+    for arguments in [
+        &["silo", "config", "--json"][..],
+        &["silo", "containers", "--json"][..],
+        &["silo", "state", "--json"][..],
+        &["silo", "config", "path", "--json"][..],
+        &["silo", "containers", "delete", "project", "--json"][..],
+        &["silo", "state", "delete", "cache", "--json"][..],
+    ] {
+        let error = Cli::try_parse_from(arguments)
+            .err()
+            .expect("JSON is rejected outside explicit list commands");
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{arguments:?}");
     }
 }
 
@@ -285,7 +324,7 @@ fn state_defaults_to_list_and_parses_delete_aliases() {
     assert!(matches!(
         parse(&["silo", "state", "list"]),
         Command::State {
-            command: Some(StateCommand::List)
+            command: Some(StateCommand::List { json: false })
         }
     ));
     for command in ["delete", "rm"] {

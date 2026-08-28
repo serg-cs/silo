@@ -8,12 +8,16 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, anyhow};
 
 use crate::config::{Config, DEFAULT_CONFIG, config_path_from};
-use crate::output::write_stdout;
+use crate::output::{write_json, write_stdout};
 
-/// Prints the merged configuration as TOML.
-pub(super) fn print_effective(config: &Config) -> Result<ExitCode> {
-    let text = toml::to_string_pretty(config).context("failed to serialize configuration")?;
-    write_stdout(&text)?;
+/// Prints the merged configuration as TOML or JSON.
+pub(super) fn print_effective(config: &Config, json: bool) -> Result<ExitCode> {
+    if json {
+        write_json(config)?;
+    } else {
+        let text = toml::to_string_pretty(config).context("failed to serialize configuration")?;
+        write_stdout(&text)?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 

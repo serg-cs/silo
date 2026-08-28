@@ -46,6 +46,34 @@ fn list_output_is_compact_and_preserves_full_identity() {
     );
 }
 
+#[test]
+fn json_output_has_only_the_public_container_fields() {
+    let containers = [container("silo-full-id", "/work/project")];
+    let value = serde_json::to_value(container_output(&containers)).expect("JSON serializes");
+
+    assert_eq!(
+        value,
+        serde_json::json!([{
+            "id": "silo-full-id",
+            "type": "shared",
+            "state": "stopped",
+            "project": "/work/project"
+        }])
+    );
+    assert_eq!(
+        serde_json::to_value(container_output(&[])).expect("empty JSON serializes"),
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn json_output_preserves_unusual_project_characters() {
+    let containers = [container("silo-escaped", "/work/project\tbranch\nnext")];
+    let value = serde_json::to_value(container_output(&containers)).expect("JSON serializes");
+
+    assert_eq!(value[0]["project"], "/work/project\tbranch\nnext");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn stop_guard_readiness_has_a_bounded_wait() {

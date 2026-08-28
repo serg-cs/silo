@@ -25,13 +25,15 @@ fn try_run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::Config { command } => run_config_command(command.as_ref()),
         Command::Containers { command } => match command {
-            None | Some(ContainersCommand::List) => container::print_containers(),
+            None => container::print_containers(false),
+            Some(ContainersCommand::List { json }) => container::print_containers(json),
             Some(ContainersCommand::Delete { selector, force }) => {
                 container::delete_selected_container(&selector, force)
             }
         },
         Command::State { command } => match command {
-            None | Some(StateCommand::List) => storage::managed::print_state(),
+            None => storage::managed::print_state(false),
+            Some(StateCommand::List { json }) => storage::managed::print_state(json),
             Some(StateCommand::Delete { selector }) => {
                 storage::managed::delete_selected_state(&selector)
             }
@@ -83,11 +85,12 @@ fn load_project_config(
 /// `check` requires a root that could be mounted as a workspace.
 fn run_config_command(command: Option<&ConfigCommand>) -> anyhow::Result<ExitCode> {
     match command {
-        None | Some(ConfigCommand::List) => {
+        None | Some(ConfigCommand::List { .. }) => {
+            let json = matches!(command, Some(ConfigCommand::List { json: true }));
             let project_root = project::current_project_root()?;
             let config = load_config(&project_root, None, None, false)?;
             validate_config(&config, &project_root, ValidationProfile::Standard)?;
-            config_command::print_effective(&config)
+            config_command::print_effective(&config, json)
         }
         Some(ConfigCommand::Edit { global }) => {
             let project_root = project::current_project_root()?;

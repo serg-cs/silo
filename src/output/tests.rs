@@ -48,3 +48,10 @@ fn tsv_fields_preserve_one_record_per_line() {
         "one\\\\two\\tthree\\nfour\\rfive"
     );
 }
+
+#[test]
+fn json_is_pretty_printed_with_a_trailing_newline() {
+    let text = json_text(&serde_json::json!({"items": [1, 2]})).expect("JSON serializes");
+
+    assert_eq!(text, "{\n  \"items\": [\n    1,\n    2\n  ]\n}\n");
+}

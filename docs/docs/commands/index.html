@@ -51,6 +51,7 @@
         <section id="overview">
           <h2><a href="#overview">Overview</a></h2>
           <p>Run Silo from the project you want to work on. The command name selects a built-in operation; an unrecognized name can select a configured <a href="#quick-commands">quick command</a>.</p>
+          <p>Machine-readable output is available from the explicit <code>config list --json</code>, <code>containers list --json</code>, and <code>state list --json</code> forms. The shorthand commands without <code>list</code> retain their human-readable output.</p>
           <nav class="command-index" aria-label="Command overview">
             <a href="#run"><code>silo run</code><span>Open a session or run a command.</span></a>
             <a href="#image"><code>silo image build</code><span>Build the workspace image.</span></a>
@@ -110,7 +111,7 @@ silo run --sudo -- apt-get update</code></pre>
           <h2><a href="#config">Inspect and edit configuration</a></h2>
           <p><code>silo config</code> without a subcommand behaves like <code>silo config list</code>.</p>
           <dl class="command-list">
-            <div><dt><code>silo config list</code><span>Alias: <code>ls</code></span></dt><dd>Serialize the merged effective configuration as TOML.</dd></div>
+            <div><dt><code>silo config list [--json]</code><span>Alias: <code>ls</code></span></dt><dd>Serialize the merged effective configuration as TOML, or as a JSON object with <code>--json</code>.</dd></div>
             <div><dt><code>silo config edit</code></dt><dd>Open the active project configuration, or the global file when no project file exists.</dd></div>
             <div><dt><code>silo config edit --global</code></dt><dd>Always open or create the global configuration.</dd></div>
             <div><dt><code>silo config default</code></dt><dd>Print the bundled starter configuration without reading project or filesystem state.</dd></div>
@@ -121,6 +122,7 @@ silo run --sudo -- apt-get update</code></pre>
           <h3>Common inspection flow</h3>
           <pre data-copy><code>silo config path
 silo config list
+silo config list --json
 silo config check</code></pre>
           <p><code>silo config check</code> works without a project file in an ordinary directory, but rejects filesystem root <code>/</code> because it cannot serve as a workspace. See <a href="../configuration/#validation">validation and diagnostics</a> for the exact contract, and the <a href="../configuration/">configuration reference</a> for the complete schema and merge behavior.</p>
         </section>
@@ -130,8 +132,8 @@ silo config check</code></pre>
           <p><code>silo containers</code> without a subcommand behaves like <code>silo containers list</code>.</p>
           <dl class="command-list">
             <div>
-              <dt><code>silo containers list</code><span>Alias: <code>ls</code></span></dt>
-              <dd>List Silo-owned containers with their full ID, lifecycle, state, and canonical project path.</dd>
+              <dt><code>silo containers list [--json]</code><span>Alias: <code>ls</code></span></dt>
+              <dd>List Silo-owned containers with their full ID, lifecycle, state, and canonical project path. <code>--json</code> emits an array of objects with <code>id</code>, <code>type</code>, <code>state</code>, and <code>project</code> fields.</dd>
             </div>
             <div>
               <dt><code>silo containers delete &lt;selector&gt; [--force]</code><span>Alias: <code>rm</code></span></dt>
@@ -140,6 +142,7 @@ silo config check</code></pre>
           </dl>
           <h3>Examples</h3>
           <pre data-copy><code>silo containers
+silo containers list --json
 silo containers delete my-project
 silo containers rm silo-a0b1c2d3e4f5678901234567 --force</code></pre>
           <p>Without <code>--force</code>, Silo refuses to terminate an active session or shared-session handoff. Container deletion does not remove managed state.</p>
@@ -151,8 +154,8 @@ silo containers rm silo-a0b1c2d3e4f5678901234567 --force</code></pre>
           <p><code>silo state</code> without a subcommand behaves like <code>silo state list</code>.</p>
           <dl class="command-list">
             <div>
-              <dt><code>silo state list</code><span>Alias: <code>ls</code></span></dt>
-              <dd>List every Silo-managed state directory with its stable ID, scope, logical name, project, and host path.</dd>
+              <dt><code>silo state list [--json]</code><span>Alias: <code>ls</code></span></dt>
+              <dd>List every Silo-managed state directory with its stable ID, scope, logical name, project, and host path. <code>--json</code> emits an array of objects with <code>id</code>, <code>scope</code>, <code>name</code>, <code>project</code>, and <code>source</code> fields; <code>project</code> is <code>null</code> for user state.</dd>
             </div>
             <div>
               <dt><code>silo state delete &lt;selector&gt;</code><span>Alias: <code>rm</code></span></dt>

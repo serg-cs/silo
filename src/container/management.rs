@@ -1,5 +1,6 @@
 //! Container inventory presentation and safe administration.
 
+use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{ChildStdout, Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -7,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 
 use super::inventory::{
     ContainerInfo, container_inventory, delete_stopped_container, revalidate_selected_container,
@@ -16,17 +18,30 @@ use crate::apple::{
     CONTAINER_BIN, ContainerState, container_not_found, force_delete_container, spawn_error,
 };
 use crate::image::runtime_contract::LIFECYCLE;
-use crate::output::{tsv_field, write_stdout};
+use crate::output::{tsv_field, write_json, write_stdout};
+
+#[derive(Serialize)]
+struct ContainerOutput<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    lifecycle: &'static str,
+    state: &'static str,
+    project: Cow<'a, str>,
+}
 
 /// Prints the core identity and state of every owned container.
-pub(crate) fn print_containers() -> Result<ExitCode> {
+pub(crate) fn print_containers(json: bool) -> Result<ExitCode> {
     let inventory = container_inventory()?;
-    let text = if inventory.items.is_empty() {
-        "No Silo containers.\n".to_string()
+    if json {
+        write_json(&container_output(&inventory.items))?;
     } else {
-        format!("{}\n", render_container_list(&inventory.items))
-    };
-    write_stdout(&text)?;
+        let text = if inventory.items.is_empty() {
+            "No Silo containers.\n".to_string()
+        } else {
+            format!("{}\n", render_container_list(&inventory.items))
+        };
+        write_stdout(&text)?;
+    }
     for warning in inventory.warnings {
         eprintln!("warning: {warning}");
     }
@@ -59,6 +74,18 @@ fn render_container_list(items: &[ContainerInfo]) -> String {
         )
     }));
     lines.join("\n")
+}
+
+fn container_output(items: &[ContainerInfo]) -> Vec<ContainerOutput<'_>> {
+    items
+        .iter()
+        .map(|item| ContainerOutput {
+            id: &item.id,
+            lifecycle: item.lifecycle.as_str(),
+            state: item.state.as_str(),
+            project: item.project.to_string_lossy(),
+        })
+        .collect()
 }
 /// Selects an exact ID or one unambiguous project basename.
 fn select_container<'a>(items: &'a [ContainerInfo], selector: &str) -> Result<&'a ContainerInfo> {

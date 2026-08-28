@@ -66,7 +66,11 @@ pub(crate) enum Command {
 pub(crate) enum ConfigCommand {
     /// Print the effective configuration for the current project.
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Print the effective configuration as JSON instead of TOML.
+        #[arg(long)]
+        json: bool,
+    },
     /// Edit the nearest project configuration, or the global configuration.
     Edit {
         /// Edit the global configuration even when a project file exists.
@@ -91,7 +95,11 @@ pub(crate) enum ImageCommand {
 pub(crate) enum ContainersCommand {
     /// List all shared and isolated Silo containers.
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Print the container inventory as JSON instead of TSV.
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop and delete one Silo container.
     #[command(alias = "rm")]
     Delete {
@@ -107,7 +115,11 @@ pub(crate) enum ContainersCommand {
 pub(crate) enum StateCommand {
     /// List all Silo-owned persistent state.
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Print the managed state inventory as JSON instead of TSV.
+        #[arg(long)]
+        json: bool,
+    },
     /// Permanently delete one unused state directory.
     #[command(alias = "rm")]
     Delete {
