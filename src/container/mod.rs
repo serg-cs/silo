@@ -13,7 +13,7 @@ pub(crate) fn validate_config(
     config: &crate::config::Config,
     project_root: &std::path::Path,
 ) -> anyhow::Result<()> {
-    runtime::validate_config(&config.container)?;
+    runtime::validate_config(&config.container, &config.env_vars)?;
     match crate::project::shared_dir_name(project_root) {
         Ok(project_dir) => {
             crate::apple::mount_argument_path(project_root)?;

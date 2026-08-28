@@ -12,7 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, Container, Shell};
+use crate::config::{Config, Shell};
 use crate::digest::hex as hex_digest;
 use crate::host_ports;
 
@@ -91,6 +91,7 @@ fn run_isolated(
         host_ids: &ids,
         mounts: &config_mounts,
         resources: &config.container,
+        env_vars: &config.env_vars,
         lifecycle: ContainerLifecycle::Isolated,
     };
     let mut create =
@@ -398,7 +399,7 @@ fn ensure_shared_container(
                     &image_digest,
                     &ids,
                     &config_mounts,
-                    &config.container,
+                    config,
                     &instance,
                 );
                 drop(mount_lock);
@@ -447,7 +448,7 @@ fn create_shared_container(
     image_digest: &str,
     ids: &HostIds,
     config_mounts: &ConfigMounts,
-    resources: &Container,
+    config: &Config,
     instance: &str,
 ) -> Result<SharedCreation> {
     let cid_dir = tempfile::Builder::new()
@@ -469,7 +470,8 @@ fn create_shared_container(
         instance,
         host_ids: ids,
         mounts: config_mounts,
-        resources,
+        resources: &config.container,
+        env_vars: &config.env_vars,
         lifecycle: ContainerLifecycle::Shared,
     };
     let output = shared_create_command(&launch, &cidfile)?

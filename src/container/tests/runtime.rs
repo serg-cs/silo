@@ -28,6 +28,48 @@ fn creation_uses_only_the_minimal_runtime_identity() {
 }
 
 #[test]
+fn creation_forwards_only_allowlisted_environment_names() {
+    let env_vars = BTreeSet::from(["API_TOKEN".to_string(), "AWS_PROFILE".to_string()]);
+    let project = test_project("/tmp/project");
+    let host_ids = HostIds {
+        uid: "501".into(),
+        gid: "20".into(),
+    };
+    let shared = create_command_with_env(
+        &project,
+        &host_ids,
+        &ConfigMounts::default(),
+        &Container::default(),
+        &env_vars,
+        Path::new("/tmp/container.cid"),
+    )
+    .expect("shared command builds");
+    let isolated = isolated_create_command_with_env(
+        &ConfigMounts::default(),
+        &Container::default(),
+        &env_vars,
+        &[],
+        Shell::Zsh,
+    )
+    .expect("isolated command builds");
+
+    for command in [&shared, &isolated] {
+        let args: Vec<&str> = command
+            .get_args()
+            .map(|argument| argument.to_str().expect("argument is UTF-8"))
+            .collect();
+        for name in ["API_TOKEN", "AWS_PROFILE"] {
+            assert!(args.windows(2).any(|pair| pair == ["--env", name]));
+            assert!(
+                !args
+                    .iter()
+                    .any(|argument| argument.starts_with(&format!("{name}=")))
+            );
+        }
+    }
+}
+
+#[test]
 fn ownership_requires_consistent_labels_and_runtime_id() {
     let project = test_project("/tmp/project");
     let valid = inspection(&project, ContainerLifecycle::Shared);
@@ -175,10 +217,13 @@ fn session_commands_use_the_consolidated_guest_lifecycle() {
 #[test]
 fn resource_and_shell_validation_remain_strict() {
     assert!(
-        crate::container::runtime::validate_config(&Container {
-            cpus: Some(0),
-            ..Container::default()
-        })
+        crate::container::runtime::validate_config(
+            &Container {
+                cpus: Some(0),
+                ..Container::default()
+            },
+            &BTreeSet::new(),
+        )
         .is_err()
     );
     assert_eq!(
@@ -189,4 +234,32 @@ fn resource_and_shell_validation_remain_strict() {
         resolve_shell(None, Some(OsStr::new("/bin/unknown"))),
         Shell::Zsh
     );
+}
+
+#[test]
+fn environment_allowlist_validation_is_strict() {
+    let valid = BTreeSet::from(["API_TOKEN".to_string(), "_PRIVATE_2".to_string()]);
+    crate::container::runtime::validate_config(&Container::default(), &valid)
+        .expect("shell variable names are valid");
+
+    for name in [
+        "",
+        "2FA_TOKEN",
+        "API-TOKEN",
+        "API TOKEN",
+        "HOME",
+        "PATH",
+        "SHELL",
+        "BREW_PREFIX",
+        "SILO_UID",
+        "SILO_CUSTOM",
+    ] {
+        let error = crate::container::runtime::validate_config(
+            &Container::default(),
+            &BTreeSet::from([name.to_string()]),
+        )
+        .expect_err("invalid or reserved names fail")
+        .to_string();
+        assert!(error.contains(name), "{error}");
+    }
 }

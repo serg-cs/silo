@@ -23,6 +23,9 @@ pub(crate) struct Config {
     /// Project arrays replace global arrays.
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub(crate) host_ports: BTreeSet<u16>,
+    /// Host environment variables inherited when a container is created.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) env_vars: BTreeSet<String>,
     /// Interactive shell supplied by the Silo base image. When omitted, Silo
     /// mirrors a supported host `$SHELL` and falls back to Zsh.
     #[serde(skip_serializing_if = "Option::is_none")]

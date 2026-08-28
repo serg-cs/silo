@@ -97,6 +97,20 @@ fn project_host_ports_replace_global_host_ports() {
 }
 
 #[test]
+fn project_env_vars_replace_the_global_allowlist() {
+    let config = parse_layers(
+        "env_vars = [\"GLOBAL_TOKEN\", \"AWS_PROFILE\"]\n",
+        "env_vars = [\"PROJECT_TOKEN\", \"PROJECT_TOKEN\"]\n",
+    )
+    .expect("environment allowlists merge");
+
+    assert_eq!(
+        config.env_vars,
+        BTreeSet::from(["PROJECT_TOKEN".to_string()])
+    );
+}
+
+#[test]
 fn merged_relative_paths_resolve_from_the_project_root() {
     let base = Path::new("/project");
     let config = parse_layers(
@@ -214,6 +228,23 @@ fn host_ports_render_as_a_sorted_unique_allowlist() {
 }
 
 #[test]
+fn env_vars_render_as_a_sorted_unique_allowlist() {
+    let config =
+        Config::parse("env_vars = [\"OPENAI_API_KEY\", \"AWS_PROFILE\", \"OPENAI_API_KEY\"]\n")
+            .expect("environment allowlist parses");
+
+    assert_eq!(
+        config.env_vars,
+        BTreeSet::from(["AWS_PROFILE".to_string(), "OPENAI_API_KEY".to_string(),])
+    );
+    let text = toml::to_string_pretty(&config).expect("environment allowlist serializes");
+    assert!(
+        text.contains("env_vars = [\n    \"AWS_PROFILE\",\n    \"OPENAI_API_KEY\",\n]"),
+        "{text}"
+    );
+}
+
+#[test]
 fn host_ports_reject_values_outside_the_schema_range() {
     let error = Config::parse("host_ports = [65536]\n")
         .expect_err("host ports must fit in an unsigned 16-bit integer")
@@ -246,6 +277,7 @@ fn effective_config_round_trips_through_toml() {
          container.memory = \"4G\"\n\
          container.sudo = true\n\
          shell = \"fish\"\n\
+         env_vars = [\"OPENAI_API_KEY\", \"AWS_PROFILE\"]\n\
          workspace.read_only = [\"policy\"]\n\
          host_ports = [5432, 8080]\n\
          [binds.docs]\n\

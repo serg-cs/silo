@@ -1,5 +1,6 @@
 //! Container identity and command construction above Apple's runtime adapter.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
@@ -31,7 +32,7 @@ pub(super) const CONFLICT_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const CONFLICT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const GUEST_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
-pub(super) fn validate_config(resources: &Container) -> Result<()> {
+pub(super) fn validate_config(resources: &Container, env_vars: &BTreeSet<String>) -> Result<()> {
     ensure!(
         resources.cpus != Some(0),
         "invalid `container.cpus` config option: CPU count must be greater than zero"
@@ -43,7 +44,26 @@ pub(super) fn validate_config(resources: &Container) -> Result<()> {
             .is_some_and(|memory| memory.trim().is_empty()),
         "invalid `container.memory` config option: memory must not be empty"
     );
+    for name in env_vars {
+        ensure!(
+            valid_env_var_name(name),
+            "invalid `env_vars` entry `{name}`: expected an ASCII shell variable name"
+        );
+        ensure!(
+            !matches!(name.as_str(), "HOME" | "PATH" | "SHELL" | "BREW_PREFIX")
+                && !name.starts_with("SILO_"),
+            "invalid `env_vars` entry `{name}`: the name is reserved by Silo"
+        );
+    }
     Ok(())
+}
+
+fn valid_env_var_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -77,6 +97,7 @@ pub(super) struct LaunchSpec<'a> {
     pub(super) host_ids: &'a HostIds,
     pub(super) mounts: &'a ConfigMounts,
     pub(super) resources: &'a Container,
+    pub(super) env_vars: &'a BTreeSet<String>,
     pub(super) lifecycle: ContainerLifecycle,
 }
 
@@ -187,6 +208,7 @@ pub(super) fn shared_create_command(launch: &LaunchSpec<'_>, cidfile: &Path) -> 
 /// Applies the creation contract shared by both lifecycle modes.
 fn append_launch_contract(run: &mut Command, launch: &LaunchSpec<'_>) -> Result<()> {
     append_resources(run, launch.resources);
+    append_env_vars(run, launch.env_vars);
     append_identity_labels(
         run,
         launch.project,
@@ -206,6 +228,13 @@ fn append_launch_contract(run: &mut Command, launch: &LaunchSpec<'_>) -> Result<
         launch.mounts.host_ports.is_some(),
     );
     Ok(())
+}
+
+/// Inherits allowlisted values without placing them in Silo's arguments.
+fn append_env_vars(run: &mut Command, env_vars: &BTreeSet<String>) {
+    for name in env_vars {
+        run.arg("--env").arg(name);
+    }
 }
 
 /// Adds only explicitly configured limits, preserving Apple container's

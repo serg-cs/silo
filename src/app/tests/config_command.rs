@@ -47,13 +47,14 @@ fn missing_active_paths_report_builtin_defaults_successfully() {
 #[test]
 fn effective_config_uses_the_existing_schema_when_serialized_as_json() {
     let config = crate::config::Config::parse(
-        "[container]\ncpus = 4\nsudo = true\n[quick]\ntest = [\"cargo\", \"test\"]\n",
+        "env_vars = [\"OPENAI_API_KEY\"]\n[container]\ncpus = 4\nsudo = true\n[quick]\ntest = [\"cargo\", \"test\"]\n",
     )
     .expect("config parses");
     let value = serde_json::to_value(config).expect("effective config serializes as JSON");
 
     assert_eq!(value["container"]["cpus"], 4);
     assert_eq!(value["container"]["sudo"], true);
+    assert_eq!(value["env_vars"], serde_json::json!(["OPENAI_API_KEY"]));
     assert_eq!(value["quick"]["test"], serde_json::json!(["cargo", "test"]));
     assert!(value.is_object());
 }

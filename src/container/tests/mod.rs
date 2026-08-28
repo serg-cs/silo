@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::net::Ipv4Addr;
@@ -30,6 +30,16 @@ fn isolated_create_command(
     command: &[OsString],
     shell: Shell,
 ) -> Result<Command> {
+    isolated_create_command_with_env(config_mounts, resources, &BTreeSet::new(), command, shell)
+}
+
+fn isolated_create_command_with_env(
+    config_mounts: &ConfigMounts,
+    resources: &Container,
+    env_vars: &BTreeSet<String>,
+    command: &[OsString],
+    shell: Shell,
+) -> Result<Command> {
     let project = test_project("/tmp/project");
     let host_ids = HostIds {
         uid: "501".into(),
@@ -43,6 +53,7 @@ fn isolated_create_command(
         host_ids: &host_ids,
         mounts: config_mounts,
         resources,
+        env_vars,
         lifecycle: ContainerLifecycle::Isolated,
     };
     super::runtime::isolated_create_command(false, &launch, command, shell)
@@ -55,6 +66,24 @@ fn create_command(
     resources: &Container,
     cidfile: &Path,
 ) -> Result<Command> {
+    create_command_with_env(
+        project,
+        host_ids,
+        config_mounts,
+        resources,
+        &BTreeSet::new(),
+        cidfile,
+    )
+}
+
+fn create_command_with_env(
+    project: &Project,
+    host_ids: &HostIds,
+    config_mounts: &ConfigMounts,
+    resources: &Container,
+    env_vars: &BTreeSet<String>,
+    cidfile: &Path,
+) -> Result<Command> {
     let launch = LaunchSpec {
         project,
         id: &project.id,
@@ -63,6 +92,7 @@ fn create_command(
         host_ids,
         mounts: config_mounts,
         resources,
+        env_vars,
         lifecycle: ContainerLifecycle::Shared,
     };
     shared_create_command(&launch, cidfile)
