@@ -41,6 +41,7 @@ fn validation_rejects_duplicate_names_targets_and_runtime_overlap() {
 fn validation_rejects_writable_overlays_below_read_only_workspace() {
     let dir = test_dir("read-only-overlap");
     fs::create_dir_all(dir.path().join("policy/child")).expect("policy directories create");
+    fs::create_dir(dir.path().join("policy/cache")).expect("state target creates");
 
     let error = validate_config_at(
         "workspace.read_only = [\"policy\"]\n\
@@ -61,11 +62,11 @@ fn validation_rejects_writable_overlays_below_read_only_workspace() {
     assert!(error.contains("overlaps read-only workspace"), "{error}");
 
     validate_config_at(
-        "workspace.read_only = [\"missing\"]\n\
-         [state.project.cache]\ntarget = \"./missing/cache\"\n",
+        "workspace.read_only = [\"policy\"]\n\
+         [state.project.cache]\ntarget = \"./policy/missing\"\n",
         dir.path(),
     )
-    .expect("an ignored read-only path does not protect a missing directory");
+    .expect("missing project state does not overlap a read-only directory");
 }
 
 #[test]
@@ -194,6 +195,8 @@ fn read_only_resolution_stays_within_the_project() {
 
 #[test]
 fn configured_mounts_encode_owner_and_sort_parents_before_children() {
+    let project = test_dir("configured-mounts");
+    fs::create_dir_all(project.path().join("cache/child")).expect("state target creates");
     let mut config = Config::default();
     config
         .state
@@ -203,13 +206,18 @@ fn configured_mounts_encode_owner_and_sort_parents_before_children() {
         .state
         .user
         .insert("parent".into(), state_entry("./cache"));
-    let project = Path::new("/tmp/project");
-    let mounts =
-        resolve_configured_mounts(&config, project, &[], Some(Path::new("/home/user")), None)
-            .expect("mounts resolve");
+    let project_dir = shared_dir_name(project.path()).expect("project destination resolves");
+    let mounts = resolve_configured_mounts(
+        &config,
+        project.path(),
+        &[],
+        Some(Path::new("/home/user")),
+        None,
+    )
+    .expect("mounts resolve");
 
-    assert_eq!(mounts[0].dest, Path::new("/home/silo/project/cache"));
-    assert_eq!(mounts[1].dest, Path::new("/home/silo/project/cache/child"));
+    assert_eq!(mounts[0].dest, project_dir.join("cache"));
+    assert_eq!(mounts[1].dest, project_dir.join("cache/child"));
     let MountSource::Managed(parent) = &mounts[0].source else {
         panic!("state mount is managed");
     };
@@ -217,13 +225,69 @@ fn configured_mounts_encode_owner_and_sort_parents_before_children() {
         panic!("state mount is managed");
     };
     assert_eq!(parent.owner, StateOwner::User);
-    assert_eq!(child.owner, StateOwner::Project(project.into()));
+    assert_eq!(child.owner, StateOwner::Project(project.path().into()));
     assert!(
         child
             .path
             .to_string_lossy()
-            .contains(&project_digest(project))
+            .contains(&project_digest(project.path()))
     );
+}
+
+#[test]
+fn missing_project_relative_state_is_ignored() {
+    let project = test_dir("missing-project-state");
+    let target = project.path().join("target");
+    let mut config = Config::default();
+    config
+        .state
+        .project
+        .insert("cargo-target".into(), state_entry("./target"));
+
+    let mounts = resolve_configured_mounts(&config, project.path(), &[], None, None)
+        .expect("missing project state is ignored without managed storage");
+    assert!(mounts.is_empty());
+    ensure_managed_mounts(&mounts).expect("no managed state needs creation");
+    assert!(!target.exists());
+
+    fs::create_dir(&target).expect("state target creates");
+    let state_home = project.path().join("state-home");
+    let mounts = resolve_configured_mounts(&config, project.path(), &[], None, Some(&state_home))
+        .expect("existing project state resolves");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(
+        mounts[0].dest,
+        shared_dir_name(project.path())
+            .expect("project destination resolves")
+            .join("target")
+    );
+}
+
+#[test]
+fn project_state_eligibility_is_stable_during_resolution() {
+    let project = test_dir("project-state-snapshot");
+    let target = project.path().join("target");
+    let project_dir = shared_dir_name(project.path()).expect("project destination resolves");
+    let mut config = Config::default();
+    config
+        .state
+        .project
+        .insert("project-cache".into(), state_entry("./target"));
+    config
+        .state
+        .user
+        .insert("user-cache".into(), state_entry("./target"));
+
+    let project_state = eligible_project_state(&config, project.path());
+    assert!(project_state.is_empty());
+
+    fs::create_dir(target).expect("target appears after eligibility snapshot");
+    validate_eligible_project_targets(&config, &project_state, &project_dir, &[])
+        .expect("the unchanged snapshot has no duplicate target");
+    let names: Vec<_> = configured_mounts(&config, Some(&project_state))
+        .map(|(name, _, _)| name)
+        .collect();
+    assert_eq!(names, ["user-cache"]);
 }
 
 #[test]

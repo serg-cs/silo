@@ -151,8 +151,10 @@ pub(super) fn resolve_configured_mounts(
     xdg_state_home: Option<&Path>,
 ) -> Result<Vec<ConfiguredMount>> {
     let project_dir = shared_dir_name(project_root)?;
-    // Enforce the mount contract before resolving sources or managed state.
-    validate_project_targets(config, &project_dir, read_only)?;
+    validate_config(config)?;
+    let project_state = eligible_project_state(config, project_root);
+    // Enforce the mount contract against the same state snapshot used below.
+    validate_eligible_project_targets(config, &project_state, &project_dir, read_only)?;
 
     let capacity = config.binds.len() + config.state.project.len() + config.state.user.len();
     let mut resolved = Vec::with_capacity(capacity);
@@ -178,7 +180,12 @@ pub(super) fn resolve_configured_mounts(
             access: bind.access,
         });
     }
-    for (name, entry) in &config.state.project {
+    for (name, entry) in config
+        .state
+        .project
+        .iter()
+        .filter(|(name, _)| project_state.contains(*name))
+    {
         let dest = effective_target(&entry.target, &project_dir)
             .ok_or_else(|| anyhow!("state entry `{name}` has no valid container target"))?;
         let owner = StateOwner::Project(project_root.to_path_buf());
@@ -265,7 +272,7 @@ pub(super) fn validate_config(config: &Config) -> Result<()> {
 
     let mut names = BTreeSet::new();
     let mut targets = BTreeMap::<PathBuf, &str>::new();
-    for (name, target, _) in configured_mounts(config) {
+    for (name, target, _) in configured_mounts(config, None) {
         ensure!(
             valid_mount_name(name),
             "bind or state entry `{name}`: name must start with an ASCII letter or number and contain only ASCII letters, numbers, `_`, or `-`"
@@ -310,16 +317,27 @@ fn context_independent_target(target: &Path) -> Option<PathBuf> {
 /// accepting duplicate or writable-overlap invariants.
 pub(super) fn validate_project_targets(
     config: &Config,
+    project_root: &Path,
     project_dir: &Path,
     read_only: &[ReadOnlyProjectPath],
 ) -> Result<()> {
     validate_config(config)?;
+    let project_state = eligible_project_state(config, project_root);
+    validate_eligible_project_targets(config, &project_state, project_dir, read_only)
+}
+
+pub(super) fn validate_eligible_project_targets(
+    config: &Config,
+    project_state: &BTreeSet<String>,
+    project_dir: &Path,
+    read_only: &[ReadOnlyProjectPath],
+) -> Result<()> {
     let protected: Vec<_> = read_only
         .iter()
         .map(|path| project_path_target(project_dir, &path.relative))
         .collect();
     let mut targets = BTreeMap::<PathBuf, &str>::new();
-    for (name, configured, access) in configured_mounts(config) {
+    for (name, configured, access) in configured_mounts(config, Some(project_state)) {
         let target = effective_target(configured, project_dir).ok_or_else(|| {
             anyhow!("validated entry `{name}` did not resolve to a container target")
         })?;
@@ -351,21 +369,51 @@ pub(super) fn validate_project_targets(
     Ok(())
 }
 
-fn configured_mounts(config: &Config) -> impl Iterator<Item = (&str, &Path, Permission)> {
+pub(super) fn configured_mounts<'a>(
+    config: &'a Config,
+    project_state: Option<&'a BTreeSet<String>>,
+) -> impl Iterator<Item = (&'a str, &'a Path, Permission)> + 'a {
     config
         .binds
         .iter()
         .map(|(name, entry)| (name.as_str(), entry.target.as_path(), entry.access))
         .chain(
-            config.state.project.iter().map(|(name, entry)| {
-                (name.as_str(), entry.target.as_path(), Permission::ReadWrite)
-            }),
+            config
+                .state
+                .project
+                .iter()
+                .filter(move |(name, _)| {
+                    project_state.is_none_or(|eligible| eligible.contains(*name))
+                })
+                .map(|(name, entry)| {
+                    (name.as_str(), entry.target.as_path(), Permission::ReadWrite)
+                }),
         )
         .chain(
             config.state.user.iter().map(|(name, entry)| {
                 (name.as_str(), entry.target.as_path(), Permission::ReadWrite)
             }),
         )
+}
+
+pub(super) fn eligible_project_state(config: &Config, project_root: &Path) -> BTreeSet<String> {
+    config
+        .state
+        .project
+        .iter()
+        .filter(|(_, entry)| project_state_target_exists(project_root, &entry.target))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Project-relative state is only useful when its mount point already exists.
+/// Omitting missing paths prevents the container runtime from creating them in
+/// the writable project bind. Home-relative and absolute targets are unaffected.
+fn project_state_target_exists(project_root: &Path, target: &Path) -> bool {
+    let Some(relative) = target.to_str().and_then(|target| target.strip_prefix("./")) else {
+        return true;
+    };
+    project_root.join(relative).is_dir()
 }
 
 fn validate_host_path(name: &str, path: &Path) -> Result<()> {

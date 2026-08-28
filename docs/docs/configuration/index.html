@@ -159,6 +159,7 @@ agent-state = { target = "~/.agent" }</code></pre>
             <li><strong>Project</strong> state is keyed by canonical project path and entry name.</li>
             <li><strong>User</strong> state is keyed by entry name and is intentionally reused across this user's projects.</li>
           </ul>
+          <p>Project-state targets beginning with <code>./</code> are mounted only when the corresponding directory already exists in the project. Missing paths are silently ignored so configuration shared across projects does not create unrelated directories.</p>
           <p>Bind and state names must start with an ASCII letter or digit and then contain only letters, digits, <code>_</code>, or <code>-</code>. One logical name cannot appear in more than one bind or state category, including across global and project configuration.</p>
         </section>
 
