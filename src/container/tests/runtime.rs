@@ -212,6 +212,13 @@ fn session_commands_use_the_consolidated_guest_lifecycle() {
         .map(|argument| argument.to_str().expect("argument is UTF-8"))
         .collect();
     assert!(session_args.ends_with(&[LIFECYCLE_COMMAND, "session", "abc123", "true"]));
+
+    let persistence = persistence_command(&project, "abc123");
+    let persistence_args: Vec<&str> = persistence
+        .get_args()
+        .map(|argument| argument.to_str().expect("argument is UTF-8"))
+        .collect();
+    assert!(persistence_args.ends_with(&[LIFECYCLE_COMMAND, "persist", "abc123"]));
 }
 
 #[test]

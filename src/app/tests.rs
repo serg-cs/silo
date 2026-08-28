@@ -5,7 +5,16 @@ mod config_command;
 #[test]
 fn builtin_commands_covers_the_project_command_set() {
     let names = builtin_commands();
-    for expected in ["config", "run", "containers", "state", "image", "help"] {
+    for expected in [
+        "config",
+        "run",
+        "start",
+        "stop",
+        "containers",
+        "state",
+        "image",
+        "help",
+    ] {
         assert!(
             names.iter().any(|name| name == expected),
             "missing {expected}"

@@ -215,34 +215,7 @@ fn run_shared(
 ) -> Result<ExitCode> {
     sweep_orphaned_isolated_containers(None);
     let deadline = Instant::now() + GUEST_READY_TIMEOUT + CONFLICT_RETRY_TIMEOUT;
-    let (reservation, address, tunnel) = loop {
-        if Instant::now() >= deadline {
-            return Err(anyhow!(
-                "container `{}` repeatedly stopped during session handoff",
-                project.id
-            ));
-        }
-        let tunnel = ensure_shared_container(project, config)?;
-        let requires_address = tunnel.is_some();
-        let Some(inspection) = wait_for_guest_ready(project, requires_address)? else {
-            continue;
-        };
-        let Some(reservation) = reserve_shared_session(project)? else {
-            continue;
-        };
-        break (reservation, inspection.ipv4_address, tunnel);
-    };
-    // Only the creator owns prepared host-port assets; joins leave the
-    // running instance unchanged.
-    if let Some(tunnel) = tunnel {
-        let address = address.ok_or_else(|| {
-            anyhow!(
-                "container `{}` did not expose an IPv4 address for host ports",
-                project.id
-            )
-        })?;
-        tunnel.ensure(address)?;
-    }
+    let reservation = prepare_shared_handoff(config, project, deadline)?;
 
     // The attached process owns the terminal, but not the shared container.
     let mut exec = exec_command(
@@ -260,6 +233,66 @@ fn run_shared(
         terminal.restore();
     }
     status.map(exit_code)
+}
+
+/// Starts or promotes the current project's shared container without attaching a session.
+pub(crate) fn start_shared_container(config: &Config, project: &Project) -> Result<ExitCode> {
+    sweep_orphaned_isolated_containers(None);
+    let deadline = Instant::now() + GUEST_READY_TIMEOUT + CONFLICT_RETRY_TIMEOUT;
+    loop {
+        let reservation = prepare_shared_handoff(config, project, deadline)?;
+        let output = persistence_command(project, &reservation)
+            .output()
+            .map_err(spawn_error)?;
+        if output.status.success() {
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let Some(inspection) = inspect_container(&project.id)? else {
+            continue;
+        };
+        if inspection.state == ContainerState::Running {
+            validate_shared_ownership(&inspection, project)?;
+            return Err(anyhow!(
+                "failed to keep container `{}` running: {}",
+                project.id,
+                stderr
+            ));
+        }
+    }
+}
+
+/// Ensures a shared container and protects it with a reservation through handoff.
+fn prepare_shared_handoff(config: &Config, project: &Project, deadline: Instant) -> Result<String> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "container `{}` repeatedly stopped during shared-container handoff",
+                project.id
+            ));
+        }
+        let tunnel = ensure_shared_container(project, config)?;
+        let requires_address = tunnel.is_some();
+        let Some(inspection) = wait_for_guest_ready(project, requires_address)? else {
+            continue;
+        };
+        let Some(reservation) = reserve_shared_session(project)? else {
+            continue;
+        };
+        // Only the creator owns prepared host-port assets; joins leave the
+        // running instance unchanged. The reservation protects this setup.
+        if let Some(tunnel) = tunnel {
+            let address = inspection.ipv4_address.ok_or_else(|| {
+                anyhow!(
+                    "container `{}` did not expose an IPv4 address for host ports",
+                    project.id
+                )
+            })?;
+            tunnel.ensure(address)?;
+        }
+        return Ok(reservation);
+    }
 }
 
 /// Waits until the shared container reports readiness and its inspection is usable.
@@ -353,6 +386,17 @@ pub(super) fn session_reserve_command(project: &Project) -> Command {
         .arg(&project.id)
         .arg(LIFECYCLE_COMMAND)
         .arg("reserve");
+    command
+}
+
+pub(super) fn persistence_command(project: &Project, reservation: &str) -> Command {
+    let mut command = Command::new(CONTAINER_BIN);
+    command
+        .args(["exec", "--user", "silo"])
+        .arg(&project.id)
+        .arg(LIFECYCLE_COMMAND)
+        .arg("persist")
+        .arg(reservation);
     command
 }
 

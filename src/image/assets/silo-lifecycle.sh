@@ -4,6 +4,7 @@ set -eu
 runtime=${SILO_RUNTIME_DIR:-/run/silo}
 lock="$runtime/session.lock"
 reservations="$runtime/reservations"
+persistent="$runtime/persistent"
 
 count_live_reservations() {
     now=$(date +%s)
@@ -39,8 +40,12 @@ case "${1:-}" in
         done
         exec 9>"$lock"
         while :; do
+            if [ -e "$persistent" ]; then
+                sleep 0.1
+                continue
+            fi
             if flock --exclusive --nonblock 9; then
-                if [ "$(count_live_reservations)" -eq 0 ]; then
+                if [ "$(count_live_reservations)" -eq 0 ] && [ ! -e "$persistent" ]; then
                     exit 0
                 fi
                 flock --unlock 9
@@ -73,6 +78,19 @@ case "${1:-}" in
         touch "$runtime/armed"
         exec "$@"
         ;;
+    persist)
+        [ "$#" -eq 2 ] || exit 64
+        token=$2
+        case "$token" in
+            *[!0-9A-Za-z]*|'') exit 64 ;;
+        esac
+        reservation_file="$reservations/$token"
+        exec 9>"$lock"
+        flock --shared 9
+        [ -f "$reservation_file" ] || exit 75
+        rm -f "$reservation_file"
+        touch "$persistent" "$runtime/armed"
+        ;;
     stop-guard)
         [ "$#" -eq 1 ] || exit 64
         exec 9>"$lock"
@@ -86,7 +104,7 @@ case "${1:-}" in
         cat >/dev/null
         ;;
     *)
-        echo 'usage: silo-lifecycle {init|reserve|session|stop-guard}' >&2
+        echo 'usage: silo-lifecycle {init|reserve|session|persist|stop-guard}' >&2
         exit 64
         ;;
 esac

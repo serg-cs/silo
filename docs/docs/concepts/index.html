@@ -63,14 +63,15 @@
           <div class="table-wrap"><table>
             <thead><tr><th>Property</th><th>Shared</th><th>Isolated</th></tr></thead>
             <tbody>
-              <tr><td>Requested by</td><td><code>silo run</code></td><td><code>silo run --isolated</code></td></tr>
+              <tr><td>Requested by</td><td><code>silo run</code> or <code>silo start</code></td><td><code>silo run --isolated</code></td></tr>
               <tr><td>Container ID</td><td>Stable digest of the project path</td><td>Unique to the Silo process</td></tr>
               <tr><td>Concurrency</td><td>Multiple overlapping sessions</td><td>One foreground session</td></tr>
-              <tr><td>Exit behavior</td><td>Stops after the final lease closes</td><td>Stops and is deleted</td></tr>
+              <tr><td>Exit behavior</td><td>Stops after the final lease, unless explicitly started</td><td>Stops and is deleted</td></tr>
               <tr><td>Best for</td><td>Normal development and cooperating agents</td><td>Clean-room work and throwaway checks</td></tr>
             </tbody>
           </table></div>
           <p>Shared does not mean global: one project never joins another project's container. It means that multiple commands for the same canonical project can share running processes and ephemeral container state while their sessions overlap.</p>
+          <p><code>silo start</code> keeps that same shared container running while it is idle; later sessions attach normally. Use <code>silo stop</code> when the persistent workspace is no longer needed.</p>
         </section>
 
         <section id="state">

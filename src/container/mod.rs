@@ -5,8 +5,8 @@ mod mounts;
 mod process;
 mod runtime;
 
-pub(crate) use lifecycle::run_session;
-pub(crate) use management::{delete_selected_container, print_containers};
+pub(crate) use lifecycle::{run_session, start_shared_container};
+pub(crate) use management::{delete_selected_container, print_containers, stop_project_container};
 
 /// Validates config values and project-relative targets without runtime state.
 pub(crate) fn validate_config(

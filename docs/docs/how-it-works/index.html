@@ -75,6 +75,7 @@
           <p>The Silo base runs a small supervisor as PID 1. Before starting an arbitrary user command, the host waits for an explicit guest readiness marker and reserves a session token through a safe helper.</p>
           <p>The reservation closes a subtle race: without it, the supervisor could decide the container was idle after host inspection but just before the command attached. Only the reservation helper is retried; Silo never replays the user's command automatically.</p>
           <p>Once attached, a guest wrapper owns the session lease for the command and its children. The supervisor observes reservations and active leases and exits only when both reach zero. This allows shells, tests, and agents to overlap without one process shutting down another's container.</p>
+          <p><code>silo start</code> consumes the same safe reservation into a runtime-only persistence marker. While that marker exists, the supervisor remains alive with no sessions; <code>silo run</code> continues to reserve and attach sessions through the normal path. <code>silo stop</code> uses the guarded stop handshake, or bypasses it with <code>--force</code>.</p>
           <p>When Silo receives an interrupt, termination, hangup, or quit signal, it forwards the signal to the attached runtime process, waits for cleanup, and restores the host terminal state.</p>
         </section>
 

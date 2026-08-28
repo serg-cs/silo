@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Complete reference for Silo run, image, config, container, state, and quick commands.">
+    <meta name="description" content="Complete reference for Silo run, start, stop, image, config, container, state, and quick commands.">
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/commands/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
@@ -54,6 +54,7 @@
           <p>Machine-readable output is available from the explicit <code>config list --json</code>, <code>containers list --json</code>, and <code>state list --json</code> forms. The shorthand commands without <code>list</code> retain their human-readable output.</p>
           <nav class="command-index" aria-label="Command overview">
             <a href="#run"><code>silo run</code><span>Open a session or run a command.</span></a>
+            <a href="#persistent"><code>silo start / stop</code><span>Control a persistent shared container.</span></a>
             <a href="#image"><code>silo image build</code><span>Build the workspace image.</span></a>
             <a href="#config"><code>silo config</code><span>Inspect and manage configuration.</span></a>
             <a href="#containers"><code>silo containers</code><span>Inspect or delete Silo containers.</span></a>
@@ -93,6 +94,31 @@ silo run --cpus 8 --memory 12G -- cargo build
 silo run --sudo -- apt-get update</code></pre>
           <div class="note"><p>The separator is required: use <code>silo run -- cargo test</code>, not <code>silo run cargo test</code>.</p></div>
           <div class="note"><p>CPU, memory, and sudo access are container creation settings. Silo joins an already-running shared container without comparing or applying these overrides. The settings take effect after the container is recreated.</p></div>
+        </section>
+
+        <section id="persistent">
+          <h2><a href="#persistent">Keep a shared container running</a></h2>
+          <div class="command-block">
+            <div class="command-block-heading"><h3><code>silo start</code></h3><span>Persistent lifecycle command</span></div>
+            <pre class="command-usage"><code>silo start [--cpus &lt;count&gt;] [--memory &lt;size&gt;] [--sudo]</code></pre>
+            <p>Starts the current project's shared container in the background and keeps it running between sessions. If a shared container is already running, this command promotes that instance without recreating it.</p>
+          </div>
+          <div class="command-block">
+            <div class="command-block-heading"><h3><code>silo stop</code></h3><span>Persistent lifecycle command</span></div>
+            <pre class="command-usage"><code>silo stop [--force]</code></pre>
+            <p>Stops the current project's shared container. The command succeeds when no container exists and does not remove configured managed state.</p>
+          </div>
+          <h3>Options</h3>
+          <dl class="option-list">
+            <div><dt><code>start --cpus &lt;count&gt;</code></dt><dd>Override the positive CPU count when creating a new container.</dd></div>
+            <div><dt><code>start --memory &lt;size&gt;</code></dt><dd>Override memory when creating a new container.</dd></div>
+            <div><dt><code>start --sudo</code></dt><dd>Enable passwordless sudo when creating a new container.</dd></div>
+            <div><dt><code>stop --force</code></dt><dd>Terminate active sessions instead of refusing to stop.</dd></div>
+          </dl>
+          <pre data-copy><code>silo start
+silo run -- cargo test
+silo stop</code></pre>
+          <p>Without <code>--force</code>, <code>silo stop</code> refuses to interrupt an active session or session handoff. As with <code>silo run</code>, creation overrides do not change an already-running container.</p>
         </section>
 
         <section id="image">

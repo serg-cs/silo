@@ -183,6 +183,46 @@ fn run_rejects_invalid_resource_overrides() {
 }
 
 #[test]
+fn start_accepts_shared_container_overrides() {
+    let Command::Start {
+        cpus: Some(cpus),
+        memory: Some(memory),
+        sudo: true,
+    } = parse(&["silo", "start", "--cpus", "4", "--memory", "8G", "--sudo"])
+    else {
+        panic!("expected start command with creation overrides");
+    };
+
+    assert_eq!(cpus.get(), 4);
+    assert_eq!(memory, "8G");
+}
+
+#[test]
+fn start_rejects_session_only_arguments_and_invalid_overrides() {
+    for arguments in [
+        &["silo", "start", "--isolated"][..],
+        &["silo", "start", "--", "true"][..],
+        &["silo", "start", "--cpus", "0"][..],
+        &["silo", "start", "--memory", "  "][..],
+    ] {
+        assert!(Cli::try_parse_from(arguments).is_err(), "{arguments:?}");
+    }
+}
+
+#[test]
+fn stop_parses_only_force() {
+    assert!(matches!(
+        parse(&["silo", "stop"]),
+        Command::Stop { force: false }
+    ));
+    assert!(matches!(
+        parse(&["silo", "stop", "--force"]),
+        Command::Stop { force: true }
+    ));
+    assert!(Cli::try_parse_from(["silo", "stop", "project"]).is_err());
+}
+
+#[test]
 fn run_flags_after_double_dash_are_command_arguments() {
     let Command::Run {
         cpus: None,
@@ -283,6 +323,8 @@ fn unknown_first_token_is_a_quick_command() {
 #[test]
 fn builtin_subcommands_win_over_quick_commands() {
     assert!(matches!(parse(&["silo", "run"]), Command::Run { .. }));
+    assert!(matches!(parse(&["silo", "start"]), Command::Start { .. }));
+    assert!(matches!(parse(&["silo", "stop"]), Command::Stop { .. }));
     assert!(matches!(
         parse(&["silo", "image", "build"]),
         Command::Image { .. }

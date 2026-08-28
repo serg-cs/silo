@@ -118,6 +118,60 @@ fn guest_lifecycle_blocks_stop_while_sessions_overlap() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn guest_lifecycle_persistence_keeps_an_idle_container_running() {
+    let dir = test_dir("guest-persistence");
+    let runtime = dir.path().join("runtime");
+    let script = dir.path().join("silo-lifecycle");
+    fs::write(&script, LIFECYCLE).expect("lifecycle script writes");
+    fs::create_dir_all(runtime.join("reservations")).expect("reservation directory creates");
+
+    let mut supervisor = Command::new("sh")
+        .arg(&script)
+        .arg("init")
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .spawn()
+        .expect("supervisor starts");
+    let reservation = Command::new("sh")
+        .arg(&script)
+        .arg("reserve")
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("reservation runs");
+    assert!(reservation.status.success());
+    let token = String::from_utf8(reservation.stdout)
+        .expect("token is UTF-8")
+        .trim()
+        .to_string();
+    let persisted = Command::new("sh")
+        .arg(&script)
+        .args(["persist", &token])
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .status()
+        .expect("persistence handoff runs");
+    assert!(persisted.success());
+
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        supervisor.try_wait().expect("supervisor polls").is_none(),
+        "persistent supervisor exited while idle"
+    );
+
+    fs::remove_file(runtime.join("persistent")).expect("persistence marker removes");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if supervisor.try_wait().expect("supervisor polls").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "supervisor did not exit after unpinning"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn guest_stop_guard_rejects_live_reservations_and_prunes_expired_ones() {
     let dir = test_dir("guest-reservations");
     let runtime = dir.path().join("runtime");

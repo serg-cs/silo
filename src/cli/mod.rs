@@ -45,6 +45,24 @@ pub(crate) enum Command {
         #[arg(value_name = "COMMAND", last = true)]
         command: Vec<OsString>,
     },
+    /// Start the shared container for the current project in the background.
+    Start {
+        /// Override the number of CPUs allocated to the container.
+        #[arg(long)]
+        cpus: Option<NonZeroUsize>,
+        /// Override the memory allocated to the container (for example `4G`).
+        #[arg(long, value_parser = parse_memory)]
+        memory: Option<String>,
+        /// Grant passwordless sudo access to the Silo user.
+        #[arg(long)]
+        sudo: bool,
+    },
+    /// Stop the shared container for the current project.
+    Stop {
+        /// Terminate active sessions while stopping the container.
+        #[arg(long)]
+        force: bool,
+    },
     /// List and manage Silo containers.
     Containers {
         #[command(subcommand)]

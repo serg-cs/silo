@@ -60,6 +60,18 @@ fn try_run(cli: Cli) -> anyhow::Result<ExitCode> {
             )?;
             container::run_session(&config, &project, &command, isolated)
         }
+        Command::Start { cpus, memory, sudo } => {
+            let (project, config) = load_project_config(
+                cpus.map(std::num::NonZeroUsize::get),
+                memory.as_deref(),
+                sudo,
+            )?;
+            container::start_shared_container(&config, &project)
+        }
+        Command::Stop { force } => {
+            let project = project::Project::current()?;
+            container::stop_project_container(&project, force)
+        }
         Command::Quick(args) => {
             let (project, config) = load_project_config(None, None, false)?;
             let command = quick_command(&config, &args)?;

@@ -12,13 +12,16 @@ use serde::Serialize;
 
 use super::inventory::{
     ContainerInfo, container_inventory, delete_stopped_container, revalidate_selected_container,
+    shared_container_info,
 };
 use super::runtime::{CONFLICT_RETRY_INTERVAL, CONFLICT_RETRY_TIMEOUT, ContainerLifecycle};
 use crate::apple::{
-    CONTAINER_BIN, ContainerState, container_not_found, force_delete_container, spawn_error,
+    CONTAINER_BIN, ContainerState, container_not_found, force_delete_container, inspect_container,
+    spawn_error,
 };
 use crate::image::runtime_contract::LIFECYCLE;
 use crate::output::{tsv_field, write_json, write_stdout};
+use crate::project::Project;
 
 #[derive(Serialize)]
 struct ContainerOutput<'a> {
@@ -59,6 +62,16 @@ pub(crate) fn delete_selected_container(selector: &str, force: bool) -> Result<E
     } else {
         delete_stopped_container(container)?;
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Stops the current project's shared container without selecting other projects.
+pub(crate) fn stop_project_container(project: &Project, force: bool) -> Result<ExitCode> {
+    let Some(inspection) = inspect_container(&project.id)? else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let container = shared_container_info(project, &inspection)?;
+    stop_selected_container(&container, force)?;
     Ok(ExitCode::SUCCESS)
 }
 
