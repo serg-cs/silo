@@ -1,5 +1,4 @@
 use std::cell::Cell;
-use std::ffi::OsStr;
 
 use super::*;
 
@@ -222,7 +221,7 @@ fn session_commands_use_the_consolidated_guest_lifecycle() {
 }
 
 #[test]
-fn resource_and_shell_validation_remain_strict() {
+fn resource_validation_remains_strict() {
     assert!(
         crate::container::runtime::validate_config(
             &Container {
@@ -233,14 +232,40 @@ fn resource_and_shell_validation_remain_strict() {
         )
         .is_err()
     );
-    assert_eq!(
-        resolve_shell(Some(Shell::Fish), Some(OsStr::new("/bin/bash"))),
-        Shell::Fish
-    );
-    assert_eq!(
-        resolve_shell(None, Some(OsStr::new("/bin/unknown"))),
-        Shell::Zsh
-    );
+}
+
+#[test]
+fn sessions_launch_selected_shell_or_explicit_command_without_setting_shell_env() {
+    let project = test_project("/tmp/project");
+    for (shell, path) in [
+        (Shell::Bash, BASH_PATH),
+        (Shell::Zsh, ZSH_PATH),
+        (Shell::Fish, FISH_PATH),
+        (Shell::Nu, NU_PATH),
+    ] {
+        for user_command in [
+            vec![],
+            vec![OsString::from("echo"), OsString::from("$SHELL")],
+        ] {
+            let isolated = isolated_create_command(
+                &ConfigMounts::default(),
+                &Container::default(),
+                &user_command,
+                shell,
+            )
+            .expect("isolated command builds");
+            let shared = exec_command(false, &project, "abc123", &user_command, shell);
+            for command in [&isolated, &shared] {
+                let args = args_without_labels(command);
+                assert!(!args.iter().any(|arg| arg.starts_with("SHELL=")));
+                if user_command.is_empty() {
+                    assert_eq!(args.last(), Some(&path));
+                } else {
+                    assert!(args.ends_with(&["echo", "$SHELL"]));
+                }
+            }
+        }
+    }
 }
 
 #[test]

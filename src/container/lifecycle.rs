@@ -24,7 +24,7 @@ use super::process::{SavedTerminal, install_signal_handlers, wait_for_child};
 use super::runtime::{
     CONFLICT_RETRY_INTERVAL, CONFLICT_RETRY_TIMEOUT, ContainerLifecycle, GUEST_READY_TIMEOUT,
     HostIds, LaunchSpec, exec_command, host_ids, isolated_container_id, isolated_create_command,
-    isolated_owner_pid, isolated_start_command, owner_alive, resolve_shell, shared_create_command,
+    isolated_owner_pid, isolated_start_command, owner_alive, shared_create_command,
 };
 use crate::apple::{
     CONTAINER_BIN, ContainerInspection, ContainerState, exit_code, force_delete_container,
@@ -50,7 +50,7 @@ pub(crate) fn run_session(
     command: &[OsString],
     isolated: bool,
 ) -> Result<ExitCode> {
-    let shell = resolve_shell(config.shell, std::env::var_os("SHELL").as_deref());
+    let shell = config.shell.unwrap_or(Shell::Zsh);
     if isolated {
         let image = image::reference(config)?;
         image::require_digest(&image)?;

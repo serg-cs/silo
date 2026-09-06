@@ -49,7 +49,7 @@ fn isolated_command_applies_runtime_contract_and_user_command() {
             .any(|args| args == ["--cpus", "4", "--memory", "8G"])
     );
     assert!(args.contains(&"SILO_SUDO=1"));
-    assert!(args.contains(&"SHELL=/home/linuxbrew/.linuxbrew/bin/fish"));
+    assert!(!args.iter().any(|arg| arg.starts_with("SHELL=")));
     assert!(args.ends_with(&[TEST_IMAGE, "codex", "--quiet"]));
 }
 

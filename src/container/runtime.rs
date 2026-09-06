@@ -1,7 +1,7 @@
 //! Container identity and command construction above Apple's runtime adapter.
 
 use std::collections::BTreeSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::process::Command;
@@ -17,8 +17,6 @@ use crate::image::runtime_contract::{
     append_runtime_contract,
 };
 use crate::project::{CONTAINER_NAME_PREFIX, Project};
-
-const DEFAULT_SHELL: Shell = Shell::Zsh;
 
 pub(super) const LABEL_OWNER: &str = "dev.silo.owner";
 pub(super) const LABEL_PROJECT_ROOT: &str = "dev.silo.project-root";
@@ -170,7 +168,6 @@ pub(super) fn isolated_create_command(
         run.arg("-t");
     }
     append_launch_contract(&mut run, launch)?;
-    run.arg("--env").arg(format!("SHELL={}", shell.path()));
     run.arg(launch.image);
     if command.is_empty() {
         run.arg(shell.path());
@@ -325,10 +322,7 @@ pub(super) fn exec_command(
         .arg("silo")
         .arg("--workdir")
         .arg(&project.workdir);
-    exec.arg("--env")
-        .arg(format!("HOME={CONTAINER_HOME}"))
-        .arg("--env")
-        .arg(format!("SHELL={}", shell.path()));
+    exec.arg("--env").arg(format!("HOME={CONTAINER_HOME}"));
     exec.arg(&project.id);
     exec.arg(LIFECYCLE_COMMAND).arg("session").arg(reservation);
     if command.is_empty() {
@@ -348,21 +342,4 @@ impl Shell {
             Self::Nu => NU_PATH,
         }
     }
-}
-
-/// Selects the configured shell, otherwise mirrors a supported host shell by
-/// executable name. Unknown, missing, and non-UTF-8 host values use Zsh.
-pub(super) fn resolve_shell(configured: Option<Shell>, host_shell: Option<&OsStr>) -> Shell {
-    configured.unwrap_or_else(|| {
-        let name = host_shell
-            .and_then(|shell| Path::new(shell).file_name())
-            .and_then(OsStr::to_str);
-        match name {
-            Some("bash") => Shell::Bash,
-            Some("zsh") => Shell::Zsh,
-            Some("fish") => Shell::Fish,
-            Some("nu") => Shell::Nu,
-            _ => DEFAULT_SHELL,
-        }
-    })
 }

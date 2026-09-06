@@ -50,7 +50,7 @@
           <p>Silo then builds one derivative. Without <code>image.dockerfile</code>, the embedded extras Dockerfile produces <code>silo:latest</code> with:</p>
           <ul>
             <li>Codex, Claude Code, and many other coding-agent CLIs.</li>
-            <li>Bash, Zsh, Fish, and Nushell, with the host's supported <code>$SHELL</code> mirrored automatically and Zsh as the fallback.</li>
+            <li>Bash, Zsh, Fish, and Nushell, with Zsh used by default and the <code>shell</code> configuration option selecting another shell.</li>
             <li>Rust, Node.js, Python, <code>uv</code>, Ruff, Playwright with Chromium, GitHub CLI, Jujutsu, and common linters.</li>
             <li>Practical terminal tools including Ripgrep, fd, fzf, jq, just, tmux, Helix, Vim, lazygit, Yazi, and Zoxide.</li>
           </ul>
