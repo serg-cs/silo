@@ -45,7 +45,7 @@ fn build_commands_pull_only_the_runtime_base() {
     let base = build_command(
         Path::new("/tmp/Dockerfile"),
         Path::new("/tmp/context"),
-        BASE_IMAGE_TAG,
+        BASE_STAGING_IMAGE_TAG,
         true,
         BuildCache::Disabled,
         &build_args,
@@ -58,7 +58,7 @@ fn build_commands_pull_only_the_runtime_base() {
             "--file",
             "/tmp/Dockerfile",
             "--tag",
-            "silo-base:latest",
+            BASE_STAGING_IMAGE_TAG,
             "--pull",
             "--no-cache",
         ]
@@ -128,6 +128,91 @@ fn maintenance_commands_target_global_apple_storage() {
         command_args(&image_tag_command(STAGING_IMAGE_TAG, DEFAULT_IMAGE_TAG)),
         ["image", "tag", "silo-build:staging", "silo:latest"]
     );
+}
+
+#[test]
+fn either_candidate_failing_prevents_all_publication() {
+    for fail_base in [true, false] {
+        for execution_error in [true, false] {
+            let derivative_attempted = Cell::new(false);
+            let published = Cell::new(false);
+            let failure = || {
+                if execution_error {
+                    Err(anyhow!("runtime unavailable"))
+                } else {
+                    Ok(ExitCode::from(23))
+                }
+            };
+            let result = run_image_publication(
+                || {
+                    if fail_base {
+                        failure()
+                    } else {
+                        Ok(ExitCode::SUCCESS)
+                    }
+                },
+                || {
+                    derivative_attempted.set(true);
+                    failure()
+                },
+                || {
+                    published.set(true);
+                    Ok(())
+                },
+            );
+            assert_eq!(derivative_attempted.get(), !fail_base);
+            assert!(!published.get());
+            if execution_error {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("runtime unavailable")
+                );
+            } else {
+                assert_eq!(result.unwrap(), ExitCode::from(23));
+            }
+        }
+    }
+}
+
+#[test]
+fn publication_waits_for_both_validated_candidates_and_preserves_errors() {
+    for publication_error in [false, true] {
+        let events = RefCell::new(Vec::new());
+        let result = run_image_publication(
+            || {
+                events.borrow_mut().push("base-ready");
+                Ok(ExitCode::SUCCESS)
+            },
+            || {
+                events.borrow_mut().push("derivative-ready");
+                Ok(ExitCode::SUCCESS)
+            },
+            || {
+                events.borrow_mut().push("publish");
+                if publication_error {
+                    Err(anyhow!("publication failed"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(
+            *events.borrow(),
+            ["base-ready", "derivative-ready", "publish"]
+        );
+        if publication_error {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("publication failed")
+            );
+        } else {
+            assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        }
+    }
 }
 
 #[test]

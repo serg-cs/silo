@@ -26,7 +26,8 @@ use crate::image::runtime_contract::{RUNTIME_ASSETS, append_runtime_contract};
 use crate::storage::{Lock, effective_uid, ensure_owned_private_directory};
 
 const BUILD_LOCK_PARENT: &str = "/tmp";
-/// Scratch tag protected by the user-global build lock.
+/// Scratch tags protected by the user-global build lock.
+const BASE_STAGING_IMAGE_TAG: &str = "silo-build:base-staging";
 const STAGING_IMAGE_TAG: &str = "silo-build:staging";
 const IMAGE_SMOKE_COMMAND: &str = r#"set -eu
 test "$(id -un)" = silo
@@ -102,13 +103,13 @@ impl BuildDir {
     }
 }
 
-/// Removes the staging reference after publication or validation failure.
-struct StagedImage;
+/// Removes the staging reference after success or any ordinary failure.
+struct StagedImage(&'static str);
 
 impl Drop for StagedImage {
     fn drop(&mut self) {
         if let Err(err) = execute_maintenance(
-            image_delete_command(STAGING_IMAGE_TAG),
+            image_delete_command(self.0),
             "remove the temporary image tag",
         ) {
             eprintln!("warning: image staging cleanup failed: {err:#}");
@@ -153,27 +154,54 @@ fn build_configured_image(config: &Config, target: &str) -> Result<ExitCode> {
     }
     let build_args = runtime_asset_build_args();
 
-    // Publish the base as a stable user-visible output. The derivative reuses
-    // this invocation's cached base stage without resolving the published tag.
-    let base = build_and_publish_image(
-        &build_dir.base_dockerfile(),
-        build_dir.path(),
-        BASE_IMAGE_TAG,
-        true,
-        BuildCache::Disabled,
-        &build_args,
-    )?;
-    if base != ExitCode::SUCCESS {
-        return Ok(base);
-    }
-
-    build_and_publish_image(
-        &build_dir.derivative_dockerfile(),
-        context,
-        target,
-        false,
-        BuildCache::Reuse,
-        &build_args,
+    // Keep both candidates alive until publication. The derivative uses the
+    // cached internal base stage, so it does not need the stable base tag updated.
+    let _base = StagedImage(BASE_STAGING_IMAGE_TAG);
+    let _derivative = StagedImage(STAGING_IMAGE_TAG);
+    run_image_publication(
+        || {
+            build_and_validate_image(
+                build_command(
+                    &build_dir.base_dockerfile(),
+                    build_dir.path(),
+                    BASE_STAGING_IMAGE_TAG,
+                    true,
+                    BuildCache::Disabled,
+                    &build_args,
+                ),
+                BASE_STAGING_IMAGE_TAG,
+                BASE_IMAGE_TAG,
+            )
+        },
+        || {
+            build_and_validate_image(
+                build_command(
+                    &build_dir.derivative_dockerfile(),
+                    context,
+                    STAGING_IMAGE_TAG,
+                    false,
+                    BuildCache::Reuse,
+                    &build_args,
+                ),
+                STAGING_IMAGE_TAG,
+                target,
+            )
+        },
+        || {
+            execute_maintenance(
+                image_tag_command(BASE_STAGING_IMAGE_TAG, BASE_IMAGE_TAG),
+                &format!("publish image `{BASE_IMAGE_TAG}`"),
+            )?;
+            execute_maintenance(
+                image_tag_command(STAGING_IMAGE_TAG, target),
+                &format!("publish image `{target}`"),
+            )
+            .with_context(|| {
+                format!(
+                    "derivative publication failed; `{BASE_IMAGE_TAG}` has already been published"
+                )
+            })
+        },
     )
 }
 
@@ -183,41 +211,41 @@ fn write_build_context(build_dir: &BuildDir) -> Result<()> {
         .context("failed to write base Dockerfile")
 }
 
-/// Builds and smoke-tests a temporary image before replacing its stable tag.
-fn build_and_publish_image(
-    dockerfile: &Path,
-    context: &Path,
+/// Builds and smoke-tests a candidate without changing its stable tag.
+fn build_and_validate_image(
+    mut command: Command,
+    staging_tag: &str,
     target: &str,
-    pull: bool,
-    cache: BuildCache,
-    build_args: &[String],
 ) -> Result<ExitCode> {
     // A prior interrupted build may have left this Silo-owned scratch tag.
-    let _ = image_delete_command(STAGING_IMAGE_TAG).status();
-    let status = execute_build(&mut build_command(
-        dockerfile,
-        context,
-        STAGING_IMAGE_TAG,
-        pull,
-        cache,
-        build_args,
-    ))?;
+    let _ = image_delete_command(staging_tag).status();
+    let status = execute_build(&mut command)?;
     if status != ExitCode::SUCCESS {
         return Ok(status);
     }
-    let staged = StagedImage;
-
-    let check = execute(&mut image_runtime_check_command(STAGING_IMAGE_TAG))?;
-    if check != ExitCode::SUCCESS {
+    if execute(&mut image_runtime_check_command(staging_tag))? != ExitCode::SUCCESS {
         return Err(anyhow!(
             "built image for `{target}` failed Silo's startup check; keep the inherited Silo user, entrypoint, helpers, and supported shells available"
         ));
     }
-    execute_maintenance(
-        image_tag_command(STAGING_IMAGE_TAG, target),
-        &format!("publish image `{target}`"),
-    )?;
-    drop(staged);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Neither stable tag is published until both candidates build and validate.
+fn run_image_publication(
+    base: impl FnOnce() -> Result<ExitCode>,
+    derivative: impl FnOnce() -> Result<ExitCode>,
+    publish: impl FnOnce() -> Result<()>,
+) -> Result<ExitCode> {
+    let status = base()?;
+    if status != ExitCode::SUCCESS {
+        return Ok(status);
+    }
+    let status = derivative()?;
+    if status != ExitCode::SUCCESS {
+        return Ok(status);
+    }
+    publish()?;
     Ok(ExitCode::SUCCESS)
 }
 
