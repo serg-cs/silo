@@ -108,10 +108,7 @@ struct StagedImage(&'static str);
 
 impl Drop for StagedImage {
     fn drop(&mut self) {
-        if let Err(err) = execute_maintenance(
-            image_delete_command(self.0),
-            "remove the temporary image tag",
-        ) {
+        if let Err(err) = remove_staged_image(self.0) {
             eprintln!("warning: image staging cleanup failed: {err:#}");
         }
     }
@@ -218,7 +215,7 @@ fn build_and_validate_image(
     target: &str,
 ) -> Result<ExitCode> {
     // A prior interrupted build may have left this Silo-owned scratch tag.
-    let _ = image_delete_command(staging_tag).status();
+    remove_staged_image(staging_tag)?;
     let status = execute_build(&mut command)?;
     if status != ExitCode::SUCCESS {
         return Ok(status);
@@ -334,10 +331,47 @@ fn image_tag_command(source: &str, target: &str) -> Command {
     command
 }
 
-fn image_delete_command(image: &str) -> Command {
+fn remove_staged_image(image: &str) -> Result<()> {
+    let output = Command::new(CONTAINER_BIN)
+        .args(["image", "inspect", image])
+        .output()
+        .map_err(spawn_error)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if super::image_not_found(&stderr, image) {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "could not inspect staging image `{image}` for cleanup: {}",
+            stderr.trim()
+        ));
+    }
+    if let Some(command) = image_delete_command(image, &output.stdout)? {
+        execute_maintenance(command, "remove the temporary image tag")?;
+    }
+    Ok(())
+}
+
+fn image_delete_command(image: &str, inspection: &[u8]) -> Result<Option<Command>> {
+    // Apple resolves absent staging names through retained build annotations,
+    // possibly selecting a published image. Only delete the actual staging tag.
+    let inspection: serde_json::Value = serde_json::from_slice(inspection)
+        .context("could not parse staging image inspection; leaving it untouched")?;
+    let resolved = inspection
+        .pointer("/0/configuration/name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "staging image inspection did not contain configuration.name; leaving it untouched"
+            )
+        })?;
+    // `container build` keeps these short tags; it does not add a registry.
+    if resolved != image {
+        return Ok(None);
+    }
     let mut command = Command::new(CONTAINER_BIN);
     command.args(["image", "delete", "--force", image]);
-    command
+    Ok(Some(command))
 }
 
 fn image_runtime_check_command(image: &str) -> Command {

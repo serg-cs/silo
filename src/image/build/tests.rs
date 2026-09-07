@@ -131,6 +131,33 @@ fn maintenance_commands_target_global_apple_storage() {
 }
 
 #[test]
+fn staging_deletion_rejects_published_aliases() {
+    for (staging, stable) in [
+        (BASE_STAGING_IMAGE_TAG, BASE_IMAGE_TAG),
+        (STAGING_IMAGE_TAG, DEFAULT_IMAGE_TAG),
+        (STAGING_IMAGE_TAG, "silo:custom-example"),
+    ] {
+        // Builds keep their short tag; publication adds the registry prefix.
+        for reference in [
+            staging.to_string(),
+            format!("registry-1.docker.io/library/{stable}"),
+            format!("docker.io/library/{staging}"),
+        ] {
+            let inspection = serde_json::json!([{"configuration": {
+                "name": reference,
+                "descriptor": {"annotations": {
+                    "com.apple.containerization.image.name": staging
+                }}
+            }}]);
+            let command = image_delete_command(staging, inspection.to_string().as_bytes()).unwrap();
+            assert_eq!(command.is_some(), reference == staging);
+        }
+    }
+    assert!(image_delete_command(STAGING_IMAGE_TAG, b"[]").is_err());
+    assert!(image_delete_command(STAGING_IMAGE_TAG, b"not json").is_err());
+}
+
+#[test]
 fn either_candidate_failing_prevents_all_publication() {
     for fail_base in [true, false] {
         for execution_error in [true, false] {
