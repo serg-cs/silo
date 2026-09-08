@@ -56,22 +56,94 @@ pub(super) fn wait_for_child(child: &mut Child) -> Result<ExitStatus> {
 }
 
 /// Terminal state captured before an interactive container child starts.
-pub(super) struct SavedTerminal(libc::termios);
+///
+/// `O_NONBLOCK` lives on the open file description and is outside termios.
+pub(super) struct SavedTerminal {
+    termios: libc::termios,
+    stdio_flags: [Option<libc::c_int>; 3],
+}
 
 impl SavedTerminal {
-    /// Captures stdin's state, or returns `None` when stdin is not a terminal.
+    /// Captures stdin's terminal state, or returns `None` when stdin is not a terminal.
     pub(super) fn capture() -> Option<Self> {
         let mut attrs = std::mem::MaybeUninit::<libc::termios>::uninit();
-        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, attrs.as_mut_ptr()) } == 0 {
-            Some(Self(unsafe { attrs.assume_init() }))
-        } else {
-            None
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, attrs.as_mut_ptr()) } != 0 {
+            return None;
         }
+        Some(Self {
+            termios: unsafe { attrs.assume_init() },
+            stdio_flags: [
+                stdio_flags(libc::STDIN_FILENO),
+                stdio_flags(libc::STDOUT_FILENO),
+                stdio_flags(libc::STDERR_FILENO),
+            ],
+        })
     }
 
     /// Restores the captured terminal state on a best-effort basis.
     pub(super) fn restore(&self) {
         // Reapplying the state after a normal child exit is harmless.
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const self.0) };
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const self.termios) };
+        for (fd, flags) in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
+            .into_iter()
+            .zip(self.stdio_flags)
+        {
+            if let Some(flags) = flags {
+                restore_stdio_flags(fd, flags);
+            }
+        }
+    }
+}
+
+fn stdio_flags(fd: libc::c_int) -> Option<libc::c_int> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    (flags != -1).then_some(flags)
+}
+
+fn restore_stdio_flags(fd: libc::c_int, flags: libc::c_int) {
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{restore_stdio_flags, stdio_flags};
+
+    fn pipe_fds() -> [libc::c_int; 2] {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        fds
+    }
+
+    fn close(fd: libc::c_int) {
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+
+    #[test]
+    fn restore_clears_nonblocking_stdio_flags() {
+        let [read, write] = pipe_fds();
+        let original = stdio_flags(read).expect("pipe flags are readable");
+        assert_eq!(
+            original & libc::O_NONBLOCK,
+            0,
+            "pipes start in blocking mode"
+        );
+
+        assert_eq!(
+            unsafe { libc::fcntl(read, libc::F_SETFL, original | libc::O_NONBLOCK) },
+            0
+        );
+        assert_ne!(
+            stdio_flags(read).expect("pipe flags are readable") & libc::O_NONBLOCK,
+            0
+        );
+
+        restore_stdio_flags(read, original);
+        assert_eq!(
+            stdio_flags(read).expect("pipe flags are readable") & libc::O_NONBLOCK,
+            0
+        );
+
+        close(read);
+        close(write);
     }
 }
