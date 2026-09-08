@@ -123,7 +123,6 @@ fn maintenance_commands_target_global_apple_storage() {
         command_args(&builder_delete_command()),
         ["builder", "delete", "--force"]
     );
-    assert_eq!(command_args(&image_prune_command()), ["image", "prune"]);
     assert_eq!(
         command_args(&image_tag_command(STAGING_IMAGE_TAG, DEFAULT_IMAGE_TAG)),
         ["image", "tag", "silo-build:staging", "silo:latest"]
@@ -155,6 +154,79 @@ fn staging_deletion_rejects_published_aliases() {
     }
     assert!(image_delete_command(STAGING_IMAGE_TAG, b"[]").is_err());
     assert!(image_delete_command(STAGING_IMAGE_TAG, b"not json").is_err());
+}
+
+#[test]
+fn superseded_deletion_only_removes_the_reclaim_tag_for_the_replaced_digest() {
+    const PREVIOUS: &str = "sha256:old-silo-image";
+    const CURRENT: &str = "sha256:new-silo-image";
+    let matching = serde_json::json!([{
+        "configuration": {
+            "name": OBSOLETE_IMAGE_TAG,
+            "descriptor": {"digest": PREVIOUS}
+        }
+    }])
+    .to_string();
+
+    let command =
+        superseded_image_delete_command(OBSOLETE_IMAGE_TAG, PREVIOUS, matching.as_bytes())
+            .expect("replaced reclaim tag is eligible")
+            .expect("delete command is produced");
+    assert_eq!(
+        command_args(&command),
+        ["image", "delete", "--force", OBSOLETE_IMAGE_TAG]
+    );
+
+    for stored in [
+        format!("registry-1.docker.io/library/{OBSOLETE_IMAGE_TAG}"),
+        format!("docker.io/library/{OBSOLETE_IMAGE_TAG}"),
+    ] {
+        let inspection = serde_json::json!([{
+            "configuration": {
+                "name": stored.as_str(),
+                "descriptor": {"digest": PREVIOUS}
+            }
+        }]);
+        let command = superseded_image_delete_command(
+            OBSOLETE_IMAGE_TAG,
+            PREVIOUS,
+            inspection.to_string().as_bytes(),
+        )
+        .expect("normalized reclaim tag is eligible")
+        .expect("delete command uses the stored name");
+        assert_eq!(
+            command_args(&command),
+            ["image", "delete", "--force", stored.as_str()]
+        );
+    }
+
+    for (name, digest) in [
+        (OBSOLETE_IMAGE_TAG.to_string(), CURRENT),
+        (DEFAULT_IMAGE_TAG.to_string(), PREVIOUS),
+        (
+            format!("registry-1.docker.io/library/{DEFAULT_IMAGE_TAG}"),
+            PREVIOUS,
+        ),
+    ] {
+        let inspection = serde_json::json!([{
+            "configuration": {
+                "name": name,
+                "descriptor": {"digest": digest}
+            }
+        }]);
+        assert!(
+            superseded_image_delete_command(
+                OBSOLETE_IMAGE_TAG,
+                PREVIOUS,
+                inspection.to_string().as_bytes()
+            )
+            .expect("mismatched inspect is left")
+            .is_none()
+        );
+    }
+
+    assert!(superseded_image_delete_command(OBSOLETE_IMAGE_TAG, PREVIOUS, b"[]").is_err());
+    assert!(superseded_image_delete_command(OBSOLETE_IMAGE_TAG, PREVIOUS, b"not json").is_err());
 }
 
 #[test]
@@ -299,25 +371,6 @@ fn build_lifecycle_reports_preflight_and_success_cleanup_failures() {
     assert!(error.to_string().contains("cleanup failed"));
 }
 
-#[test]
-fn cleanup_attempts_builder_and_image_reclamation() {
-    let events = RefCell::new(Vec::new());
-    let error = cleanup_build_storage_with(
-        || {
-            events.borrow_mut().push("builder");
-            Err(anyhow!("builder failed"))
-        },
-        || {
-            events.borrow_mut().push("images");
-            Err(anyhow!("images failed"))
-        },
-    )
-    .expect_err("both cleanup failures are reported");
-
-    assert_eq!(events.into_inner(), ["builder", "images"]);
-    assert!(error.to_string().contains("builder failed"));
-    assert!(error.to_string().contains("images failed"));
-}
 #[test]
 fn captured_stderr_is_forwarded_and_bounded() {
     let mut command = Command::new("sh");

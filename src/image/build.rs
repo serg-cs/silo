@@ -29,6 +29,8 @@ const BUILD_LOCK_PARENT: &str = "/tmp";
 /// Scratch tags protected by the user-global build lock.
 const BASE_STAGING_IMAGE_TAG: &str = "silo-build:base-staging";
 const STAGING_IMAGE_TAG: &str = "silo-build:staging";
+const OBSOLETE_BASE_IMAGE_TAG: &str = "silo-build:obsolete-base";
+const OBSOLETE_IMAGE_TAG: &str = "silo-build:obsolete";
 const IMAGE_SMOKE_COMMAND: &str = r#"set -eu
 test "$(id -un)" = silo
 test "${HOME:-}" = /home/silo
@@ -123,7 +125,7 @@ pub(crate) fn build(config: &Config) -> Result<ExitCode> {
     run_build_lifecycle(
         delete_builder,
         || build_configured_image(config, &target),
-        cleanup_build_storage,
+        delete_builder,
     )
 }
 fn build_configured_image(config: &Config, target: &str) -> Result<ExitCode> {
@@ -185,19 +187,42 @@ fn build_configured_image(config: &Config, target: &str) -> Result<ExitCode> {
             )
         },
         || {
-            execute_maintenance(
+            let previous_base = retain_previous_image(BASE_IMAGE_TAG, OBSOLETE_BASE_IMAGE_TAG)?;
+            let previous_target = retain_previous_image(target, OBSOLETE_IMAGE_TAG)?;
+            let published = execute_maintenance(
                 image_tag_command(BASE_STAGING_IMAGE_TAG, BASE_IMAGE_TAG),
                 &format!("publish image `{BASE_IMAGE_TAG}`"),
-            )?;
-            execute_maintenance(
-                image_tag_command(STAGING_IMAGE_TAG, target),
-                &format!("publish image `{target}`"),
             )
-            .with_context(|| {
-                format!(
-                    "derivative publication failed; `{BASE_IMAGE_TAG}` has already been published"
+            .and_then(|()| {
+                execute_maintenance(
+                    image_tag_command(STAGING_IMAGE_TAG, target),
+                    &format!("publish image `{target}`"),
                 )
-            })
+                .with_context(|| {
+                    format!(
+                        "derivative publication failed; `{BASE_IMAGE_TAG}` has already been published"
+                    )
+                })
+            });
+            let cleaned_base =
+                remove_reclaimed_image(OBSOLETE_BASE_IMAGE_TAG, previous_base.as_deref());
+            let cleaned_target =
+                remove_reclaimed_image(OBSOLETE_IMAGE_TAG, previous_target.as_deref());
+            match published {
+                Ok(()) => {
+                    cleaned_base?;
+                    cleaned_target
+                }
+                Err(err) => {
+                    if let Err(clean) = cleaned_base {
+                        eprintln!("warning: replaced image cleanup failed: {clean:#}");
+                    }
+                    if let Err(clean) = cleaned_target {
+                        eprintln!("warning: replaced image cleanup failed: {clean:#}");
+                    }
+                    Err(err)
+                }
+            }
         },
     )
 }
@@ -289,39 +314,9 @@ fn delete_builder() -> Result<()> {
     execute_maintenance(builder_delete_command(), "delete the global image builder")
 }
 
-fn prune_images() -> Result<()> {
-    execute_maintenance(image_prune_command(), "prune dangling images")
-}
-
-fn cleanup_build_storage() -> Result<()> {
-    cleanup_build_storage_with(delete_builder, prune_images)
-}
-
-fn cleanup_build_storage_with(
-    delete: impl FnOnce() -> Result<()>,
-    prune: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    let builder = delete();
-    let images = prune();
-    match (builder, images) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(builder), Ok(())) => Err(builder),
-        (Ok(()), Err(images)) => Err(images),
-        (Err(builder), Err(images)) => Err(anyhow!(
-            "could not delete the global image builder: {builder:#}; could not prune dangling images: {images:#}"
-        )),
-    }
-}
-
 fn builder_delete_command() -> Command {
     let mut command = Command::new(CONTAINER_BIN);
     command.args(["builder", "delete", "--force"]);
-    command
-}
-
-fn image_prune_command() -> Command {
-    let mut command = Command::new(CONTAINER_BIN);
-    command.args(["image", "prune"]);
     command
 }
 
@@ -329,6 +324,92 @@ fn image_tag_command(source: &str, target: &str) -> Command {
     let mut command = Command::new(CONTAINER_BIN);
     command.args(["image", "tag", source, target]);
     command
+}
+
+fn current_image_digest(image: &str) -> Result<Option<String>> {
+    let (digest, stderr) = probe_image(image)?;
+    match digest {
+        Some(digest) => Ok(Some(digest)),
+        None if super::image_not_found(&stderr, image) => Ok(None),
+        None => Err(anyhow!(
+            "could not check for image `{image}`; `{CONTAINER_BIN} image inspect` reported:\n{stderr}"
+        )),
+    }
+}
+
+fn retain_previous_image(live_tag: &str, reclaim_tag: &str) -> Result<Option<String>> {
+    let Some(digest) = current_image_digest(live_tag)? else {
+        return Ok(None);
+    };
+    execute_maintenance(
+        image_tag_command(live_tag, reclaim_tag),
+        &format!("keep replaced image `{live_tag}` as `{reclaim_tag}`"),
+    )?;
+    Ok(Some(digest))
+}
+
+fn remove_reclaimed_image(reclaim_tag: &str, expected_digest: Option<&str>) -> Result<()> {
+    let Some(expected_digest) = expected_digest else {
+        return Ok(());
+    };
+    let output = Command::new(CONTAINER_BIN)
+        .args(["image", "inspect", reclaim_tag])
+        .output()
+        .map_err(spawn_error)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if super::image_not_found(&stderr, reclaim_tag) {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "could not inspect replaced image `{reclaim_tag}` for cleanup: {}",
+            stderr.trim()
+        ));
+    }
+    if let Some(command) =
+        superseded_image_delete_command(reclaim_tag, expected_digest, &output.stdout)?
+    {
+        execute_maintenance(command, "remove the replaced image")?;
+    }
+    Ok(())
+}
+
+fn superseded_image_delete_command(
+    reclaim_tag: &str,
+    expected_digest: &str,
+    inspection: &[u8],
+) -> Result<Option<Command>> {
+    let inspection: serde_json::Value = serde_json::from_slice(inspection)
+        .context("could not parse replaced image inspection; leaving it untouched")?;
+    let resolved_name = inspection
+        .pointer("/0/configuration/name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "replaced image inspection did not contain configuration.name; leaving it untouched"
+            )
+        })?;
+    let resolved_digest = inspection
+        .pointer("/0/configuration/descriptor/digest")
+        .and_then(serde_json::Value::as_str)
+        .filter(|digest| !digest.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "replaced image inspection did not contain an OCI image digest; leaving it untouched"
+            )
+        })?;
+    // `image tag` stores a registry-normalized name. Delete that stored
+    // reference only when it is still the reclaim tag and the replaced digest.
+    if !short_image_name_matches(resolved_name, reclaim_tag) || resolved_digest != expected_digest {
+        return Ok(None);
+    }
+    let mut command = Command::new(CONTAINER_BIN);
+    command.args(["image", "delete", "--force", resolved_name]);
+    Ok(Some(command))
+}
+
+fn short_image_name_matches(resolved: &str, short: &str) -> bool {
+    resolved == short || resolved.ends_with(&format!("/{short}"))
 }
 
 fn remove_staged_image(image: &str) -> Result<()> {
