@@ -33,7 +33,7 @@ const MAX_COMPOSED_DOCKERFILE_BYTES: usize = 16 * 1024;
 /// Runtime foundation embedded into the executable at compile time.
 const BASE_DOCKERFILE: &str = include_str!("assets/silo-base.dockerfile");
 
-/// Default agent and developer-tool layer built on the runtime foundation.
+/// Default small agent-ready workstation built on the runtime foundation.
 const EXTRAS_DOCKERFILE: &str = include_str!("assets/silo-extras.dockerfile");
 
 pub(crate) fn validate_config(config: &Config) -> Result<()> {

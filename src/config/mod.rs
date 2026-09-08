@@ -50,7 +50,7 @@ pub(crate) struct Config {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Image {
     /// Path to a Dockerfile with a literal `FROM silo-base:latest`; `None`
-    /// uses Silo's embedded development-extras layer.
+    /// uses Silo's embedded extras workstation.
     pub(crate) dockerfile: Option<PathBuf>,
 }
 

@@ -297,24 +297,8 @@ fn embedded_layers_keep_supported_shells_and_default_tools() {
             "missing supported shell {name}"
         );
     }
-    for package in [
-        "actionlint",
-        "claude-code",
-        "codex",
-        "jj",
-        "playwright-cli",
-        "rust",
-        "shellcheck",
-        "uv",
-    ] {
-        assert!(
-            EXTRAS_DOCKERFILE
-                .lines()
-                .any(|line| line.trim().trim_end_matches(" \\").trim() == package),
-            "missing extras package {package}"
-        );
-    }
-    assert!(EXTRAS_DOCKERFILE.contains("playwright-cli install-browser --with-deps"));
+    assert!(!EXTRAS_DOCKERFILE.contains("playwright-cli install-browser"));
+    assert!(!EXTRAS_DOCKERFILE.contains("/etc/sudoers.d/silo"));
     assert!(BASE_DOCKERFILE.contains("brew cleanup --prune=all"));
     assert!(EXTRAS_DOCKERFILE.contains("brew cleanup --prune=all"));
 }

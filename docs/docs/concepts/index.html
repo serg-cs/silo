@@ -49,12 +49,12 @@
           <p><code>silo image build</code> first creates <code>silo-base:latest</code>. This Ubuntu-based image owns the stable Silo contract: the <code>silo</code> user, supported shells, Homebrew, sudo, restricted SSH host-port tunnels, lifecycle helper, entrypoint, and required filesystem paths.</p>
           <p>Silo then builds one derivative. Without <code>image.dockerfile</code>, the embedded extras Dockerfile produces <code>silo:latest</code> with:</p>
           <ul>
-            <li>Codex, Claude Code, and many other coding-agent CLIs.</li>
-            <li>Bash, Zsh, Fish, and Nushell, with Zsh used by default and the <code>shell</code> configuration option selecting another shell.</li>
-            <li>Rust, Node.js, Python, <code>uv</code>, Ruff, Playwright with Chromium, GitHub CLI, Jujutsu, and common linters.</li>
-            <li>Practical terminal tools including Ripgrep, fd, fzf, jq, just, tmux, Helix, Vim, lazygit, Yazi, and Zoxide.</li>
+            <li>Codex and Claude Code.</li>
+            <li>Bash, Zsh, Fish, and Nushell from the base image, with Zsh used by default and the <code>shell</code> configuration option selecting another shell.</li>
+            <li>Node.js, GitHub CLI, and Jujutsu.</li>
+            <li>Everyday CLI tools including Ripgrep, fd, fzf, jq, bat, tmux, and Vim.</li>
           </ul>
-          <p>A configured Dockerfile replaces only the extras layer while preserving the base contract. Silo builds deliberately without a persistent cache and validates candidates before publication. See <a href="../how-it-works/#image-contract">image build and publication</a> for the exact base-and-extras, no-cache, staging, and cleanup behavior.</p>
+          <p>That extras layer is intentionally small. A configured Dockerfile replaces it while preserving the base contract; extra agents, language toolchains, browsers, and editors belong there. Silo builds deliberately without a persistent cache and validates candidates before publication. See <a href="../how-it-works/#image-contract">image build and publication</a> for the exact base-and-extras, no-cache, staging, and cleanup behavior.</p>
         </section>
 
         <section id="sessions">
@@ -109,7 +109,7 @@ USER silo
 # Add the project-specific tools you need here.
 RUN brew install go
 USER root</code></pre>
-          <p>Silo replaces that reference with an internal stage before building, which prevents any registry lookup for <code>silo-base:latest</code>. ARG-based base references and additional local stages are rejected. External images may still be used by instructions such as <code>COPY --from=registry.example/tools:latest</code>. Silo preserves the configured directory as the context and gives each Dockerfile, effective build context, and Dockerfile-specific ignore selection a deterministic local image tag. This keeps shared Dockerfile contents from colliding when projects supply different relative <code>COPY</code> inputs or ignore rules.</p>
+          <p>Silo replaces that reference with an internal stage before building, which prevents any registry lookup for <code>silo-base:latest</code>. ARG-based base references and additional local stages are rejected. External images may still be used by instructions such as <code>COPY --from=registry.example/tools:latest</code>. Silo preserves the configured directory as the context and gives each Dockerfile, effective build context, and Dockerfile-specific ignore selection a deterministic local image tag. This keeps shared Dockerfile contents from colliding when projects supply different relative <code>COPY</code> inputs or ignore rules. Because the custom Dockerfile replaces extras rather than extending them, reinstall any default extras you still want alongside project-specific tools.</p>
           <div class="warning"><p>A custom Dockerfile is trusted input. Keep the inherited <code>silo</code> user, entrypoint, lifecycle helpers, supported shells, and expected paths intact. Silo catches basic startup incompatibilities, but does not police permissions, links, package changes, or every way root-level build instructions can break later sessions.</p></div>
         </section>
 

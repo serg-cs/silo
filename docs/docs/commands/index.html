@@ -126,7 +126,7 @@ silo stop</code></pre>
           <div class="command-block">
             <div class="command-block-heading"><h3><code>silo image build</code></h3><span>Image command</span></div>
             <pre class="command-usage"><code>silo image build</code></pre>
-            <p>Build and validate the runtime base followed by the selected derivative. With no <code>image.dockerfile</code>, Silo publishes its embedded development-extras image as <code>silo:latest</code>; configured Dockerfiles receive a deterministic local tag.</p>
+            <p>Build and validate the runtime base followed by the selected derivative. With no <code>image.dockerfile</code>, Silo publishes its embedded extras image as <code>silo:latest</code>; configured Dockerfiles receive a deterministic local tag.</p>
           </div>
           <p>Silo starts Apple's container system when necessary and serializes concurrent Silo builds. See <a href="../how-it-works/#image-contract">image build and publication</a> for the authoritative no-cache, base-and-extras, staging, validation, and cleanup lifecycle.</p>
           <div class="warning"><p>The builder and dangling-image cleanup is user-global, not scoped to Silo-created build data. It force-deletes Apple's current builder and prunes every dangling image, so coordinate this command with any direct use of Apple Container. Builds also consume <code>ubuntu:latest</code>, Homebrew HEAD, and current formulae; identical Silo source is not guaranteed to rebuild identically later.</p></div>
