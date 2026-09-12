@@ -2,6 +2,7 @@
 
 # https://serg-cs.github.io/silo/docs/configuration/#image-options
 # image.dockerfile = "containers/Dockerfile"
+# image.dockerfile = "~/silo/Dockerfile"
 # container.cpus = 4
 # container.memory = "6G"
 # container.sudo = true

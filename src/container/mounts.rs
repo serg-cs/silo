@@ -11,6 +11,7 @@ use crate::config::{Config, Permission, valid_mount_name};
 use crate::host_ports;
 
 use crate::image::runtime_contract::{CONTAINER_HOME, RUNTIME_ASSETS};
+use crate::paths;
 use crate::project::shared_dir_name;
 use crate::storage::managed::{ManagedMount, StateOwner, ensure_managed_mount, managed_mount};
 
@@ -161,17 +162,18 @@ pub(super) fn resolve_configured_mounts(
     for (name, bind) in &config.binds {
         let dest = effective_target(&bind.target, &project_dir)
             .ok_or_else(|| anyhow!("bind or state entry `{name}` has no valid container target"))?;
-        let host = fs::canonicalize(expand_tilde(&bind.source, home)).with_context(|| {
+        let source = paths::resolve_host(&bind.source, project_root, home)?;
+        let host = fs::canonicalize(&source).with_context(|| {
             format!(
                 "cannot resolve source `{}` for bind `{name}` at `{}` (missing path or broken symlink?)",
-                bind.source.display(),
+                source.display(),
                 dest.display()
             )
         })?;
         if !host.is_dir() {
             return Err(anyhow!(
                 "source `{}` for bind `{name}` must be a directory",
-                bind.source.display()
+                source.display()
             ));
         }
         resolved.push(ConfiguredMount {
@@ -226,32 +228,7 @@ pub(super) fn resolve_configured_mounts(
 }
 
 fn effective_target(target: &Path, project_dir: &Path) -> Option<PathBuf> {
-    if target.is_absolute() {
-        return Some(target.to_path_buf());
-    }
-    let text = target.to_str()?;
-    text.strip_prefix("~/")
-        .map(|relative| Path::new(CONTAINER_HOME).join(relative))
-        .or_else(|| {
-            text.strip_prefix("./")
-                .map(|relative| project_dir.join(relative))
-        })
-}
-
-/// Expands a leading `~` in `path` to the home directory: `~` and `~/x`
-/// become `<home>` and `<home>/x`. Any other path (absolute, `~user`, plain
-/// relative) is returned unchanged. Without a known, non-empty home
-/// directory nothing is expanded, so an unset or empty `HOME` leaves the
-/// path relative and the later `canonicalize` fails loudly instead of
-/// resolving against the working directory.
-pub(super) fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
-    let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) else {
-        return path.to_path_buf();
-    };
-    match path.strip_prefix("~") {
-        Ok(rest) => home.join(rest),
-        Err(_) => path.to_path_buf(),
-    }
+    paths::container_target(target, Some(project_dir), Path::new(CONTAINER_HOME))
 }
 
 /// Places a normalized project-relative path below its container project
@@ -304,13 +281,7 @@ pub(super) fn validate_config(config: &Config) -> Result<()> {
 }
 
 fn context_independent_target(target: &Path) -> Option<PathBuf> {
-    if target.is_absolute() {
-        return Some(target.to_path_buf());
-    }
-    target
-        .to_str()?
-        .strip_prefix("~/")
-        .map(|relative| Path::new(CONTAINER_HOME).join(relative))
+    paths::container_target(target, None, Path::new(CONTAINER_HOME))
 }
 
 /// Resolves effective targets against the actual project destination before
@@ -410,17 +381,17 @@ pub(super) fn eligible_project_state(config: &Config, project_root: &Path) -> BT
 /// Omitting missing paths prevents the container runtime from creating them in
 /// the writable project bind. Home-relative and absolute targets are unaffected.
 fn project_state_target_exists(project_root: &Path, target: &Path) -> bool {
-    let Some(relative) = target.to_str().and_then(|target| target.strip_prefix("./")) else {
-        return true;
-    };
-    project_root.join(relative).is_dir()
+    match target.strip_prefix(".") {
+        Ok(relative) => project_root.join(relative).is_dir(),
+        Err(_) => true,
+    }
 }
 
 fn validate_host_path(name: &str, path: &Path) -> Result<()> {
     validate_mount_path(name, "source", path)?;
     ensure!(
-        path.is_absolute() || path.starts_with("~"),
-        "bind or state entry `{name}`: source path is not absolute and does not start with a bare `~`"
+        paths::is_host_source(path),
+        "bind or state entry `{name}`: source path uses unsupported `~user` expansion; use `~/...` for the current user"
     );
     Ok(())
 }

@@ -9,6 +9,7 @@ mod digest;
 mod host_ports;
 mod image;
 mod output;
+mod paths;
 mod project;
 mod storage;
 #[cfg(test)]

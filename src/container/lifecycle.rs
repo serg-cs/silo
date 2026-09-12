@@ -52,7 +52,7 @@ pub(crate) fn run_session(
 ) -> Result<ExitCode> {
     let shell = config.shell.unwrap_or(Shell::Zsh);
     if isolated {
-        let image = image::reference(config)?;
+        let image = image::reference(config, &project.root)?;
         image::require_digest(&image)?;
         if !config.host_ports.is_empty() {
             eprintln!(
@@ -430,7 +430,7 @@ fn ensure_shared_container(
                 let ids = host_ids();
                 let config_mounts =
                     resolve_config_mounts(config, &project.root, host_ports.as_ref())?;
-                let image = image::reference(config)?;
+                let image = image::reference(config, &project.root)?;
                 let image_digest = image::require_digest(&image)?;
                 let instance = instance_token(project);
                 let mount_lock = needs_mount_lock(&config_mounts.configured)

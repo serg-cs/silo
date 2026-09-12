@@ -44,7 +44,7 @@ fn try_run(cli: Cli) -> anyhow::Result<ExitCode> {
             let project_root = project::current_project_root()?;
             let config = load_config(&project_root, None, None, false)?;
             validate_config(&config, &project_root, ValidationProfile::Standard)?;
-            image::build(&config)
+            image::build(&config, &project_root)
         }
         Command::Run {
             isolated,
@@ -157,7 +157,7 @@ fn validate_config(
         profile,
         ValidationProfile::PostEdit | ValidationProfile::Check
     ) {
-        image::validate_config(config)?;
+        image::validate_config(config, project_root)?;
     }
     if matches!(profile, ValidationProfile::Check) {
         container::validate_project_filesystem(config, project_root)?;

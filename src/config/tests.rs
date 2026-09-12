@@ -14,9 +14,7 @@ fn parse_layers(global: &str, project: &str) -> Result<Config> {
     let builder = ConfigLoader::builder()
         .add_source(File::from_str(global, FileFormat::Toml))
         .add_source(File::from_str(project, FileFormat::Toml));
-    let mut config = builder.build()?.try_deserialize::<Config>()?;
-    config.resolve_paths(Path::new("/project"));
-    Ok(config)
+    Ok(builder.build()?.try_deserialize()?)
 }
 
 #[test]
@@ -111,8 +109,7 @@ fn project_env_vars_replace_the_global_allowlist() {
 }
 
 #[test]
-fn merged_relative_paths_resolve_from_the_project_root() {
-    let base = Path::new("/project");
+fn merged_relative_paths_are_kept_as_written() {
     let config = parse_layers(
         "image.dockerfile = \"containers/Dockerfile\"\n",
         "[binds.cache]\nsource = \"project-cache\"\ntarget = \"/cache\"\naccess = \"read-only\"\n",
@@ -120,10 +117,10 @@ fn merged_relative_paths_resolve_from_the_project_root() {
     .expect("configuration layers merge");
 
     assert_eq!(
-        config.image.dockerfile,
-        Some(base.join("containers/Dockerfile"))
+        config.image.dockerfile.as_deref(),
+        Some(Path::new("containers/Dockerfile"))
     );
-    assert_eq!(config.binds["cache"].source, base.join("project-cache"));
+    assert_eq!(config.binds["cache"].source, Path::new("project-cache"));
 }
 
 #[test]
@@ -140,6 +137,17 @@ fn path_resolution_preserves_values_for_semantic_validation() {
     assert_eq!(
         config.binds["invalid-home"].source,
         Path::new("~user/cache")
+    );
+}
+
+#[test]
+fn home_relative_dockerfile_is_kept_as_written() {
+    let config = parse_layers("image.dockerfile = \"~/images/Dockerfile\"\n", "")
+        .expect("home-relative dockerfile parses");
+
+    assert_eq!(
+        config.image.dockerfile.as_deref(),
+        Some(Path::new("~/images/Dockerfile"))
     );
 }
 

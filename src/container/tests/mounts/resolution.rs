@@ -264,6 +264,32 @@ fn missing_project_relative_state_is_ignored() {
 }
 
 #[test]
+fn project_relative_state_treats_extra_slashes_as_project_paths() {
+    let project = test_dir("extra-slash-project-state");
+    fs::create_dir(project.path().join("target")).expect("state target creates");
+    let mut config = Config::default();
+    config
+        .state
+        .project
+        .insert("cargo-target".into(), state_entry(".//target"));
+    let mounts = resolve_configured_mounts(
+        &config,
+        project.path(),
+        &[],
+        None,
+        Some(&project.path().join("state-home")),
+    )
+    .expect("extra slashes still match the workspace directory");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(
+        mounts[0].dest,
+        shared_dir_name(project.path())
+            .expect("project destination resolves")
+            .join("target")
+    );
+}
+
+#[test]
 fn project_state_eligibility_is_stable_during_resolution() {
     let project = test_dir("project-state-snapshot");
     let target = project.path().join("target");
@@ -345,16 +371,50 @@ fn managed_state_resolution_does_not_create_storage() {
 
 #[test]
 fn tilde_expansion_requires_a_known_home() {
-    assert_eq!(
-        expand_tilde(Path::new("~/.cache"), Some(Path::new("/home/user"))),
-        Path::new("/home/user/.cache")
+    let project = test_dir("tilde-bind-project");
+    let home = test_dir("tilde-bind-home");
+    fs::create_dir(home.path().join(".cache")).expect("cache creates");
+    let mut config = Config::default();
+    config.binds.insert(
+        "cache".into(),
+        Bind {
+            source: PathBuf::from("~/.cache"),
+            target: PathBuf::from("~/cache"),
+            access: Permission::ReadOnly,
+        },
     );
+
+    let mounts = resolve_configured_mounts(&config, project.path(), &[], Some(home.path()), None)
+        .expect("home-relative bind expands");
     assert_eq!(
-        expand_tilde(Path::new("~/.cache"), None),
-        Path::new("~/.cache")
+        mounts[0].source,
+        MountSource::Host(canonical(&home.path().join(".cache")))
     );
+
+    let missing = resolve_configured_mounts(&config, project.path(), &[], None, None)
+        .expect_err("missing home")
+        .to_string();
+    assert!(missing.contains("HOME"), "{missing}");
+}
+
+#[test]
+fn relative_bind_source_resolves_from_the_project_root() {
+    let project = test_dir("relative-bind-project");
+    fs::create_dir(project.path().join("cache")).expect("cache creates");
+    let mut config = Config::default();
+    config.binds.insert(
+        "cache".into(),
+        Bind {
+            source: PathBuf::from("cache"),
+            target: PathBuf::from("~/cache"),
+            access: Permission::ReadOnly,
+        },
+    );
+
+    let mounts = resolve_configured_mounts(&config, project.path(), &[], None, None)
+        .expect("relative bind source joins the project");
     assert_eq!(
-        expand_tilde(Path::new("~other/cache"), Some(Path::new("/home/user"))),
-        Path::new("~other/cache")
+        mounts[0].source,
+        MountSource::Host(canonical(&project.path().join("cache")))
     );
 }

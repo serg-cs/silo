@@ -532,7 +532,7 @@ fn build_validates_custom_dockerfiles_before_runtime_access() {
     let mut config = Config::default();
     config.image.dockerfile = Some(dir.path().join("Dockerfile"));
 
-    let error = build(&config).expect_err("missing Dockerfile prevents maintenance");
+    let error = build(&config, dir.path()).expect_err("missing Dockerfile prevents maintenance");
     assert!(error.to_string().contains("does not exist"));
 }
 

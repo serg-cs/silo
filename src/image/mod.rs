@@ -1,6 +1,6 @@
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::apple::{CONTAINER_BIN, probe_with_system_start, spawn_error, start_container_system};
 use crate::config::Config;
 use crate::digest::hex as hex_digest;
+use crate::paths;
 
 mod build;
 mod dockerfile;
@@ -36,20 +37,30 @@ const BASE_DOCKERFILE: &str = include_str!("assets/silo-base.dockerfile");
 /// Default small agent-ready workstation built on the runtime foundation.
 const EXTRAS_DOCKERFILE: &str = include_str!("assets/silo-extras.dockerfile");
 
-pub(crate) fn validate_config(config: &Config) -> Result<()> {
-    if let Some(dockerfile) = &config.image.dockerfile {
-        dockerfile::validate_dockerfile(dockerfile)?;
+pub(crate) fn validate_config(config: &Config, project_root: &Path) -> Result<()> {
+    if let Some(dockerfile) = configured_dockerfile(config, project_root)? {
+        dockerfile::validate_dockerfile(&dockerfile)?;
     }
     Ok(())
 }
 
 /// Resolves the stable local tag selected by the effective configuration.
-pub(crate) fn reference(config: &Config) -> Result<String> {
-    config
-        .image
-        .dockerfile
-        .as_deref()
-        .map_or_else(|| Ok(DEFAULT_IMAGE_TAG.to_string()), custom_image_reference)
+pub(crate) fn reference(config: &Config, project_root: &Path) -> Result<String> {
+    match configured_dockerfile(config, project_root)? {
+        Some(dockerfile) => custom_image_reference(&dockerfile),
+        None => Ok(DEFAULT_IMAGE_TAG.to_string()),
+    }
+}
+
+fn configured_dockerfile(config: &Config, project_root: &Path) -> Result<Option<PathBuf>> {
+    let Some(dockerfile) = &config.image.dockerfile else {
+        return Ok(None);
+    };
+    Ok(Some(paths::resolve_host(
+        dockerfile,
+        project_root,
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )?))
 }
 
 /// Gives each Dockerfile, context, and ignore-rule selection a stable tag.

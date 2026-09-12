@@ -138,6 +138,7 @@ USER root</code></pre>
 
 [binds]
 artifacts = { source = "./artifacts", target = "./artifacts", access = "read-write" }</code></pre>
+          <p>A home-relative path such as <code>image.dockerfile = "~/silo/Dockerfile"</code> is resolved from the host home directory, so the global config can select one derivative for every project. That host <code>~/…</code> form is not the same as a mount target: bind and state <code>~/…</code> targets still mean <code>/home/silo</code> inside the container.</p>
           <p>The Dockerfile must have exactly one stage and use that literal base spelling; Silo rewrites it to an internal stage so it can never be resolved from a registry. Shared sessions, shells, <code>/home/silo</code>, sudo, host ports, and project/user managed state remain available when the derivative preserves their base requirements. Selecting a custom Dockerfile replaces the extras layer rather than extending it, so reinstall Codex, Claude Code, Node.js, or any other default extras you still want, then add language toolchains, browsers, extra agents, and editors there.</p>
         </section>
 

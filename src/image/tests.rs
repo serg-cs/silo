@@ -1,8 +1,9 @@
 use super::*;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::runtime_contract::*;
+use crate::config::Config;
 use crate::image::runtime_contract::BASH_PATH;
 use crate::test_support::test_dir;
 
@@ -49,6 +50,16 @@ fn image_tags_separate_base_default_and_custom_layers() {
         first.len(),
         "silo:custom-".len() + CUSTOM_IMAGE_DIGEST_HEX_LEN
     );
+}
+
+#[test]
+fn validate_config_resolves_a_project_relative_dockerfile() {
+    let project = test_dir("relative-dockerfile");
+    fs::write(project.path().join("Dockerfile"), "FROM silo-base:latest\n")
+        .expect("Dockerfile write succeeds");
+    let mut config = Config::default();
+    config.image.dockerfile = Some(PathBuf::from("Dockerfile"));
+    validate_config(&config, project.path()).expect("relative dockerfile resolves at use");
 }
 
 #[cfg(unix)]

@@ -14,8 +14,8 @@ use super::dockerfile::compose_derivative;
 #[cfg(test)]
 use super::dockerfile::validate_dockerfile;
 use super::{
-    BASE_DOCKERFILE, BASE_IMAGE_TAG, DEFAULT_IMAGE_TAG, EXTRAS_DOCKERFILE, dockerfile_context,
-    probe_image, reference, validate_config,
+    BASE_DOCKERFILE, BASE_IMAGE_TAG, DEFAULT_IMAGE_TAG, EXTRAS_DOCKERFILE, configured_dockerfile,
+    dockerfile_context, probe_image, reference, validate_config,
 };
 use crate::apple::{
     CONTAINER_BIN, SystemStart, execute, exit_code, spawn_error, start_container_system,
@@ -117,21 +117,22 @@ impl Drop for StagedImage {
 }
 
 /// Rebuilds the runtime base and lets the derivative reuse only those layers.
-pub(crate) fn build(config: &Config) -> Result<ExitCode> {
-    validate_config(config)?;
-    let target = reference(config)?;
+pub(crate) fn build(config: &Config, project_root: &Path) -> Result<ExitCode> {
+    validate_config(config, project_root)?;
+    let target = reference(config, project_root)?;
     let _build_lock = acquire_build_lock()?;
     ensure_container_system_started()?;
     run_build_lifecycle(
         delete_builder,
-        || build_configured_image(config, &target),
+        || build_configured_image(config, project_root, &target),
         delete_builder,
     )
 }
-fn build_configured_image(config: &Config, target: &str) -> Result<ExitCode> {
+fn build_configured_image(config: &Config, project_root: &Path, target: &str) -> Result<ExitCode> {
     let build_dir = BuildDir::create()?;
     write_build_context(&build_dir)?;
-    let (derivative, source, context) = match &config.image.dockerfile {
+    let resolved_dockerfile = configured_dockerfile(config, project_root)?;
+    let (derivative, source, context) = match &resolved_dockerfile {
         Some(dockerfile) => (
             fs::read_to_string(dockerfile).with_context(|| {
                 format!("failed to read image dockerfile `{}`", dockerfile.display())
@@ -148,7 +149,7 @@ fn build_configured_image(config: &Config, target: &str) -> Result<ExitCode> {
     let combined = compose_derivative(BASE_DOCKERFILE, &derivative, source)?;
     fs::write(build_dir.derivative_dockerfile(), combined)
         .context("failed to write derivative Dockerfile")?;
-    if config.image.dockerfile.is_some() {
+    if resolved_dockerfile.is_some() {
         copy_dockerignore(source, &build_dir.derivative_dockerignore())?;
     }
     let build_args = runtime_asset_build_args();

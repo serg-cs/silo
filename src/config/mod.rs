@@ -143,26 +143,7 @@ impl Config {
             builder = builder.add_source(File::from(path).required(false));
         }
         builder = builder.add_source(File::from(project_root.join(".silo.toml")).required(false));
-        let mut config = builder.build()?.try_deserialize::<Self>()?;
-        config.resolve_paths(project_root);
-        Ok(config)
-    }
-
-    fn resolve_paths(&mut self, base: &Path) {
-        if let Some(dockerfile) = &mut self.image.dockerfile
-            && !dockerfile.as_os_str().is_empty()
-            && dockerfile.is_relative()
-        {
-            *dockerfile = base.join(&*dockerfile);
-        }
-        for bind in self.binds.values_mut() {
-            if !bind.source.as_os_str().is_empty()
-                && bind.source.is_relative()
-                && !bind.source.as_os_str().as_encoded_bytes().starts_with(b"~")
-            {
-                bind.source = base.join(&bind.source);
-            }
-        }
+        Ok(builder.build()?.try_deserialize()?)
     }
 }
 
