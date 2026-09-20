@@ -260,6 +260,11 @@ fn append_creation_mounts(
         let target = project_path_target(shared_dir, &entry.relative);
         append_bind_mount(run, &entry.host, &target, Permission::ReadOnly)?;
     }
+    // Remount siblings hidden by Apple virtiofs name-prefix matching.
+    for entry in &config_mounts.prefix_restores {
+        let target = project_path_target(shared_dir, &entry.relative);
+        append_bind_mount(run, &entry.host, &target, Permission::ReadWrite)?;
+    }
     for entry in &config_mounts.configured {
         let source = match &entry.source {
             MountSource::Host(host) => host,

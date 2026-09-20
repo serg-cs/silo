@@ -68,6 +68,9 @@ pub(super) fn needs_mount_lock(mounts: &[ConfiguredMount]) -> bool {
 #[derive(Default)]
 pub(super) struct ConfigMounts {
     pub(super) read_only: Vec<ReadOnlyProjectPath>,
+    /// Sibling directories hidden by Apple virtiofs when a nested overlay's
+    /// name is a string prefix of theirs (`.git` hides `.github`).
+    pub(super) prefix_restores: Vec<ReadOnlyProjectPath>,
     pub(super) configured: Vec<ConfiguredMount>,
     pub(super) host_ports: Option<host_ports::SshAssets>,
 }
@@ -98,6 +101,90 @@ pub(super) fn resolve_read_only_paths(
         resolved.push(ReadOnlyProjectPath { host, relative });
     }
     resolved
+}
+
+/// Directories next to a nested overlay whose names start with that overlay's
+/// name as a string. Apple virtiofs treats those siblings as part of the
+/// nested share, so they must be remounted to stay visible.
+pub(super) fn resolve_prefix_restores(
+    project_root: &Path,
+    read_only: &[ReadOnlyProjectPath],
+    configured: &[ConfiguredMount],
+) -> Vec<ReadOnlyProjectPath> {
+    let Ok(project_dir) = shared_dir_name(project_root) else {
+        return Vec::new();
+    };
+    let Some(root) = fs::canonicalize(project_root).ok() else {
+        return Vec::new();
+    };
+
+    let overlay_dests: BTreeSet<_> = read_only
+        .iter()
+        .map(|path| project_path_target(&project_dir, &path.relative))
+        .collect();
+    let configured_dests: BTreeSet<_> = configured
+        .iter()
+        .map(|mount| mount.dest.as_path())
+        .collect();
+
+    let mut unique = BTreeSet::new();
+    let mut restored = Vec::new();
+    for overlay in read_only {
+        for sibling in prefix_colliding_siblings(&overlay.host) {
+            let Some(host) = mount_host(&sibling, &root) else {
+                continue;
+            };
+            if !host.is_dir() {
+                continue;
+            }
+            let Ok(relative) = host.strip_prefix(&root) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            let relative = relative.to_path_buf();
+            let dest = project_path_target(&project_dir, &relative);
+            if overlay_dests.contains(&dest) || configured_dests.contains(dest.as_path()) {
+                continue;
+            }
+            if mount_argument_path(&host).is_err() || mount_argument_path(&dest).is_err() {
+                continue;
+            }
+            if !unique.insert(relative.clone()) {
+                continue;
+            }
+            restored.push(ReadOnlyProjectPath { host, relative });
+        }
+    }
+    restored.sort_by(|left, right| left.relative.cmp(&right.relative));
+    restored
+}
+
+fn prefix_colliding_siblings(host: &Path) -> Vec<PathBuf> {
+    let Some(name) = host.file_name() else {
+        return Vec::new();
+    };
+    let Some(parent) = host.parent() else {
+        return Vec::new();
+    };
+    let name_bytes = name.as_encoded_bytes();
+    if name_bytes.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let sibling = entry.file_name();
+            sibling != name
+                && sibling.as_encoded_bytes().starts_with(name_bytes)
+                && entry.path().is_dir()
+        })
+        .map(|entry| entry.path())
+        .collect()
 }
 
 fn normalize_read_only_path(path: &Path) -> Option<PathBuf> {
@@ -465,8 +552,10 @@ pub(super) fn resolve_config_mounts(
         std::env::var_os("HOME").as_deref().map(Path::new),
         std::env::var_os("XDG_STATE_HOME").as_deref().map(Path::new),
     )?;
+    let prefix_restores = resolve_prefix_restores(project_root, &read_only, &configured);
     Ok(ConfigMounts {
         read_only,
+        prefix_restores,
         configured,
         host_ports: host_ports.map(|tunnel| tunnel.assets.clone()),
     })

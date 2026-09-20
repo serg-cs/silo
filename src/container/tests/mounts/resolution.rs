@@ -418,3 +418,110 @@ fn relative_bind_source_resolves_from_the_project_root() {
         MountSource::Host(canonical(&project.path().join("cache")))
     );
 }
+
+#[test]
+fn prefix_restores_remount_github_beside_a_git_overlay() {
+    let project = test_dir("prefix-restore-github");
+    fs::create_dir(project.path().join(".git")).expect("git directory creates");
+    fs::create_dir(project.path().join(".github")).expect("github directory creates");
+    fs::write(project.path().join(".gitignore"), "*").expect("gitignore creates");
+
+    let read_only = resolve_read_only_paths(project.path(), &[PathBuf::from(".git")]);
+    let restored = resolve_prefix_restores(project.path(), &read_only, &[]);
+    assert_eq!(
+        restored,
+        [read_only_path(
+            canonical(&project.path().join(".github")).to_str().unwrap(),
+            ".github"
+        )]
+    );
+}
+
+#[test]
+fn prefix_restores_skip_siblings_already_overlaid() {
+    let project = test_dir("prefix-restore-already-overlaid");
+    fs::create_dir(project.path().join(".git")).expect("git directory creates");
+    fs::create_dir(project.path().join(".github")).expect("github directory creates");
+
+    let read_only = resolve_read_only_paths(
+        project.path(),
+        &[PathBuf::from(".git"), PathBuf::from(".github")],
+    );
+    let restored = resolve_prefix_restores(project.path(), &read_only, &[]);
+    assert!(restored.is_empty());
+}
+
+#[test]
+fn prefix_restores_match_every_string_prefix_sibling() {
+    let project = test_dir("prefix-restore-src");
+    for name in ["src", "src-old", "src2", "lib", "asrc"] {
+        fs::create_dir(project.path().join(name)).expect("sibling creates");
+    }
+
+    let read_only = resolve_read_only_paths(project.path(), &[PathBuf::from("src")]);
+    let restored = resolve_prefix_restores(project.path(), &read_only, &[]);
+    assert_eq!(
+        restored,
+        [
+            read_only_path(
+                canonical(&project.path().join("src-old")).to_str().unwrap(),
+                "src-old"
+            ),
+            read_only_path(
+                canonical(&project.path().join("src2")).to_str().unwrap(),
+                "src2"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn prefix_restores_stay_next_to_nested_overlays() {
+    let project = test_dir("prefix-restore-nested");
+    fs::create_dir_all(project.path().join("foo/.git")).expect("nested git creates");
+    fs::create_dir(project.path().join("foo/.github")).expect("nested github creates");
+    fs::create_dir(project.path().join(".github")).expect("top-level github creates");
+
+    let read_only = resolve_read_only_paths(project.path(), &[PathBuf::from("foo/.git")]);
+    let restored = resolve_prefix_restores(project.path(), &read_only, &[]);
+    assert_eq!(
+        restored,
+        [read_only_path(
+            canonical(&project.path().join("foo/.github"))
+                .to_str()
+                .unwrap(),
+            "foo/.github"
+        )]
+    );
+}
+
+#[test]
+fn prefix_restores_skip_configured_destinations() {
+    let project = test_dir("prefix-restore-configured");
+    fs::create_dir(project.path().join(".git")).expect("git directory creates");
+    fs::create_dir(project.path().join(".github")).expect("github directory creates");
+    let project_dir = shared_dir_name(project.path()).expect("project destination resolves");
+
+    let read_only = resolve_read_only_paths(project.path(), &[PathBuf::from(".git")]);
+    let configured = [configured_host(
+        canonical(&project.path().join(".github")).to_str().unwrap(),
+        project_dir.join(".github").to_str().unwrap(),
+        Permission::ReadWrite,
+    )];
+    let restored = resolve_prefix_restores(project.path(), &read_only, &configured);
+    assert!(restored.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn prefix_restores_skip_siblings_that_escape_the_project() {
+    let project = test_dir("prefix-restore-escape");
+    let outside = test_dir("prefix-restore-outside");
+    fs::create_dir(project.path().join(".git")).expect("git directory creates");
+    std::os::unix::fs::symlink(outside.path(), project.path().join(".github"))
+        .expect("escaping github symlink creates");
+
+    let read_only = resolve_read_only_paths(project.path(), &[PathBuf::from(".git")]);
+    let restored = resolve_prefix_restores(project.path(), &read_only, &[]);
+    assert!(restored.is_empty());
+}

@@ -5,6 +5,7 @@ fn creation_uses_structured_mounts_in_explicit_order() {
     let command = isolated_create_command(
         &ConfigMounts {
             read_only: vec![read_only_path("/tmp/project/.git", ".git")],
+            prefix_restores: vec![read_only_path("/tmp/project/.github", ".github")],
             configured: vec![configured_host(
                 "/tmp/cache:shared",
                 "/home/silo/project/cache:shared",
@@ -23,6 +24,7 @@ fn creation_uses_structured_mounts_in_explicit_order() {
         [
             "type=bind,source=/tmp/project,target=/home/silo/project",
             "type=bind,source=/tmp/project/.git,target=/home/silo/project/.git,readonly",
+            "type=bind,source=/tmp/project/.github,target=/home/silo/project/.github",
             "type=bind,source=/tmp/cache:shared,target=/home/silo/project/cache:shared",
         ]
     );
@@ -66,6 +68,7 @@ fn managed_mounts_use_structured_sources_and_access() {
         },
         &ConfigMounts {
             read_only: Vec::new(),
+            prefix_restores: Vec::new(),
             configured: vec![
                 ConfiguredMount {
                     source: MountSource::Managed(writable),
