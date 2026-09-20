@@ -39,6 +39,13 @@ pub(super) struct ReadOnlyProjectPath {
     pub(super) relative: PathBuf,
 }
 
+/// Effective read-only overlays plus skip warnings for present-but-unusable paths.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ReadOnlyResolution {
+    pub(super) paths: Vec<ReadOnlyProjectPath>,
+    pub(super) warnings: Vec<String>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum MountSource {
     Host(PathBuf),
@@ -78,29 +85,39 @@ pub(super) struct ConfigMounts {
 pub(super) fn resolve_read_only_paths(
     project_root: &Path,
     paths: &[PathBuf],
-) -> Vec<ReadOnlyProjectPath> {
+) -> Result<ReadOnlyResolution> {
+    let mut unique = BTreeSet::new();
+    let mut relative_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        let relative = normalize_read_only_path(path)?;
+        if unique.insert(relative.clone()) {
+            relative_paths.push((path, relative));
+        }
+    }
+
     let Some(root) = fs::canonicalize(project_root).ok() else {
-        return Vec::new();
+        return Ok(ReadOnlyResolution::default());
     };
 
-    let mut unique = BTreeSet::new();
-    let mut resolved = Vec::with_capacity(paths.len());
-    for path in paths {
-        let Some(relative) = normalize_read_only_path(path) else {
-            continue;
-        };
-        if !unique.insert(relative.clone()) {
+    let mut resolved = Vec::with_capacity(relative_paths.len());
+    let mut warnings = Vec::new();
+    for (path, relative) in relative_paths {
+        let candidate = project_root.join(&relative);
+        if fs::symlink_metadata(&candidate).is_err() {
             continue;
         }
-        let Some(host) = mount_host(&project_root.join(&relative), &root) else {
-            continue;
-        };
-        if !host.is_dir() {
-            continue;
+        match mount_host(&candidate, &root) {
+            Some(host) if host.is_dir() => {
+                resolved.push(ReadOnlyProjectPath { host, relative });
+            }
+            Some(_) => warnings.push(read_only_skip_warning(path, "is not a directory")),
+            None => warnings.push(read_only_unresolvable_warning(path, &candidate, &root)),
         }
-        resolved.push(ReadOnlyProjectPath { host, relative });
     }
-    resolved
+    Ok(ReadOnlyResolution {
+        paths: resolved,
+        warnings,
+    })
 }
 
 /// Directories next to a nested overlay whose names start with that overlay's
@@ -187,16 +204,27 @@ fn prefix_colliding_siblings(host: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn normalize_read_only_path(path: &Path) -> Option<PathBuf> {
+fn normalize_read_only_path(path: &Path) -> Result<PathBuf> {
     if path.as_os_str().is_empty() {
-        return None;
+        return Err(anyhow!("workspace.read_only path is empty"));
     }
     if path.is_absolute() {
-        return None;
+        return Err(anyhow!(
+            "workspace.read_only path `{}` must be relative to the project root",
+            path.display()
+        ));
     }
-    let text = path.to_str()?;
+    let text = path.to_str().ok_or_else(|| {
+        anyhow!(
+            "workspace.read_only path `{}` is not valid UTF-8",
+            path.display()
+        )
+    })?;
     if text.contains([',', '=', '\n', '\r']) {
-        return None;
+        return Err(anyhow!(
+            "workspace.read_only path `{}` contains `,`, `=`, or a newline",
+            path.display()
+        ));
     }
 
     let mut normalized = PathBuf::new();
@@ -205,13 +233,41 @@ fn normalize_read_only_path(path: &Path) -> Option<PathBuf> {
             Component::CurDir => {}
             Component::ParentDir if normalized.pop() => {}
             Component::Normal(component) => normalized.push(component),
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return None,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err(anyhow!(
+                    "workspace.read_only path `{}` is not a well-formed project-relative path",
+                    path.display()
+                ));
+            }
         }
     }
     if normalized.as_os_str().is_empty() {
         normalized.push(".");
     }
-    Some(normalized)
+    Ok(normalized)
+}
+
+fn read_only_skip_warning(path: &Path, reason: &str) -> String {
+    format!(
+        "workspace.read_only path `{}` {reason}; skipping read-only overlay",
+        path.display()
+    )
+}
+
+fn read_only_unresolvable_warning(path: &Path, candidate: &Path, root: &Path) -> String {
+    let is_symlink = fs::symlink_metadata(candidate)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_symlink {
+        match fs::canonicalize(candidate) {
+            Ok(host) if !host.starts_with(root) => {
+                return read_only_skip_warning(path, "resolves outside the project");
+            }
+            Err(_) => return read_only_skip_warning(path, "is a broken symlink"),
+            Ok(_) => {}
+        }
+    }
+    read_only_skip_warning(path, "is not a directory")
 }
 
 /// Returns the canonical path of `path` when it resolves to a real path
@@ -330,6 +386,9 @@ pub(super) fn project_path_target(project_dest: &Path, relative: &Path) -> PathB
 
 /// Rejects malformed mount settings without consulting the filesystem.
 pub(super) fn validate_config(config: &Config) -> Result<()> {
+    for path in &config.workspace.read_only {
+        normalize_read_only_path(path)?;
+    }
     for (name, bind) in &config.binds {
         validate_host_path(name, &bind.source)?;
     }
@@ -544,17 +603,20 @@ pub(super) fn resolve_config_mounts(
     project_root: &Path,
     host_ports: Option<&host_ports::Tunnel>,
 ) -> Result<ConfigMounts> {
-    let read_only = resolve_read_only_paths(project_root, &config.workspace.read_only);
+    let read_only = resolve_read_only_paths(project_root, &config.workspace.read_only)?;
+    for warning in &read_only.warnings {
+        eprintln!("warning: {warning}");
+    }
     let configured = resolve_configured_mounts(
         config,
         project_root,
-        &read_only,
+        &read_only.paths,
         std::env::var_os("HOME").as_deref().map(Path::new),
         std::env::var_os("XDG_STATE_HOME").as_deref().map(Path::new),
     )?;
-    let prefix_restores = resolve_prefix_restores(project_root, &read_only, &configured);
+    let prefix_restores = resolve_prefix_restores(project_root, &read_only.paths, &configured);
     Ok(ConfigMounts {
-        read_only,
+        read_only: read_only.paths,
         prefix_restores,
         configured,
         host_ports: host_ports.map(|tunnel| tunnel.assets.clone()),

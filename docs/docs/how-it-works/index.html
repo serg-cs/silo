@@ -94,7 +94,7 @@
 
         <section id="read-only-overlays">
           <h2><a href="#read-only-overlays">Read-only project overlays</a></h2>
-          <p>For each configured relative path, Silo canonicalizes the host directory and mounts it separately at the corresponding path inside the writable project tree. Malformed paths, duplicates, missing paths, regular files, broken symlinks, and symlinks escaping the project are silently ignored. Only effective directories inside the canonical project root participate in writable-overlap validation.</p>
+          <p>For each configured relative path, Silo canonicalizes the host directory and mounts it separately at the corresponding path inside the writable project tree. Missing paths and duplicates are skipped. A present file, broken symlink, or symlink that escapes the project is skipped and warned about. Malformed paths fail validation. Only effective directories inside the canonical project root participate in writable-overlap validation.</p>
           <p>This is a focused guardrail, not a full sandbox policy. Tools can still edit source files, while configuration validation prevents a read-write bind or managed-state mount from replacing protected content or hiding its read-only overlay behind a writable parent.</p>
         </section>
 

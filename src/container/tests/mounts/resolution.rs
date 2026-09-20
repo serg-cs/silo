@@ -155,12 +155,57 @@ fn config_only_validation_from_the_filesystem_root_remains_available() {
     assert!(duplicate.contains("both target"), "{duplicate}");
 }
 
+fn resolve_read_only(project_root: &Path, paths: &[&str]) -> ReadOnlyResolution {
+    let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    resolve_read_only_paths(project_root, &paths).expect("read-only paths resolve")
+}
+
+fn resolve_read_only_err(project_root: &Path, paths: &[&str]) -> String {
+    let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    resolve_read_only_paths(project_root, &paths)
+        .expect_err("unusable read-only path fails")
+        .to_string()
+}
+
+fn git_at(path: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path);
+    command
+}
+
+fn run_git(mut command: Command) {
+    assert!(
+        command.status().expect("Git starts").success(),
+        "Git fixture command succeeds"
+    );
+}
+
 #[test]
-fn read_only_resolution_stays_within_the_project() {
+fn read_only_resolution_keeps_in_project_directories() {
     let dir = test_dir("read-only-resolution");
-    let outside = test_dir("read-only-outside");
     fs::create_dir(dir.path().join("policy")).expect("policy creates");
+
+    let resolved = resolve_read_only(dir.path(), &["policy", "policy/../policy", "missing"]);
+    assert_eq!(
+        resolved.paths,
+        [read_only_path(
+            canonical(&dir.path().join("policy")).to_str().unwrap(),
+            "policy"
+        )]
+    );
+    assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+}
+
+#[test]
+fn read_only_resolution_warns_for_present_unusable_paths() {
+    let dir = test_dir("read-only-unusable");
+    let outside = test_dir("read-only-outside");
     fs::write(dir.path().join("file"), "content").expect("regular file creates");
+    fs::write(
+        dir.path().join(".git"),
+        "gitdir: /tmp/repo/.git/worktrees/wt\n",
+    )
+    .expect("Gitfile creates");
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(outside.path(), dir.path().join("linked"))
@@ -169,27 +214,124 @@ fn read_only_resolution_stays_within_the_project() {
             .expect("broken symlink creates");
     }
 
-    let resolved = resolve_read_only_paths(
-        dir.path(),
-        &[
-            PathBuf::from("policy"),
-            PathBuf::from("policy/../policy"),
-            PathBuf::from("missing"),
-            PathBuf::from("file"),
-            PathBuf::from("linked"),
-            PathBuf::from("broken"),
-            PathBuf::from("../escape"),
-            PathBuf::from("/absolute"),
-            PathBuf::from("bad,value"),
-            PathBuf::new(),
-        ],
-    );
+    let resolved = resolve_read_only(dir.path(), &["file", ".git", "linked", "broken", "missing"]);
+    assert!(resolved.paths.is_empty(), "{:?}", resolved.paths);
+    let mut expected = vec![
+        "workspace.read_only path `file` is not a directory; skipping read-only overlay"
+            .to_string(),
+        "workspace.read_only path `.git` is not a directory; skipping read-only overlay"
+            .to_string(),
+    ];
+    #[cfg(unix)]
+    {
+        expected.push(
+            "workspace.read_only path `linked` resolves outside the project; skipping read-only overlay"
+                .into(),
+        );
+        expected.push(
+            "workspace.read_only path `broken` is a broken symlink; skipping read-only overlay"
+                .into(),
+        );
+    }
+    assert_eq!(resolved.warnings, expected);
+}
+
+#[test]
+fn default_read_only_git_is_silent_when_missing() {
+    let dir = test_dir("read-only-missing-git");
+    let resolved = resolve_read_only(dir.path(), &[".git"]);
+    assert!(resolved.paths.is_empty(), "{:?}", resolved.paths);
+    assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+}
+
+#[test]
+fn read_only_resolution_warns_for_a_linked_worktree_gitfile() {
+    if !Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+
+    let dir = test_dir("read-only-worktree");
+    let repository = dir.path().join("repository");
+    let worktree = dir.path().join("worktree");
+    fs::create_dir(&repository).expect("repository directory creates");
+    let mut init = git_at(&repository);
+    init.args(["init", "--quiet"]);
+    run_git(init);
+    fs::write(repository.join("README.md"), "workspace\n").expect("fixture file creates");
+    let mut add = git_at(&repository);
+    add.args(["add", "README.md"]);
+    run_git(add);
+    let mut commit = git_at(&repository);
+    commit.args([
+        "-c",
+        "user.name=Silo Tests",
+        "-c",
+        "user.email=silo@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "fixture",
+    ]);
+    run_git(commit);
+    let mut add_worktree = git_at(&repository);
+    add_worktree.args(["worktree", "add", "--quiet"]);
+    add_worktree.arg(&worktree);
+    run_git(add_worktree);
+    assert!(worktree.join(".git").is_file());
+
+    let resolved = resolve_read_only(&worktree, &[".git"]);
+    assert!(resolved.paths.is_empty(), "{:?}", resolved.paths);
     assert_eq!(
-        resolved,
-        [read_only_path(
-            canonical(&dir.path().join("policy")).to_str().unwrap(),
-            "policy"
-        )]
+        resolved.warnings,
+        ["workspace.read_only path `.git` is not a directory; skipping read-only overlay"]
+    );
+}
+
+#[test]
+fn read_only_resolution_rejects_malformed_paths() {
+    let dir = test_dir("read-only-malformed");
+    let absolute = resolve_read_only_err(dir.path(), &["/absolute"]);
+    assert!(
+        absolute.contains("must be relative to the project root"),
+        "{absolute}"
+    );
+
+    let escape = resolve_read_only_err(dir.path(), &["../escape"]);
+    assert!(
+        escape.contains("not a well-formed project-relative path"),
+        "{escape}"
+    );
+
+    let delimiter = resolve_read_only_err(dir.path(), &["bad,value"]);
+    assert!(
+        delimiter.contains("contains `,`, `=`, or a newline"),
+        "{delimiter}"
+    );
+
+    let empty = resolve_read_only_err(dir.path(), &[""]);
+    assert!(empty.contains("path is empty"), "{empty}");
+}
+
+#[test]
+fn validation_rejects_malformed_read_only_paths() {
+    let absolute = validate_config_text("workspace.read_only = [\"/absolute\"]\n")
+        .expect_err("absolute read-only path fails")
+        .to_string();
+    assert!(
+        absolute.contains("must be relative to the project root"),
+        "{absolute}"
+    );
+
+    let delimiter = validate_config_text("workspace.read_only = [\"bad=value\"]\n")
+        .expect_err("delimiter in read-only path fails")
+        .to_string();
+    assert!(
+        delimiter.contains("contains `,`, `=`, or a newline"),
+        "{delimiter}"
     );
 }
 
@@ -426,7 +568,7 @@ fn prefix_restores_remount_github_beside_a_git_overlay() {
     fs::create_dir(project.path().join(".github")).expect("github directory creates");
     fs::write(project.path().join(".gitignore"), "*").expect("gitignore creates");
 
-    let read_only = resolve_read_only_paths(project.path(), &[PathBuf::from(".git")]);
+    let read_only = resolve_read_only(project.path(), &[".git"]).paths;
     let restored = resolve_prefix_restores(project.path(), &read_only, &[]);
     assert_eq!(
         restored,
@@ -443,10 +585,7 @@ fn prefix_restores_skip_siblings_already_overlaid() {
     fs::create_dir(project.path().join(".git")).expect("git directory creates");
     fs::create_dir(project.path().join(".github")).expect("github directory creates");
 
-    let read_only = resolve_read_only_paths(
-        project.path(),
-        &[PathBuf::from(".git"), PathBuf::from(".github")],
-    );
+    let read_only = resolve_read_only(project.path(), &[".git", ".github"]).paths;
     let restored = resolve_prefix_restores(project.path(), &read_only, &[]);
     assert!(restored.is_empty());
 }
@@ -458,7 +597,7 @@ fn prefix_restores_match_every_string_prefix_sibling() {
         fs::create_dir(project.path().join(name)).expect("sibling creates");
     }
 
-    let read_only = resolve_read_only_paths(project.path(), &[PathBuf::from("src")]);
+    let read_only = resolve_read_only(project.path(), &["src"]).paths;
     let restored = resolve_prefix_restores(project.path(), &read_only, &[]);
     assert_eq!(
         restored,
@@ -482,7 +621,7 @@ fn prefix_restores_stay_next_to_nested_overlays() {
     fs::create_dir(project.path().join("foo/.github")).expect("nested github creates");
     fs::create_dir(project.path().join(".github")).expect("top-level github creates");
 
-    let read_only = resolve_read_only_paths(project.path(), &[PathBuf::from("foo/.git")]);
+    let read_only = resolve_read_only(project.path(), &["foo/.git"]).paths;
     let restored = resolve_prefix_restores(project.path(), &read_only, &[]);
     assert_eq!(
         restored,
@@ -502,7 +641,7 @@ fn prefix_restores_skip_configured_destinations() {
     fs::create_dir(project.path().join(".github")).expect("github directory creates");
     let project_dir = shared_dir_name(project.path()).expect("project destination resolves");
 
-    let read_only = resolve_read_only_paths(project.path(), &[PathBuf::from(".git")]);
+    let read_only = resolve_read_only(project.path(), &[".git"]).paths;
     let configured = [configured_host(
         canonical(&project.path().join(".github")).to_str().unwrap(),
         project_dir.join(".github").to_str().unwrap(),
@@ -521,7 +660,7 @@ fn prefix_restores_skip_siblings_that_escape_the_project() {
     std::os::unix::fs::symlink(outside.path(), project.path().join(".github"))
         .expect("escaping github symlink creates");
 
-    let read_only = resolve_read_only_paths(project.path(), &[PathBuf::from(".git")]);
+    let read_only = resolve_read_only(project.path(), &[".git"]).paths;
     let restored = resolve_prefix_restores(project.path(), &read_only, &[]);
     assert!(restored.is_empty());
 }

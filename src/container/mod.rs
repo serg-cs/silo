@@ -19,8 +19,8 @@ pub(crate) fn validate_config(
             crate::apple::mount_argument_path(project_root)?;
             crate::apple::mount_argument_path(&project_dir)?;
             let read_only =
-                mounts::resolve_read_only_paths(project_root, &config.workspace.read_only);
-            mounts::validate_project_targets(config, project_root, &project_dir, &read_only)
+                mounts::resolve_read_only_paths(project_root, &config.workspace.read_only)?;
+            mounts::validate_project_targets(config, project_root, &project_dir, &read_only.paths)
         }
         // The filesystem root has no container workdir. Config-only
         // inspection from `/` still validates context-independent syntax.
