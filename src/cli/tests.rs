@@ -2,7 +2,7 @@ use std::ffi::OsString;
 
 use clap::{Parser, error::ErrorKind};
 
-use super::{Cli, Command, ConfigCommand, ContainersCommand, StateCommand};
+use super::{Cli, Command, ConfigCommand, ContainersCommand, ImageCommand, StateCommand};
 
 fn parse(args: &[&str]) -> Command {
     let arguments: Vec<OsString> = args.iter().map(OsString::from).collect();
@@ -327,7 +327,15 @@ fn builtin_subcommands_win_over_quick_commands() {
     assert!(matches!(parse(&["silo", "stop"]), Command::Stop { .. }));
     assert!(matches!(
         parse(&["silo", "image", "build"]),
-        Command::Image { .. }
+        Command::Image {
+            command: ImageCommand::Build
+        }
+    ));
+    assert!(matches!(
+        parse(&["silo", "image", "update"]),
+        Command::Image {
+            command: ImageCommand::Update
+        }
     ));
     assert!(matches!(
         parse(&["silo", "containers"]),

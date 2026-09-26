@@ -55,6 +55,7 @@
             <li>Everyday CLI tools including Ripgrep, fd, fzf, jq, bat, tmux, and Vim.</li>
           </ul>
           <p>That extras layer is intentionally small. A configured Dockerfile replaces it while preserving the base contract; extra agents, language toolchains, browsers, and editors belong there. Silo builds deliberately without a persistent cache and validates candidates before publication. See <a href="../how-it-works/#image-contract">image build and publication</a> for the exact base-and-extras, no-cache, staging, and cleanup behavior.</p>
+          <p><code>silo image update</code> repeats that tool-layer build on the <code>silo-base:latest</code> already published locally and publishes the same derivative tag. The base image stays in place. Recreating the runtime base, including after a Silo upgrade, remains <code>silo image build</code>.</p>
         </section>
 
         <section id="sessions">

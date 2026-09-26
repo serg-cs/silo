@@ -128,6 +128,109 @@ pub(crate) fn build(config: &Config, project_root: &Path) -> Result<ExitCode> {
         delete_builder,
     )
 }
+
+/// Rebuilds the selected tool layer on the published local base.
+///
+/// The tool Dockerfile is sent to the builder unchanged, with the local
+/// `silo-base:latest` tag as its parent. The base tag is left in place.
+pub(crate) fn update(config: &Config, project_root: &Path) -> Result<ExitCode> {
+    validate_config(config, project_root)?;
+    let target = reference(config, project_root)?;
+    let _build_lock = acquire_build_lock()?;
+    ensure_container_system_started()?;
+    require_published_base()?;
+    build_updated_image(config, project_root, &target)
+}
+
+fn build_updated_image(config: &Config, project_root: &Path, target: &str) -> Result<ExitCode> {
+    let build_dir = BuildDir::create()?;
+    let (dockerfile, context) = update_dockerfile(config, project_root, &build_dir)?;
+    let _staged = StagedImage(STAGING_IMAGE_TAG);
+    let status = build_and_validate_image(
+        update_build_command(&dockerfile, &context),
+        STAGING_IMAGE_TAG,
+        target,
+    )?;
+    if status != ExitCode::SUCCESS {
+        return Ok(status);
+    }
+    publish_updated_image(target)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Selects the tool Dockerfile without inlining the runtime base.
+fn update_dockerfile(
+    config: &Config,
+    project_root: &Path,
+    build_dir: &BuildDir,
+) -> Result<(PathBuf, PathBuf)> {
+    if let Some(dockerfile) = configured_dockerfile(config, project_root)? {
+        let context = dockerfile_context(&dockerfile).to_path_buf();
+        return Ok((dockerfile, context));
+    }
+    let dockerfile = build_dir.derivative_dockerfile();
+    fs::write(&dockerfile, EXTRAS_DOCKERFILE).context("failed to write extras Dockerfile")?;
+    Ok((dockerfile, build_dir.path().to_path_buf()))
+}
+
+fn update_build_command(dockerfile: &Path, context: &Path) -> Command {
+    let build_args: &[String] = &[];
+    build_command(
+        dockerfile,
+        context,
+        STAGING_IMAGE_TAG,
+        false,
+        BuildCache::Disabled,
+        build_args,
+    )
+}
+
+fn require_published_base() -> Result<()> {
+    require_base_digest(current_image_digest(BASE_IMAGE_TAG))?;
+    Ok(())
+}
+
+fn require_base_digest(digest: Result<Option<String>>) -> Result<String> {
+    match digest? {
+        Some(digest) => Ok(digest),
+        None => Err(anyhow!(
+            "image `{BASE_IMAGE_TAG}` not built yet; run `silo image build` first"
+        )),
+    }
+}
+
+/// Tags that move when an update replaces the selected derivative.
+struct UpdatePublication {
+    reclaim_tag: &'static str,
+    publish: Command,
+}
+
+fn update_publication(target: &str) -> UpdatePublication {
+    UpdatePublication {
+        reclaim_tag: OBSOLETE_IMAGE_TAG,
+        publish: image_tag_command(STAGING_IMAGE_TAG, target),
+    }
+}
+
+/// Publishes the staged tool layer and leaves the runtime base tag in place.
+///
+/// A running container can keep the previous derivative alive, so reclaim
+/// deletion must not undo a tag that has already moved.
+fn publish_updated_image(target: &str) -> Result<()> {
+    let publication = update_publication(target);
+    let previous = retain_previous_image(target, publication.reclaim_tag)?;
+    let published = execute_maintenance(publication.publish, &format!("publish image `{target}`"));
+    let cleaned = remove_reclaimed_image(publication.reclaim_tag, previous.as_deref());
+    finish_updated_publication(published, cleaned)
+}
+
+fn finish_updated_publication(published: Result<()>, cleaned: Result<()>) -> Result<()> {
+    if let Err(err) = cleaned {
+        eprintln!("warning: replaced image cleanup failed: {err:#}");
+    }
+    published
+}
+
 fn build_configured_image(config: &Config, project_root: &Path, target: &str) -> Result<ExitCode> {
     let build_dir = BuildDir::create()?;
     write_build_context(&build_dir)?;
@@ -305,7 +408,7 @@ fn ensure_container_system_started() -> Result<()> {
     let (_, stderr) = probe_image(DEFAULT_IMAGE_TAG)?;
     if start_system_for_error(&stderr, start_container_system) == SystemStart::Failed {
         return Err(anyhow!(
-            "could not start the Apple container system before cleaning build storage"
+            "could not start the Apple container system before building an image"
         ));
     }
     Ok(())

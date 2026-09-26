@@ -568,6 +568,136 @@ fn build_lock_location_is_stable_for_the_current_user() {
     );
 }
 #[test]
+fn update_build_command_disables_cache_without_pulling_the_base() {
+    let command = update_build_command(Path::new("/tmp/silo-extras.dockerfile"), Path::new("/tmp"));
+    let args = command_args(&command);
+    assert_eq!(
+        &args[..7],
+        [
+            "build",
+            "--file",
+            "/tmp/silo-extras.dockerfile",
+            "--tag",
+            STAGING_IMAGE_TAG,
+            "--no-cache",
+            "/tmp",
+        ]
+    );
+    assert!(!args.contains(&"--pull"));
+    assert!(!args.contains(&"--build-arg"));
+}
+
+#[test]
+fn update_writes_the_embedded_extras_dockerfile_unchanged() {
+    let dir = test_dir("update-extras");
+    let build_dir =
+        BuildDir::create_for_test(dir.path()).expect("build directory creation succeeds");
+    let (dockerfile, context) = update_dockerfile(&Config::default(), dir.path(), &build_dir)
+        .expect("embedded extras resolve");
+
+    assert_eq!(context, build_dir.path());
+    assert_eq!(
+        fs::read_to_string(&dockerfile).expect("extras Dockerfile reads"),
+        EXTRAS_DOCKERFILE
+    );
+    assert!(EXTRAS_DOCKERFILE.starts_with("FROM silo-base:latest\n"));
+    let entries = fs::read_dir(build_dir.path())
+        .expect("build context reads")
+        .map(|entry| entry.expect("build context entry reads").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, [OsString::from("silo-derivative.dockerfile")]);
+}
+
+#[test]
+fn update_uses_a_configured_dockerfile_and_its_context_directly() {
+    let dir = test_dir("update-custom");
+    let dockerfile = dir.path().join("Dockerfile.silo");
+    fs::write(&dockerfile, "FROM silo-base:latest\nRUN true\n").expect("Dockerfile write succeeds");
+    let build_dir =
+        BuildDir::create_for_test(dir.path()).expect("build directory creation succeeds");
+    let mut config = Config::default();
+    config.image.dockerfile = Some(dockerfile.clone());
+
+    let (resolved, context) =
+        update_dockerfile(&config, dir.path(), &build_dir).expect("configured Dockerfile resolves");
+    assert_eq!(resolved, dockerfile);
+    assert_eq!(context, dir.path());
+
+    let command = update_build_command(&resolved, &context);
+    let args = command_args(&command);
+    assert!(args.windows(2).any(|pair| {
+        pair == [
+            "--file",
+            dockerfile.to_str().expect("dockerfile path is UTF-8"),
+        ]
+    }));
+    assert_eq!(args.last().copied(), dir.path().to_str());
+    assert!(args.contains(&"--no-cache"));
+    assert!(!args.contains(&"--pull"));
+    assert!(!args.contains(&"--build-arg"));
+    assert!(args.contains(&STAGING_IMAGE_TAG));
+    let entries = fs::read_dir(build_dir.path())
+        .expect("temporary context reads")
+        .count();
+    assert_eq!(entries, 0);
+}
+
+#[test]
+fn update_validates_custom_dockerfiles_before_runtime_access() {
+    let dir = test_dir("missing-update-dockerfile");
+    let mut config = Config::default();
+    config.image.dockerfile = Some(dir.path().join("Dockerfile"));
+
+    let error = update(&config, dir.path()).expect_err("missing Dockerfile prevents an update");
+    assert!(error.to_string().contains("does not exist"));
+}
+
+#[test]
+fn missing_base_requires_a_full_image_build() {
+    let missing = require_base_digest(Ok(None)).expect_err("missing base");
+    let message = missing.to_string();
+    assert!(message.contains(BASE_IMAGE_TAG));
+    assert!(message.contains("silo image build"));
+
+    let digest = "sha256:abc";
+    assert_eq!(
+        require_base_digest(Ok(Some(digest.to_string()))).expect("present base"),
+        digest
+    );
+
+    let inspect = require_base_digest(Err(anyhow!("could not check for image `{BASE_IMAGE_TAG}`")))
+        .expect_err("inspect failure");
+    assert!(inspect.to_string().contains("could not check"));
+    assert!(!inspect.to_string().contains("not built yet"));
+}
+
+#[test]
+fn update_publication_keeps_a_moved_tag_when_reclaim_cleanup_fails() {
+    assert!(finish_updated_publication(Ok(()), Err(anyhow!("image is in use"))).is_ok());
+
+    let error = finish_updated_publication(Err(anyhow!("publish failed")), Ok(()))
+        .expect_err("publication failure remains");
+    assert!(error.to_string().contains("publish failed"));
+}
+
+#[test]
+fn update_publication_replaces_only_the_derivative_tag() {
+    for target in ["silo:latest", "silo:custom-example"] {
+        let publication = update_publication(target);
+        assert_eq!(publication.reclaim_tag, OBSOLETE_IMAGE_TAG);
+        let publish = command_args(&publication.publish);
+        assert_eq!(publish, ["image", "tag", STAGING_IMAGE_TAG, target]);
+        let retain_command = image_tag_command(target, publication.reclaim_tag);
+        let retain = command_args(&retain_command);
+        assert_eq!(retain, ["image", "tag", target, OBSOLETE_IMAGE_TAG]);
+        let rendered = format!("{retain:?} {publish:?}");
+        assert!(!rendered.contains(BASE_IMAGE_TAG));
+        assert!(!rendered.contains(OBSOLETE_BASE_IMAGE_TAG));
+        assert!(!rendered.contains(BASE_STAGING_IMAGE_TAG));
+    }
+}
+
+#[test]
 fn runtime_asset_build_arguments_round_trip_without_context_files() {
     let build_args = runtime_asset_build_args();
     assert_eq!(build_args.len(), RUNTIME_ASSETS.len());

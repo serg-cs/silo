@@ -28,7 +28,9 @@ silo run
 ```
 
 Run `silo image build` again after upgrading Silo so the local runtime matches
-the installed binary.
+the installed binary. `silo image update` rebuilds the tool layer on the base
+already published; an upgraded Silo still needs a full build so the entrypoint,
+lifecycle helper, and sshd config match the installed binary.
 
 For the complete setup guide and current behavior, continue to the **[documentation](https://serg-cs.github.io/silo/docs/)**.
 

@@ -107,6 +107,8 @@ pub(crate) enum ConfigCommand {
 pub(crate) enum ImageCommand {
     /// Rebuild the Silo base and configured derivative without cached layers.
     Build,
+    /// Rebuild the selected tool layer on the existing local base without cached layers.
+    Update,
 }
 
 #[derive(Subcommand)]

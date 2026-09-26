@@ -38,13 +38,14 @@ fn try_run(cli: Cli) -> anyhow::Result<ExitCode> {
                 storage::managed::delete_selected_state(&selector)
             }
         },
-        Command::Image {
-            command: ImageCommand::Build,
-        } => {
+        Command::Image { command } => {
             let project_root = project::current_project_root()?;
             let config = load_config(&project_root, None, None, false)?;
             validate_config(&config, &project_root, ValidationProfile::Standard)?;
-            image::build(&config, &project_root)
+            match command {
+                ImageCommand::Build => image::build(&config, &project_root),
+                ImageCommand::Update => image::update(&config, &project_root),
+            }
         }
         Command::Run {
             isolated,

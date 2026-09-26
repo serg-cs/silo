@@ -63,6 +63,7 @@
           <h2><a href="#first-session">Your first session</a></h2>
           <p>Build the default development image:</p>
           <pre data-copy><code>silo image build</code></pre>
+          <p>Later, <code>silo image update</code> rebuilds the tool layer on that existing base. Upgrading Silo still requires <code>silo image build</code>, because the runtime programs are part of the base.</p>
           <p>Move into a project and open a shell:</p>
           <pre data-copy><code>cd ~/code/my-project
 silo run</code></pre>

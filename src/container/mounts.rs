@@ -255,9 +255,8 @@ fn read_only_skip_warning(path: &Path, reason: &str) -> String {
 }
 
 fn read_only_unresolvable_warning(path: &Path, candidate: &Path, root: &Path) -> String {
-    let is_symlink = fs::symlink_metadata(candidate)
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false);
+    let is_symlink =
+        fs::symlink_metadata(candidate).is_ok_and(|meta| meta.file_type().is_symlink());
     if is_symlink {
         match fs::canonicalize(candidate) {
             Ok(host) if !host.starts_with(root) => {

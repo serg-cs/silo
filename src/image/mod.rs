@@ -18,7 +18,7 @@ pub(crate) mod runtime_contract;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use build::build;
+pub(crate) use build::{build, update};
 #[cfg(test)]
 use dockerfile::{compose_derivative, validate_dockerfile};
 
