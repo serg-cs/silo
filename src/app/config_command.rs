@@ -127,9 +127,9 @@ pub(super) fn run_editor(
         .arg("silo-config-editor")
         .arg(path)
         .status()
-        .with_context(|| format!("failed to start config editor `{editor}`"))?;
+        .with_context(|| format!("failed to start editor `{editor}`"))?;
     if !status.success() {
-        return Err(anyhow!("config editor exited with status {status}"));
+        return Err(anyhow!("editor exited with status {status}"));
     }
     Ok(())
 }

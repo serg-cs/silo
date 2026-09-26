@@ -55,7 +55,7 @@
           <nav class="command-index" aria-label="Command overview">
             <a href="#run"><code>silo run</code><span>Open a session or run a command.</span></a>
             <a href="#persistent"><code>silo start / stop</code><span>Control a persistent shared container.</span></a>
-            <a href="#image"><code>silo image</code><span>Build or update the workspace image.</span></a>
+            <a href="#image"><code>silo image</code><span>Build, update, or edit the workspace image.</span></a>
             <a href="#config"><code>silo config</code><span>Inspect and manage configuration.</span></a>
             <a href="#containers"><code>silo containers</code><span>Inspect or delete Silo containers.</span></a>
             <a href="#state"><code>silo state</code><span>Inspect or delete managed state.</span></a>
@@ -122,7 +122,7 @@ silo stop</code></pre>
         </section>
 
         <section id="image">
-          <h2><a href="#image">Build or update the image</a></h2>
+          <h2><a href="#image">Build, update, or edit the image</a></h2>
           <div class="command-block">
             <div class="command-block-heading"><h3><code>silo image build</code></h3><span>Image command</span></div>
             <pre class="command-usage"><code>silo image build</code></pre>
@@ -133,6 +133,11 @@ silo stop</code></pre>
             <div class="command-block-heading"><h3><code>silo image update</code></h3><span>Image command</span></div>
             <pre class="command-usage"><code>silo image update</code></pre>
             <p>Rebuild and validate the selected tool layer on the existing local <code>silo-base:latest</code>. With no <code>image.dockerfile</code>, Silo republishes its embedded extras image as <code>silo:latest</code>. A configured Dockerfile keeps its deterministic local tag. The base tag, running containers, and Apple's builder stay in place.</p>
+          </div>
+          <div class="command-block">
+            <div class="command-block-heading"><h3><code>silo image edit</code></h3><span>Image command</span></div>
+            <pre class="command-usage"><code>silo image edit</code></pre>
+            <p>Open the Dockerfile selected by <code>image.dockerfile</code> in <code>$VISUAL</code>, then <code>$EDITOR</code>, then <code>vi</code>. When <code>image.dockerfile</code> is unset, print a message and leave the embedded extras image unopened. The command does not create a file or build an image.</p>
           </div>
           <p>Update builds that tool Dockerfile with <code>--no-cache</code> and without <code>--pull</code>. <code>FROM silo-base:latest</code> names the published local image. Silo inspects that tag first and stops when it is missing, before a resolver can look for it in a registry. Homebrew formulae come from the taps already stored in the base. After a Silo upgrade, or whenever the runtime base itself should be recreated, run <code>silo image build</code>.</p>
           <p>Silo starts Apple's container system when necessary and serializes concurrent Silo image builds and updates. See <a href="../how-it-works/#image-contract">image build and publication</a> for the authoritative no-cache, base-and-extras, staging, validation, and cleanup lifecycle.</p>

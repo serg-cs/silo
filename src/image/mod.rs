@@ -63,6 +63,28 @@ fn configured_dockerfile(config: &Config, project_root: &Path) -> Result<Option<
     )?))
 }
 
+/// Resolves the extras Dockerfile `silo image edit` should open.
+///
+/// `Ok(None)` means the effective config selects the embedded extras image,
+/// so there is no file to edit.
+///
+/// # Errors
+///
+/// Returns an error when the configured path is empty or cannot be resolved.
+pub(crate) fn edit_path(
+    config: &Config,
+    project_root: &Path,
+    home: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let Some(dockerfile) = &config.image.dockerfile else {
+        return Ok(None);
+    };
+    if dockerfile.as_os_str().is_empty() {
+        return Err(anyhow!("image dockerfile path is empty"));
+    }
+    Ok(Some(paths::resolve_host(dockerfile, project_root, home)?))
+}
+
 /// Gives each Dockerfile, context, and ignore-rule selection a stable tag.
 fn custom_image_reference(dockerfile: &Path) -> Result<String> {
     let canonical_dockerfile = fs::canonicalize(dockerfile).with_context(|| {

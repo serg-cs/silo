@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use anyhow::anyhow;
 
 use crate::cli::{Cli, Command, ConfigCommand, ContainersCommand, ImageCommand, StateCommand};
+use crate::output::write_stdout;
 use crate::{config, container, host_ports, image, project, storage};
 
 mod config_command;
@@ -41,10 +42,16 @@ fn try_run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Image { command } => {
             let project_root = project::current_project_root()?;
             let config = load_config(&project_root, None, None, false)?;
-            validate_config(&config, &project_root, ValidationProfile::Standard)?;
             match command {
-                ImageCommand::Build => image::build(&config, &project_root),
-                ImageCommand::Update => image::update(&config, &project_root),
+                ImageCommand::Edit => edit_image(&config, &project_root),
+                ImageCommand::Build => {
+                    validate_config(&config, &project_root, ValidationProfile::Standard)?;
+                    image::build(&config, &project_root)
+                }
+                ImageCommand::Update => {
+                    validate_config(&config, &project_root, ValidationProfile::Standard)?;
+                    image::update(&config, &project_root)
+                }
             }
         }
         Command::Run {
@@ -121,6 +128,29 @@ fn run_config_command(command: Option<&ConfigCommand>) -> anyhow::Result<ExitCod
             config_command::print_valid()
         }
         Some(ConfigCommand::Default) => config_command::print_default(),
+    }
+}
+
+/// Opens the configured extras Dockerfile, or reports that the embedded image is in use.
+fn edit_image(config: &config::Config, project_root: &std::path::Path) -> anyhow::Result<ExitCode> {
+    let home = std::env::var_os("HOME");
+    match image::edit_path(
+        config,
+        project_root,
+        home.as_deref().map(std::path::Path::new),
+    )? {
+        None => {
+            write_stdout("no image dockerfile configured; Silo uses the embedded extras image\n")?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(path) => {
+            config_command::run_editor(
+                &path,
+                std::env::var_os("VISUAL").as_deref(),
+                std::env::var_os("EDITOR").as_deref(),
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

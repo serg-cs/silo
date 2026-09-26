@@ -62,6 +62,57 @@ fn validate_config_resolves_a_project_relative_dockerfile() {
     validate_config(&config, project.path()).expect("relative dockerfile resolves at use");
 }
 
+#[test]
+fn edit_path_is_absent_when_no_dockerfile_is_configured() {
+    let project = test_dir("edit-unset");
+    let path = edit_path(&Config::default(), project.path(), None).expect("unset dockerfile");
+    assert_eq!(path, None);
+}
+
+#[test]
+fn edit_path_joins_a_project_relative_dockerfile() {
+    let project = test_dir("edit-relative");
+    let mut config = Config::default();
+    config.image.dockerfile = Some(PathBuf::from("containers/Dockerfile"));
+    let path = edit_path(&config, project.path(), None).expect("relative dockerfile");
+    assert_eq!(path, Some(project.path().join("containers/Dockerfile")));
+}
+
+#[test]
+fn edit_path_expands_a_home_relative_dockerfile() {
+    let project = test_dir("edit-home");
+    let home = project.path().join("home");
+    let mut config = Config::default();
+    config.image.dockerfile = Some(PathBuf::from("~/silo/Dockerfile"));
+    let path = edit_path(&config, project.path(), Some(&home)).expect("home dockerfile");
+    assert_eq!(path, Some(home.join("silo/Dockerfile")));
+}
+
+#[test]
+fn edit_path_rejects_an_empty_dockerfile() {
+    let project = test_dir("edit-empty");
+    let mut config = Config::default();
+    config.image.dockerfile = Some(PathBuf::new());
+    let message = edit_path(&config, project.path(), None)
+        .expect_err("empty dockerfile is rejected")
+        .to_string();
+    assert!(
+        message.contains("image dockerfile path is empty"),
+        "{message}"
+    );
+}
+
+#[test]
+fn edit_path_requires_home_for_a_home_relative_dockerfile() {
+    let project = test_dir("edit-no-home");
+    let mut config = Config::default();
+    config.image.dockerfile = Some(PathBuf::from("~/silo/Dockerfile"));
+    let message = edit_path(&config, project.path(), None)
+        .expect_err("missing home is reported")
+        .to_string();
+    assert!(message.contains("HOME is unset"), "{message}");
+}
+
 #[cfg(unix)]
 #[test]
 fn shared_dockerfile_symlinks_in_different_contexts_have_distinct_tags() {

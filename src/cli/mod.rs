@@ -109,6 +109,8 @@ pub(crate) enum ImageCommand {
     Build,
     /// Rebuild the selected tool layer on the existing local base without cached layers.
     Update,
+    /// Open the configured image Dockerfile in the editor.
+    Edit,
 }
 
 #[derive(Subcommand)]

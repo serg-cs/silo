@@ -338,6 +338,12 @@ fn builtin_subcommands_win_over_quick_commands() {
         }
     ));
     assert!(matches!(
+        parse(&["silo", "image", "edit"]),
+        Command::Image {
+            command: ImageCommand::Edit
+        }
+    ));
+    assert!(matches!(
         parse(&["silo", "containers"]),
         Command::Containers { command: None }
     ));
