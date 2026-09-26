@@ -3,14 +3,18 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Install Silo and open your first project workspace.">
+    <meta name="description" content="Install Silo, build the workspace image, and open a project shell.">
     <meta name="theme-color" content="#fcc010">
+    <meta property="og:title" content="Getting started — Silo">
+    <meta property="og:description" content="Install Silo, build the workspace image, and open a project shell.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://serg-cs.github.io/silo/docs/">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/">
     <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="../assets/base.css">
     <link rel="stylesheet" href="../assets/docs.css">
     <script src="../assets/site.js" defer></script>
-    <title>Documentation — Silo</title>
+    <title>Getting started — Silo</title>
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
@@ -28,57 +32,83 @@
     </header>
 
     <main class="docs-layout" id="main">
-      <aside class="docs-sidebar" aria-label="Documentation navigation">
-        <p class="docs-sidebar-title">Documentation</p>
-        <nav aria-label="Documentation sections">
-          <a href="./" aria-current="page">Start here</a>
-          <a href="./concepts/">Concepts</a>
-          <a href="./configuration/">Configuration</a>
-          <a href="./how-it-works/">How it works</a>
-          <a href="./tips/">Tips &amp; troubleshooting</a>
-        </nav>
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">Documentation</p>
+          <nav aria-label="Documentation sections">
+            <a href="./" aria-current="page">Getting started</a>
+            <a href="./concepts/">Concepts</a>
+            <a href="./configuration/">Configuration</a>
+            <a href="./commands/">Commands</a>
+            <a href="./how-it-works/">How it works</a>
+            <a href="./tips/">Tips &amp; troubleshooting</a>
+          </nav>
+        </div>
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">On this page</p>
+          <nav class="toc-nav" aria-label="On this page">
+            <a href="#requirements">Requirements</a>
+            <a href="#install">Install</a>
+            <a href="#image">Build the image</a>
+            <a href="#workspace">Open a workspace</a>
+            <a href="#upgrade">Upgrade</a>
+            <a href="#uninstall">Uninstall</a>
+          </nav>
+        </div>
       </aside>
 
       <article class="doc-content">
         <header class="doc-header">
           <p class="eyebrow">Documentation</p>
-          <h1>Get started with Silo.</h1>
-          <p>Install Silo, build its development image, and open a shell in your project.</p>
+          <h1>Get started.</h1>
+          <p>Install the binary, build the workspace image, and open a shell in your project.</p>
         </header>
 
         <section id="requirements">
           <h2><a href="#requirements">Requirements</a></h2>
-          <p>Silo runs on Apple's <code>container</code> CLI. Its upstream supported environment is an Apple silicon Mac running macOS 26. Consult the <a href="https://github.com/apple/container#requirements" target="_blank" rel="noopener noreferrer">official runtime requirements</a> for current platform details.</p>
+          <p>An Apple silicon Mac running macOS 26 or later, with:</p>
+          <ul>
+            <li><a href="https://github.com/apple/container" target="_blank" rel="noopener noreferrer">Apple container</a></li>
+            <li><a href="https://www.rust-lang.org/tools/install" target="_blank" rel="noopener noreferrer">Rust</a> 1.91 or newer, with Cargo</li>
+          </ul>
+          <p>Silo starts the container service when a command needs it.</p>
         </section>
 
         <section id="install">
-          <h2><a href="#install">Install from source</a></h2>
-          <p>Install Rust 1.91 or newer with Cargo, then build and install the latest Silo source directly from GitHub:</p>
+          <h2><a href="#install">Install</a></h2>
           <pre data-copy><code>cargo install --git https://github.com/serg-cs/silo --locked</code></pre>
-          <p>Verify the installation:</p>
           <pre data-copy><code>silo --version</code></pre>
+          <p>Cargo installs the binary to <code>~/.cargo/bin</code>. If the shell cannot find <code>silo</code>, open a new terminal and check that <code>~/.cargo/bin</code> is on <code>$PATH</code>.</p>
         </section>
 
-        <section id="first-session">
-          <h2><a href="#first-session">Your first session</a></h2>
-          <p>Build the default development image:</p>
+        <section id="image">
+          <h2><a href="#image">Build the image</a></h2>
           <pre data-copy><code>silo image build</code></pre>
-          <p>Later, <code>silo image update</code> rebuilds the tool layer on that existing base. Upgrading Silo still requires <code>silo image build</code>, because the runtime programs are part of the base.</p>
-          <p>Move into a project and open a shell:</p>
+          <p>The first build takes a while. A zero exit status means the image is ready. The default image includes Codex, Claude Code, Node.js, and everyday command-line tools.</p>
+          <p>Run <code>silo image build</code> again after upgrading Silo. <code>silo image update</code> refreshes the tool layer on a base you already have. A project that sets <code>image.dockerfile</code> should be your current directory for the build. See <a href="./concepts/#image">images</a>.</p>
+        </section>
+
+        <section id="workspace">
+          <h2><a href="#workspace">Open a workspace</a></h2>
           <pre data-copy><code>cd ~/code/my-project
 silo run</code></pre>
-          <p>Silo mounts the project as the container's working directory. When the shell exits, your project files remain on the host.</p>
-          <p>To retain container processes and ephemeral filesystem state between sessions, use <code>silo start</code> before running commands and <code>silo stop</code> when finished.</p>
+          <p>Silo mounts the project and opens a Linux shell. The working directory is <code>/home/silo/</code> plus the directory name. Your files stay on the Mac, and <code>exit</code> brings you back.</p>
+          <p>Use <code>--</code> to run one command instead of a shell:</p>
+          <pre data-copy><code>silo run -- uname -s</code></pre>
+          <p><code>silo start</code> keeps the container running between commands. <code>silo stop</code> shuts it down.</p>
         </section>
 
-        <section id="next-steps">
-          <h2><a href="#next-steps">Where to go next</a></h2>
-          <ul>
-            <li>Read <a href="./concepts/">Concepts</a> for the project, image, container, session, and state model.</li>
-            <li>Use the <a href="./commands/">Command reference</a> for every subcommand, flag, alias, and selector.</li>
-            <li>Open <a href="./configuration/">Configuration</a> for the complete TOML schema and merge rules.</li>
-            <li>Visit <a href="./tips/">Tips &amp; troubleshooting</a> for practical workflows and common fixes.</li>
-          </ul>
+        <section id="upgrade">
+          <h2><a href="#upgrade">Upgrade</a></h2>
+          <pre data-copy><code>cargo install --git https://github.com/serg-cs/silo --locked
+silo image build</code></pre>
+          <p>The rebuild keeps the image's entrypoint and helpers matched to the binary. A container that is already running keeps its old image until you stop it and start the workspace again.</p>
+        </section>
+
+        <section id="uninstall">
+          <h2><a href="#uninstall">Uninstall</a></h2>
+          <pre data-copy><code>cargo uninstall silo</code></pre>
+          <p>That removes the binary. Images, containers, and saved state stay behind. Clear containers and state with <code>silo containers</code> and <code>silo state</code> before uninstalling if you want them gone. Where that state lives is described in <a href="./concepts/#state">state</a>.</p>
         </section>
 
         <nav class="page-links page-links-next" aria-label="Next documentation page">

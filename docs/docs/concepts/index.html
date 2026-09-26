@@ -3,7 +3,11 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Understand Silo projects, images, sessions, containers, persistent state, binds, and custom image boundaries.">
+    <meta name="description" content="Understand Silo projects, images, sessions, file ownership, environment variables, persistent state, and custom images.">
+    <meta property="og:title" content="Concepts — Silo">
+    <meta property="og:description" content="Understand Silo projects, images, sessions, file ownership, environment variables, persistent state, and custom images.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://serg-cs.github.io/silo/docs/concepts/">
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/concepts/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
@@ -21,15 +25,38 @@
     </div></header>
 
     <main class="docs-layout" id="main">
-      <aside class="docs-sidebar" aria-label="Documentation navigation"><p class="docs-sidebar-title">Documentation</p><nav aria-label="Documentation sections">
-        <a href="../">Start here</a><a href="./" aria-current="page">Concepts</a><a href="../configuration/">Configuration</a><a href="../how-it-works/">How it works</a><a href="../tips/">Tips &amp; troubleshooting</a>
-      </nav></aside>
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">Documentation</p>
+          <nav aria-label="Documentation sections">
+            <a href="../">Getting started</a>
+            <a href="./" aria-current="page">Concepts</a>
+            <a href="../configuration/">Configuration</a>
+            <a href="../commands/">Commands</a>
+            <a href="../how-it-works/">How it works</a>
+            <a href="../tips/">Tips &amp; troubleshooting</a>
+          </nav>
+        </div>
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">On this page</p>
+          <nav class="toc-nav" aria-label="On this page">
+            <a href="#projects">Projects</a>
+            <a href="#image">Image layers</a>
+            <a href="#sessions">Sessions</a>
+            <a href="#ownership">File ownership</a>
+            <a href="#state">State</a>
+            <a href="#environment">Environment</a>
+            <a href="#read-only-boundary">Read-only paths</a>
+            <a href="#custom-images">Custom images</a>
+          </nav>
+        </div>
+      </aside>
 
       <article class="doc-content">
         <header class="doc-header">
           <p class="eyebrow">Concepts</p>
           <h1>The Silo mental model.</h1>
-          <p>A project selects a workspace. The image supplies the tools. Sessions decide how long a container lives, while binds and managed state decide which data outlives it.</p>
+          <p>A project selects a workspace. The image supplies the tools. Sessions decide how long a container lives, while binds, managed state, and an environment allowlist decide what else crosses the boundary.</p>
         </header>
 
         <section id="projects">
@@ -40,22 +67,14 @@
             <li>Without a Silo marker, Silo asks Git for the top-level working tree with <code>git rev-parse --show-toplevel</code>. Git therefore handles normal repositories, linked worktrees, and submodules itself.</li>
             <li>If Git is unavailable or does not report a valid ancestor, the exact current directory is the project.</li>
           </ol>
-          <p>The canonical root determines the mounted source tree, the container working directory, the shared container ID, project-scoped state, and ownership labels. Two directories with the same basename remain separate projects when their canonical paths differ.</p>
-          <div class="note"><p>Put an empty or partial <code>.silo.toml</code> at the directory you want to use when Silo's project root should differ from Git's root.</p></div>
+          <p>That root is what gets mounted, and it is what later sessions reuse. Two folders with the same name stay separate when their full paths differ.</p>
+          <div class="note"><p>Drop a <code>.silo.toml</code> in a directory when you want that directory, rather than the Git root, to be the project. Silo cannot use <code>/</code>, or a path that is not valid UTF-8 or that contains <code>,</code>, <code>=</code>, or a newline.</p></div>
         </section>
 
         <section id="image">
-          <h2><a href="#image">A stable base supports replaceable tool layers</a></h2>
-          <p><code>silo image build</code> first creates <code>silo-base:latest</code>. This Ubuntu-based image owns the stable Silo contract: the <code>silo</code> user, supported shells, Homebrew, sudo, restricted SSH host-port tunnels, lifecycle helper, entrypoint, and required filesystem paths.</p>
-          <p>Silo then builds one derivative. Without <code>image.dockerfile</code>, the embedded extras Dockerfile produces <code>silo:latest</code> with:</p>
-          <ul>
-            <li>Codex and Claude Code.</li>
-            <li>Bash, Zsh, Fish, and Nushell from the base image, with Zsh used by default and the <code>shell</code> configuration option selecting another shell.</li>
-            <li>Node.js, GitHub CLI, and Jujutsu.</li>
-            <li>Everyday CLI tools including Ripgrep, fd, fzf, jq, bat, tmux, and Vim.</li>
-          </ul>
-          <p>That extras layer is intentionally small. A configured Dockerfile replaces it while preserving the base contract; extra agents, language toolchains, browsers, and editors belong there. Silo builds deliberately without a persistent cache and validates candidates before publication. See <a href="../how-it-works/#image-contract">image build and publication</a> for the exact base-and-extras, no-cache, staging, and cleanup behavior.</p>
-          <p><code>silo image update</code> repeats that tool-layer build on the <code>silo-base:latest</code> already published locally and publishes the same derivative tag. The base image stays in place. Recreating the runtime base, including after a Silo upgrade, remains <code>silo image build</code>.</p>
+          <h2><a href="#image">Images are built in two layers</a></h2>
+          <p><code>silo image build</code> publishes a base image, then a tool image on top of it. The base contains everything Silo needs to run a session: the <code>silo</code> user, shells, Homebrew, and the programs that start commands and host ports.</p>
+          <p>The default tool image adds a small extras layer and is published as <code>silo:latest</code>. What it installs is in <a href="https://github.com/serg-cs/silo/blob/main/src/image/assets/silo-extras.dockerfile" target="_blank" rel="noopener noreferrer"><code>silo-extras.dockerfile</code></a>. A configured <code>image.dockerfile</code> replaces that layer. <code>silo image update</code> rebuilds it on the base you already have. After upgrading Silo, run <code>silo image build</code> so the base matches the new binary.</p>
         </section>
 
         <section id="sessions">
@@ -71,8 +90,13 @@
               <tr><td>Best for</td><td>Normal development and cooperating agents</td><td>Clean-room work and throwaway checks</td></tr>
             </tbody>
           </table></div>
-          <p>Shared does not mean global: one project never joins another project's container. It means that multiple commands for the same canonical project can share running processes and ephemeral container state while their sessions overlap.</p>
-          <p><code>silo start</code> keeps that same shared container running while it is idle; later sessions attach normally. Use <code>silo stop</code> when the persistent workspace is no longer needed.</p>
+          <p>Shared means several commands for the same project can see each other's processes and temporary files. A different project always gets its own container. <code>silo start</code> keeps the shared container up while it is idle. <code>silo stop</code> shuts it down.</p>
+        </section>
+
+        <section id="ownership">
+          <h2><a href="#ownership">Files you create belong to your Mac user</a></h2>
+          <p>Inside the container you are the user <code>silo</code>, with home <code>/home/silo</code>. The project is mounted at <code>/home/silo/</code> plus the directory name, and that is the working directory.</p>
+          <p>Silo maps that user to the Mac account that launched it, so new files in the project, in a writable bind, or in managed state belong to you. Files that were already there keep their existing owners.</p>
         </section>
 
         <section id="state">
@@ -87,7 +111,13 @@
             </tbody>
           </table></div>
           <p>Every bind declares <code>access = "read-only"</code> or <code>access = "read-write"</code>. Managed state is always writable. Relative targets beginning with <code>./</code> anchor to the project directory; <code>~/</code> anchors to the Silo user home; absolute targets stay absolute.</p>
-          <p>Managed state lives below <code>$XDG_STATE_HOME/silo/state</code>, or <code>~/.local/state/silo/state</code> when <code>XDG_STATE_HOME</code> is unavailable. Use <code>silo state</code> to inspect it and <code>silo state delete</code> to remove an unused entry safely.</p>
+          <p>Managed state lives under <code>$XDG_STATE_HOME/silo/state</code> when that variable is an absolute path, and under <code>~/.local/state/silo/state</code> when it is unset, empty, or relative and <code>HOME</code> is absolute. Use <code>silo state</code> to inspect it and <code>silo state delete</code> to remove an unused entry safely.</p>
+        </section>
+
+        <section id="environment">
+          <h2><a href="#environment">Environment is an allowlist of names</a></h2>
+          <p>Silo does not copy your shell environment into the container. <code>env_vars</code> names the variables to bring in, such as <code>OPENAI_API_KEY</code>. The value is read from the terminal that creates the container, and it is not written into config or into Silo's own output. A project list replaces the global one.</p>
+          <p>A session that joins a container already running keeps the values from when it was created. Stop it and start again after you change a name or a value. <code>HOME</code>, <code>PATH</code>, <code>SHELL</code>, <code>BREW_PREFIX</code>, and names beginning with <code>SILO_</code> are reserved. Inside a session, <code>HOME</code> is <code>/home/silo</code>.</p>
         </section>
 
         <section id="read-only-boundary">
@@ -95,9 +125,9 @@
           <p>The whole project tree is mounted read-write so editors, builds, formatters, and agents can change working files. By default, Silo overlays an existing <code>.git</code> or <code>.jj</code> directory read-only; tools can inspect repository metadata without changing it.</p>
           <p>Projects that expect containerized tools to manage repository metadata can remove those paths or disable the <code>workspace.read_only</code> overlays. Other project directories can be protected with the same literal, project-relative list:</p>
           <pre data-copy><code>workspace.read_only = [".github"]</code></pre>
-          <p>Use <code>workspace.read_only = []</code> instead to disable every read-only project overlay. Missing paths are skipped so shared configuration can list directories that some projects do not have. A path that exists but is not a usable in-project directory — including a linked-worktree or submodule <code>.git</code> file — is skipped and Silo prints a warning when the overlay would have been applied or when you run <code>silo config check</code>. Malformed entries are configuration errors. Project discovery still works through Git, but metadata stored outside the selected root is not mounted automatically. Separately configured binds retain their own access modes.</p>
-          <p>Configuration validation rejects read-write binds and managed-state mounts that overlap a protected path in either direction. A writable child could replace protected content directly, while a writable parent could hide the read-only overlay.</p>
-          <div class="warning"><p>Read-only overlays cannot target individual files because Apple container accepts only directories as bind-mount sources. A skipped entry provides no protection and does not participate in writable-overlap checks.</p></div>
+          <p><code>workspace.read_only = []</code> turns the overlays off. Missing paths are skipped, so a shared config can mention directories some projects do not have. A file, a broken symlink, or a path that leaves the project is skipped with a warning. Silo also refuses a writable bind or state mount that would cover a protected path or hide it.</p>
+          <div class="note"><p>A read-only <code>.git</code> does not hide <code>.github</code>. Silo remounts neighboring directories whose names start with the protected directory's name, so they stay visible and writable.</p></div>
+          <div class="warning"><p>Overlays can only cover directories. A skipped entry protects nothing.</p></div>
         </section>
 
         <section id="custom-images">
@@ -109,12 +139,12 @@ USER silo
 # Add the project-specific tools you need here.
 RUN brew install go
 USER root</code></pre>
-          <p>Silo replaces that reference with an internal stage before building, which prevents any registry lookup for <code>silo-base:latest</code>. ARG-based base references and additional local stages are rejected. External images may still be used by instructions such as <code>COPY --from=registry.example/tools:latest</code>. Silo preserves the configured directory as the context and gives each Dockerfile, effective build context, and Dockerfile-specific ignore selection a deterministic local image tag. This keeps shared Dockerfile contents from colliding when projects supply different relative <code>COPY</code> inputs or ignore rules. Because the custom Dockerfile replaces extras rather than extending them, reinstall any default extras you still want alongside project-specific tools.</p>
-          <div class="warning"><p>A custom Dockerfile is trusted input. Keep the inherited <code>silo</code> user, entrypoint, lifecycle helpers, supported shells, and expected paths intact. Silo catches basic startup incompatibilities, but does not police permissions, links, package changes, or every way root-level build instructions can break later sessions.</p></div>
+          <p>The Dockerfile needs exactly one stage, and that <code>FROM</code> line has to be literal. Silo rewrites it so the name is not looked up in a registry. The file's directory is the build context. Because this replaces the extras layer, reinstall Codex, Claude Code, or anything else from the default image that you still want.</p>
+          <div class="warning"><p>A custom Dockerfile is trusted. Keep the <code>silo</code> user, entrypoint, and shells working. Silo checks those on startup and leaves the rest to you.</p></div>
         </section>
 
         <nav class="page-links" aria-label="Adjacent documentation pages">
-          <a class="page-link" href="../"><span>Previous</span>Start here</a>
+          <a class="page-link" href="../"><span>Previous</span>Getting started</a>
           <a class="page-link" href="../configuration/"><span>Next</span>Configuration</a>
         </nav>
       </article>

@@ -3,7 +3,11 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Complete Silo TOML configuration reference, including precedence, workspaces, binds, state, host ports, quick commands, and custom images.">
+    <meta name="description" content="Complete Silo TOML configuration reference, including precedence, environment variables, workspaces, binds, state, host ports, quick commands, and custom images.">
+    <meta property="og:title" content="Configuration — Silo">
+    <meta property="og:description" content="Complete Silo TOML configuration reference, including precedence, environment variables, workspaces, binds, state, host ports, and quick commands.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://serg-cs.github.io/silo/docs/configuration/">
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/configuration/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
@@ -21,9 +25,35 @@
     </div></header>
 
     <main class="docs-layout" id="main">
-      <aside class="docs-sidebar" aria-label="Documentation navigation"><p class="docs-sidebar-title">Documentation</p><nav aria-label="Documentation sections">
-        <a href="../">Start here</a><a href="../concepts/">Concepts</a><a href="./" aria-current="page">Configuration</a><a href="../how-it-works/">How it works</a><a href="../tips/">Tips &amp; troubleshooting</a>
-      </nav></aside>
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">Documentation</p>
+          <nav aria-label="Documentation sections">
+            <a href="../">Getting started</a>
+            <a href="../concepts/">Concepts</a>
+            <a href="./" aria-current="page">Configuration</a>
+            <a href="../commands/">Commands</a>
+            <a href="../how-it-works/">How it works</a>
+            <a href="../tips/">Tips &amp; troubleshooting</a>
+          </nav>
+        </div>
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">On this page</p>
+          <nav class="toc-nav" aria-label="On this page">
+            <a href="#files">Files</a>
+            <a href="#merging">Merging</a>
+            <a href="#complete-example">Example</a>
+            <a href="#image-options">Image and container</a>
+            <a href="#environment">Environment</a>
+            <a href="#host-ports">Host ports</a>
+            <a href="#binds">Binds</a>
+            <a href="#managed-state">Managed state</a>
+            <a href="#target-paths">Target paths</a>
+            <a href="#quick">Quick commands</a>
+            <a href="#validation">Validation</a>
+          </nav>
+        </div>
+      </aside>
 
       <article class="doc-content">
         <header class="doc-header">
@@ -44,7 +74,13 @@
               <tr><td>Invocation</td><td><code>--cpus</code>, <code>--memory</code>, <code>--sudo</code></td><td>Container overrides for one run</td></tr>
             </tbody>
           </table></div>
-          <p>Precedence is <strong>built-in defaults → global file → project file → CLI flags</strong>. A missing global file leaves the filesystem unchanged and uses built-in defaults. Run <code>silo config edit --global</code> when you want to create the commented starter file.</p>
+          <p>Precedence is <strong>built-in defaults → global file → project file → CLI flags</strong>. A missing global file leaves the filesystem unchanged and uses built-in defaults. Run <code>silo config edit --global</code> when you want to edit the global config file.</p>
+          <p><code>silo config list</code> and <code>silo config list --json</code> omit settings that still match the built-in default. The <code>workspace</code> table is always printed, including the default read-only list. With no other settings, the TOML result is:</p>
+          <pre><code>[workspace]
+read_only = [
+    ".git",
+    ".jj",
+]</code></pre>
           <pre data-copy><code>silo config default  # print the starter file
 silo config path     # list active configuration sources
 silo config list     # print the merged result
@@ -53,9 +89,10 @@ silo config check    # validate the merged result</code></pre>
 
         <section id="merging">
           <h2><a href="#merging">How layers merge</a></h2>
-          <p>Silo delegates source merging to <code>config-rs</code>. Project scalars and arrays replace global values, omitted values inherit, and tables merge recursively by key:</p>
+          <p>Project scalars and arrays replace global values, omitted values inherit, and tables merge recursively by key:</p>
           <ul>
             <li><strong>Host ports replace as a collection.</strong> A project <code>host_ports</code> array replaces the global array; an empty array disables inherited host ports.</li>
+            <li><strong>Environment names replace as a collection.</strong> A project <code>env_vars</code> array replaces the global array; an empty array inherits no environment names.</li>
             <li><strong>Binds and state merge by name and field.</strong> Reusing a name under a different bind or state category is an error.</li>
             <li><strong>Read-only paths replace as a collection.</strong> A project <code>workspace.read_only</code> array replaces the global array; an empty array disables inherited read-only workspace overlays without changing bind permissions.</li>
             <li><strong>Quick commands merge by name.</strong> A project may add commands or replace the complete argument array for an inherited name. An empty project table changes nothing.</li>
@@ -73,6 +110,7 @@ container.cpus = 4
 container.memory = "6G"
 container.sudo = false
 shell = "zsh"
+env_vars = ["OPENAI_API_KEY", "AWS_PROFILE"]
 workspace.read_only = [".git", ".jj"]
 host_ports = [5432]
 
@@ -119,6 +157,25 @@ USER root</code></pre>
           <p>Before publication, Silo starts the candidate through its normal entrypoint and checks the <code>silo</code> identity, home, core lifecycle helpers, and supported shells. This is intentionally a small compatibility check. A custom Dockerfile is trusted project input, and its author is responsible for permissions, links, packages, and other root-level changes that may break Silo behavior.</p>
         </section>
 
+        <section id="environment">
+          <h2><a href="#environment">Environment</a></h2>
+          <pre data-copy><code>env_vars = ["OPENAI_API_KEY", "AWS_PROFILE"]</code></pre>
+          <p>Each entry is the name of a variable to inherit from the <code>silo</code> process that creates the container. Silo passes that name to Apple's runtime as <code>--env NAME</code>. The value stays in the process environment. It is not written into Silo's arguments, into either configuration file, or into <code>silo config list</code>.</p>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Rule</th><th>Behavior</th></tr></thead>
+            <tbody>
+              <tr><td>Default</td><td>No host variables are inherited. Sessions still have <code>HOME=/home/silo</code>, plus the image environment and Silo's own contract variables.</td></tr>
+              <tr><td>Name syntax</td><td>ASCII. The first character is a letter or <code>_</code>. The rest are letters, digits, or <code>_</code>.</td></tr>
+              <tr><td>Reserved names</td><td><code>HOME</code>, <code>PATH</code>, <code>SHELL</code>, <code>BREW_PREFIX</code>, and any name beginning with <code>SILO_</code> are rejected.</td></tr>
+              <tr><td>Duplicates</td><td>Repeated names collapse. <code>silo config list</code> prints the set in sorted order.</td></tr>
+              <tr><td>Merge</td><td>A project array replaces the global array. <code>env_vars = []</code> clears names inherited from the global file.</td></tr>
+              <tr><td>When it applies</td><td>Container creation, for both shared and isolated runs. Joining a running container does not re-read the host environment.</td></tr>
+            </tbody>
+          </table></div>
+          <p>There is no command-line flag for this setting. Export the values in the shell that runs <code>silo run</code>, <code>silo start</code>, or a quick command when that invocation creates the container. After a shared container exists, <code>silo stop</code> it and start the workspace again to capture new names or new values.</p>
+          <div class="note"><p>Store names in configuration and values in the environment. A value written into <code>.silo.toml</code> becomes an ordinary project file.</p></div>
+        </section>
+
         <section id="host-ports">
           <h2><a href="#host-ports">Host ports</a></h2>
           <pre data-copy><code>host_ports = [5432, 8080]</code></pre>
@@ -143,7 +200,7 @@ artifacts = { source = "./artifacts", target = "./artifacts", access = "read-wri
               <tr><td><code>access</code></td><td>Required</td><td>Explicitly selects <code>read-only</code> or <code>read-write</code>.</td></tr>
             </tbody>
           </table></div>
-          <p>Sources are canonicalized when a session starts. Missing paths, broken symlinks, and non-directory sources fail loudly instead of creating an unexpected bind.</p>
+          <p>Sources are canonicalized when a session starts. Missing paths, broken symlinks, and non-directory sources fail loudly instead of creating an unexpected bind. Silo expands a bare <code>~</code> or <code>~/…</code> for the current user. A <code>~otheruser</code> path is rejected. Relative sources from both the global file and the project file resolve from the project root.</p>
         </section>
 
         <section id="managed-state">
@@ -193,7 +250,7 @@ cx = ["codex", "--model", "gpt-5"]</code></pre>
           <p>The command does not start Apple's container runtime, build an image, create a container, or create managed-state directories. It checks:</p>
           <ul>
             <li>TOML structure, field types, unknown keys, and quick-command definitions.</li>
-            <li>CPU, memory, host ports, bind and state names, required fields, access modes, and path syntax.</li>
+            <li>CPU, memory, host ports, environment names, bind and state names, required fields, access modes, and path syntax.</li>
             <li>The complete custom-Dockerfile contract, including its resolved file, stage shape, base instruction, escape directive, and composed size.</li>
             <li>Bind sources after home expansion and canonicalization; each source must already exist as a real directory.</li>
             <li>Managed-state path derivation, mount targets, duplicate targets, protected runtime paths, and writable overlap with effective read-only workspace paths.</li>

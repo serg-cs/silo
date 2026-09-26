@@ -5,13 +5,17 @@
   margin: 0 auto;
   padding-block: 3rem 7rem;
   align-items: start;
-  grid-template-columns: 14rem minmax(0, var(--reading-width));
+  grid-template-columns: 15.5rem minmax(0, var(--reading-width));
   gap: clamp(2.5rem, 7vw, 7rem);
 }
 
 .docs-sidebar {
   position: sticky;
-  top: 7rem;
+  top: 5.75rem;
+  max-height: calc(100vh - 7rem);
+  overflow: auto;
+  padding-bottom: 1.5rem;
+  scrollbar-color: var(--border-strong) transparent;
 }
 
 .docs-sidebar-title {
@@ -21,6 +25,10 @@
   font-weight: 800;
   letter-spacing: 0.1em;
   text-transform: uppercase;
+}
+
+.sidebar-group + .sidebar-group {
+  margin-top: 1.7rem;
 }
 
 .docs-sidebar nav {
@@ -34,7 +42,12 @@
   color: var(--text-muted);
   font-size: 0.9rem;
   font-weight: 600;
+  line-height: 1.35;
   text-decoration: none;
+}
+
+.docs-sidebar .toc-nav a {
+  font-size: 0.84rem;
 }
 
 .docs-sidebar a:hover {
@@ -128,6 +141,7 @@
 
 pre {
   overflow-x: auto;
+  max-width: 100%;
   margin: 1.4rem 0;
   padding: 1rem 1.05rem;
   border: 1px solid #2b3931;
@@ -142,6 +156,8 @@ pre {
 
 .code-block {
   position: relative;
+  min-width: 0;
+  max-width: 100%;
   margin: 1.4rem 0;
 }
 
@@ -231,10 +247,83 @@ tr:last-child td {
   border-bottom: 0;
 }
 
-/* Give the standalone command reference its own compact scanning system. */
+/* Give the command reference the full content column for wide tables. */
 .command-layout {
-  grid-template-columns: 12rem minmax(0, 1fr);
+  grid-template-columns: 15.5rem minmax(0, 1fr);
   gap: clamp(2.5rem, 6vw, 5.5rem);
+}
+
+.checklist {
+  padding-left: 0;
+  list-style: none;
+}
+
+.checklist li {
+  position: relative;
+  padding-left: 1.45rem;
+}
+
+.checklist li::before {
+  position: absolute;
+  top: 0.55rem;
+  left: 0;
+  width: 0.48rem;
+  height: 0.48rem;
+  border-radius: 999px;
+  background: var(--accent);
+  content: "";
+}
+
+.install-steps {
+  display: grid;
+  margin-top: 1.4rem;
+  counter-reset: install;
+  gap: 0.9rem;
+}
+
+.install-step {
+  position: relative;
+  min-width: 0;
+  max-width: 100%;
+  padding: 1.25rem 1.25rem 1.25rem 4.35rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  counter-increment: install;
+}
+
+.doc-content .install-steps > .install-step + .install-step {
+  margin-top: 0;
+}
+
+.install-step::before {
+  position: absolute;
+  top: 1.2rem;
+  left: 1.15rem;
+  display: grid;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent-bright);
+  color: var(--accent-contrast);
+  content: counter(install);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.doc-content .install-step h3 {
+  margin: 0.15rem 0 0.75rem;
+}
+
+.step-check {
+  margin: 1.35rem 0 0.35rem;
+  color: var(--text);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .docs-sidebar code {
@@ -398,18 +487,38 @@ tr:last-child td {
 
 @media (max-width: 900px) {
   .docs-layout {
-    grid-template-columns: 1fr;
-    gap: 3rem;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2.5rem;
+  }
+
+  .docs-sidebar,
+  .doc-content,
+  .install-steps,
+  .install-step,
+  .code-block {
+    min-width: 0;
+    max-width: 100%;
   }
 
   .docs-sidebar {
     position: static;
-    padding-bottom: 1.5rem;
+    max-height: none;
+    padding-bottom: 1.25rem;
     border-bottom: 1px solid var(--border);
+    overflow: visible;
   }
 
-  .docs-sidebar nav {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+  .docs-sidebar nav,
+  .docs-sidebar .toc-nav {
+    display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
+    max-width: 100%;
+    gap: 0.35rem;
+  }
+
+  .docs-sidebar a {
+    white-space: nowrap;
   }
 
   .command-index {
@@ -424,12 +533,15 @@ tr:last-child td {
 }
 
 @media (max-width: 600px) {
-  .docs-sidebar nav {
-    grid-template-columns: 1fr;
+  .install-step {
+    padding: 1.05rem 0.95rem 1.05rem 3.5rem;
   }
 
-  .command-layout > .docs-sidebar {
-    display: none;
+  .install-step::before {
+    top: 1rem;
+    left: 0.7rem;
+    width: 1.75rem;
+    height: 1.75rem;
   }
 
   .table-wrap table {

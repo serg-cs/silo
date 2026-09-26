@@ -41,8 +41,8 @@
           <h1>Some things shouldn’t see the outside.</h1>
           <p class="hero-lede">Silo gives coding agents and developer tools a focused container on macOS—persistent where it helps, isolated when it matters, and clear about what crosses the boundary.</p>
           <div class="hero-actions">
-            <a class="button button-primary" href="./docs/">Read the documentation</a>
-            <a class="button" href="https://github.com/serg-cs/silo" target="_blank" rel="noopener noreferrer">View on GitHub</a>
+            <a class="button button-primary" href="./docs/">Install Silo</a>
+            <a class="button" href="./#manual">Browse the manual</a>
           </div>
         </div>
 
@@ -91,7 +91,7 @@
           <article class="feature">
             <span class="feature-number">04</span>
             <h3>Durable state, chosen explicitly</h3>
-            <p>Keep caches per project, share selected credentials across projects, or expose host directories with read-only access by default.</p>
+            <p>Keep caches per project, share selected tool state, forward named host environment variables, or expose host directories with read-only access by default.</p>
           </article>
           <article class="feature">
             <span class="feature-number">05</span>
@@ -127,12 +127,27 @@
         </div>
       </section>
 
+      <section class="content-section manual-section" id="manual">
+        <div class="section-intro">
+          <h2>The manual.</h2>
+          <p>Getting started is a short sequence. The rest of the documentation covers what Silo keeps, what it isolates, and every command that manages it.</p>
+        </div>
+        <div class="manual-grid">
+          <a href="./docs/">Getting started<span>Install Silo, build the image, and open a workspace.</span></a>
+          <a href="./docs/concepts/">Concepts<span>Projects, images, sessions, ownership, state, and environment.</span></a>
+          <a href="./docs/configuration/">Configuration<span>Every TOML key, how layers merge, and what validation checks.</span></a>
+          <a href="./docs/commands/">Commands<span>Syntax, flags, aliases, selectors, and command output.</span></a>
+          <a href="./docs/how-it-works/">How it works<span>Identity, session leases, mounts, images, and host ports.</span></a>
+          <a href="./docs/tips/">Tips &amp; troubleshooting<span>Agent workflows, credentials, caches, and fixes.</span></a>
+        </div>
+      </section>
+
       <section class="closing-panel">
         <div>
-          <h2>Know exactly what Silo does.</h2>
-          <p>Explore the lifecycle, every command, the full TOML schema, host ports, storage, custom images, and practical agent workflows.</p>
+          <h2>Open a workspace.</h2>
+          <p>Install the runtime, build the image once, and run the tools for a project from the directory where the work already lives.</p>
         </div>
-        <a class="button button-primary" href="./docs/">Open the docs</a>
+        <a class="button button-primary" href="./docs/">Install Silo</a>
       </section>
     </main>
 

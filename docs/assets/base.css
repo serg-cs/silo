@@ -229,6 +229,37 @@ a {
   color: var(--text);
 }
 
+/* Shared link tiles used by the landing page and the manual map. */
+.manual-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.manual-grid a {
+  display: grid;
+  padding: 1.05rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-small);
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 750;
+  gap: 0.35rem;
+  text-decoration: none;
+}
+
+.manual-grid a span {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+.manual-grid a:hover {
+  border-color: var(--border-strong);
+  color: var(--accent);
+}
+
 /* Collapse layouts carefully without hiding navigation or reference tables. */
 @media (max-width: 900px) {
   .nav-shell {
@@ -285,6 +316,10 @@ a {
     padding-block: 1.5rem;
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .manual-grid {
+    grid-template-columns: 1fr;
   }
 }
 

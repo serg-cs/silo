@@ -268,6 +268,16 @@
   font-size: 0.95rem;
 }
 
+.manual-section .manual-grid {
+  margin-top: 0.2rem;
+}
+
+@media (min-width: 901px) {
+  .manual-section .manual-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 .closing-panel {
   display: grid;
   width: min(calc(100% - 2rem), var(--content-width));

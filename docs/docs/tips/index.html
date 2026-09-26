@@ -3,14 +3,18 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Practical Silo workflows for coding agents, caches, host services, cleanup, custom images, and troubleshooting.">
+    <meta name="description" content="Practical Silo workflows for coding agents, credentials, caches, host services, cleanup, custom images, and troubleshooting.">
+    <meta property="og:title" content="Tips &amp; troubleshooting — Silo">
+    <meta property="og:description" content="Practical Silo workflows for coding agents, credentials, caches, host services, cleanup, custom images, and troubleshooting.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://serg-cs.github.io/silo/docs/tips/">
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/tips/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="../../assets/base.css">
     <link rel="stylesheet" href="../../assets/docs.css">
     <script src="../../assets/site.js" defer></script>
-    <title>Tips and troubleshooting — Silo</title>
+    <title>Tips &amp; troubleshooting — Silo</title>
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
@@ -21,15 +25,41 @@
     </div></header>
 
     <main class="docs-layout" id="main">
-      <aside class="docs-sidebar" aria-label="Documentation navigation"><p class="docs-sidebar-title">Documentation</p><nav aria-label="Documentation sections">
-        <a href="../">Start here</a><a href="../concepts/">Concepts</a><a href="../configuration/">Configuration</a><a href="../how-it-works/">How it works</a><a href="./" aria-current="page">Tips &amp; troubleshooting</a>
-      </nav></aside>
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">Documentation</p>
+          <nav aria-label="Documentation sections">
+            <a href="../">Getting started</a>
+            <a href="../concepts/">Concepts</a>
+            <a href="../configuration/">Configuration</a>
+            <a href="../commands/">Commands</a>
+            <a href="../how-it-works/">How it works</a>
+            <a href="./" aria-current="page">Tips &amp; troubleshooting</a>
+          </nav>
+        </div>
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">On this page</p>
+          <nav class="toc-nav" aria-label="On this page">
+            <a href="#agent-workspace">Agent workspace</a>
+            <a href="#credentials">Credentials</a>
+            <a href="#multiple-agents">Concurrent tools</a>
+            <a href="#quick-commands">Quick commands</a>
+            <a href="#host-services">Host services</a>
+            <a href="#resources">Resources</a>
+            <a href="#sudo">Sudo</a>
+            <a href="#project-writes">Protected paths</a>
+            <a href="#inspect-first">Inspect first</a>
+            <a href="#custom-images">Custom images</a>
+            <a href="#troubleshooting">Troubleshooting</a>
+          </nav>
+        </div>
+      </aside>
 
       <article class="doc-content">
         <header class="doc-header">
-          <p class="eyebrow">Field guide</p>
-          <h1>Useful patterns, clear fixes.</h1>
-          <p>Keep agent sessions convenient without blurring boundaries, and diagnose the effective workspace before reaching for destructive cleanup.</p>
+          <p class="eyebrow">Tips &amp; troubleshooting</p>
+          <h1>Tips &amp; troubleshooting.</h1>
+          <p>Practical setups for agents and caches, then the fixes for the problems that come up most often.</p>
         </header>
 
         <section id="agent-workspace">
@@ -46,7 +76,18 @@ codex = { target = "~/.codex" }
 codex = ["codex"]
 check = ["cargo", "test", "--workspace"]</code></pre>
           <p>This layout lets an agent reuse credentials while keeping compiled dependencies specific to one canonical project.</p>
-          <div class="warning"><p>User state is visible to every project that enables the same logical name. Do not put project secrets there merely for convenience.</p></div>
+          <div class="warning"><p>User state is visible to every project that enables the same logical name. Keep project secrets out of it.</p></div>
+        </section>
+
+        <section id="credentials">
+          <h2><a href="#credentials">Pass credentials by name</a></h2>
+          <p>API keys belong in the environment of the terminal that creates the container. Name them in configuration and export the values in that shell:</p>
+          <pre data-copy><code>env_vars = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]</code></pre>
+          <pre data-copy><code>export OPENAI_API_KEY="your-key"
+export ANTHROPIC_API_KEY="your-key"
+silo start</code></pre>
+          <p><code>silo start</code>, the first <code>silo run</code>, and an isolated run capture the allowlist. Later terminals can attach to the running shared container without exporting the variables again. Exporting a new value in those terminals leaves the running container unchanged. <code>silo stop</code> the container and create it again after rotating a key.</p>
+          <p>Write the names into config, and keep the values in the environment. User state such as <code>~/.codex</code> is a separate choice: it shares files with every project that mounts the same name. Use <code>env_vars</code> for API keys, and user state for tool data you intend to reuse. The schema is in <a href="../configuration/#environment">environment configuration</a>.</p>
         </section>
 
         <section id="multiple-agents">
@@ -107,6 +148,7 @@ container.memory = "6G"</code></pre>
           <p>Silo leaves the working tree writable while protecting existing Git and Jujutsu metadata by default. If agents or other tools should modify that metadata, disable the project overlays in the project file:</p>
           <pre data-copy><code>workspace.read_only = []</code></pre>
           <p>Use literal relative paths to protect additional directories, for example <code>workspace.read_only = [".git", ".jj", ".github"]</code>. Missing paths are skipped. A present file, broken symlink, or path that leaves the project is skipped with a warning because Apple container bind mounts require safe directory sources; <code>silo config check</code> reports those warnings and rejects malformed entries.</p>
+          <p>A read-only <code>.git</code> directory does not hide <code>.github</code>. Silo remounts that neighboring directory so it stays visible and writable. The mechanism is in <a href="../concepts/#read-only-boundary">read-only paths</a>.</p>
         </section>
 
         <section id="inspect-first">
@@ -120,7 +162,7 @@ silo state</code></pre>
           <p>Delete runtime containers independently from durable state:</p>
           <pre data-copy><code>silo containers delete my-project
 silo state delete &lt;full-state-id&gt;</code></pre>
-          <div class="warning"><p>Container deletion is recoverable from source and configuration. Managed state deletion removes its data permanently.</p></div>
+          <div class="warning"><p>Deleting managed state removes that data permanently.</p></div>
         </section>
 
         <section id="custom-images">
@@ -143,6 +185,18 @@ artifacts = { source = "./artifacts", target = "./artifacts", access = "read-wri
 
         <section id="troubleshooting">
           <h2><a href="#troubleshooting">Troubleshooting</a></h2>
+
+          <h3 id="container-missing"><a href="#container-missing"><code>container</code> is not on <code>PATH</code></a></h3>
+          <p>Silo runs Apple's <code>container</code> command from <code>PATH</code>. Install it from the <a href="https://github.com/apple/container" target="_blank" rel="noopener noreferrer">container documentation</a>, then open a new terminal. <code>container --version</code> should succeed before <code>silo image build</code>.</p>
+
+          <h3 id="silo-missing"><a href="#silo-missing"><code>silo</code> or <code>cargo</code> is not on <code>PATH</code></a></h3>
+          <p>Open a new terminal after installing Rust or Silo so <code>~/.cargo/bin</code> is on <code>PATH</code>. See the <a href="https://www.rust-lang.org/tools/install" target="_blank" rel="noopener noreferrer">Rust installation guide</a> if Cargo itself is missing.</p>
+
+          <h3 id="image-slow"><a href="#image-slow">The image build is still running</a></h3>
+          <p>The first <code>silo image build</code> installs a full toolchain and can take a long time. Later, <code>silo image update</code> rebuilds only the tool layer.</p>
+
+          <h3 id="stale-container"><a href="#stale-container">A changed setting seems to be ignored</a></h3>
+          <p>The image, mounts, resources, sudo access, host ports, and environment names apply when a container is created. <code>silo containers</code> shows a shared container that is already running. <code>silo stop</code> lets the next <code>silo run</code> or <code>silo start</code> create a new one. Active sessions block a normal stop until they exit. <code>--force</code> terminates them.</p>
 
           <h3 id="image-not-built"><a href="#image-not-built">The selected image is not built yet</a></h3>
           <p>Build the currently configured image:</p>

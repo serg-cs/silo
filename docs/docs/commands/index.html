@@ -3,7 +3,11 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Complete reference for Silo run, start, stop, image, config, container, state, and quick commands.">
+    <meta name="description" content="Complete reference for Silo run, start, stop, image, config, container, state, and quick commands, including output formats.">
+    <meta property="og:title" content="Command reference — Silo">
+    <meta property="og:description" content="Complete reference for Silo run, start, stop, image, config, container, state, and quick commands, including output formats.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://serg-cs.github.io/silo/docs/commands/">
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/commands/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
@@ -28,17 +32,31 @@
     </header>
 
     <main class="docs-layout command-layout" id="main">
-      <aside class="docs-sidebar" aria-label="Command reference navigation">
-        <p class="docs-sidebar-title">Command reference</p>
-        <nav aria-label="Command sections">
-          <a href="#overview">Overview</a>
-          <a href="#run"><code>silo run</code></a>
-          <a href="#image"><code>silo image</code></a>
-          <a href="#config"><code>silo config</code></a>
-          <a href="#containers"><code>silo containers</code></a>
-          <a href="#state"><code>silo state</code></a>
-          <a href="#quick-commands">Quick commands</a>
-        </nav>
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">Documentation</p>
+          <nav aria-label="Documentation sections">
+            <a href="../">Getting started</a>
+            <a href="../concepts/">Concepts</a>
+            <a href="../configuration/">Configuration</a>
+            <a href="./" aria-current="page">Commands</a>
+            <a href="../how-it-works/">How it works</a>
+            <a href="../tips/">Tips &amp; troubleshooting</a>
+          </nav>
+        </div>
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">On this page</p>
+          <nav class="toc-nav" aria-label="On this page">
+            <a href="#overview">Overview</a>
+            <a href="#run"><code>silo run</code></a>
+            <a href="#persistent"><code>silo start</code> / <code>stop</code></a>
+            <a href="#image"><code>silo image</code></a>
+            <a href="#config"><code>silo config</code></a>
+            <a href="#containers"><code>silo containers</code></a>
+            <a href="#state"><code>silo state</code></a>
+            <a href="#quick-commands">Quick commands</a>
+          </nav>
+        </div>
       </aside>
 
       <article class="doc-content command-content">
@@ -51,7 +69,7 @@
         <section id="overview">
           <h2><a href="#overview">Overview</a></h2>
           <p>Run Silo from the project you want to work on. The command name selects a built-in operation; an unrecognized name can select a configured <a href="#quick-commands">quick command</a>.</p>
-          <p>Machine-readable output is available from the explicit <code>config list --json</code>, <code>containers list --json</code>, and <code>state list --json</code> forms. The shorthand commands without <code>list</code> retain their human-readable output.</p>
+          <p><code>silo config</code>, <code>silo containers</code>, and <code>silo state</code> print a readable list. Add <code>list --json</code> when you want JSON. Errors and warnings go to stderr and start with <code>error:</code> or <code>warning:</code>.</p>
           <nav class="command-index" aria-label="Command overview">
             <a href="#run"><code>silo run</code><span>Open a session or run a command.</span></a>
             <a href="#persistent"><code>silo start / stop</code><span>Control a persistent shared container.</span></a>
@@ -92,8 +110,8 @@ silo run -- cargo test --workspace
 silo run --isolated -- ./scripts/check.sh
 silo run --cpus 8 --memory 12G -- cargo build
 silo run --sudo -- apt-get update</code></pre>
-          <div class="note"><p>The separator is required: use <code>silo run -- cargo test</code>, not <code>silo run cargo test</code>.</p></div>
-          <div class="note"><p>CPU, memory, and sudo access are container creation settings. Silo joins an already-running shared container without comparing or applying these overrides. The settings take effect after the container is recreated.</p></div>
+          <div class="note"><p>The separator is required. <code>silo run cargo test</code> is not a command Silo understands.</p></div>
+          <div class="note"><p>CPU, memory, sudo, and <code>env_vars</code> apply when the container is created. Joining one that is already running leaves those settings as they are. Stop it and start again to pick up a change.</p></div>
         </section>
 
         <section id="persistent">
@@ -148,11 +166,11 @@ silo stop</code></pre>
           <h2><a href="#config">Inspect and edit configuration</a></h2>
           <p><code>silo config</code> without a subcommand behaves like <code>silo config list</code>.</p>
           <dl class="command-list">
-            <div><dt><code>silo config list [--json]</code><span>Alias: <code>ls</code></span></dt><dd>Serialize the merged effective configuration as TOML, or as a JSON object with <code>--json</code>.</dd></div>
+            <div><dt><code>silo config list [--json]</code><span>Alias: <code>ls</code></span></dt><dd>Print the merged configuration as TOML, or as JSON with <code>--json</code>. Settings that still match the built-in defaults are left out. The <code>workspace</code> table is always included.</dd></div>
             <div><dt><code>silo config edit</code></dt><dd>Open the active project configuration, or the global file when no project file exists.</dd></div>
             <div><dt><code>silo config edit --global</code></dt><dd>Always open or create the global configuration.</dd></div>
             <div><dt><code>silo config default</code></dt><dd>Print the bundled starter configuration without reading project or filesystem state.</dd></div>
-            <div><dt><code>silo config path</code></dt><dd>Print active configuration sources in precedence order. When no files are active, report the embedded defaults and succeed.</dd></div>
+            <div><dt><code>silo config path</code></dt><dd>Print the active configuration files, global first, then the project file. When neither file exists, report that the built-in defaults are in use.</dd></div>
             <div><dt><code>silo config check</code></dt><dd>Run the full side-effect-free preflight, including custom-image rules and host filesystem resolution.</dd></div>
           </dl>
           <p>Editing uses <code>$VISUAL</code>, then <code>$EDITOR</code>, then <code>vi</code>. Silo reloads and validates the effective configuration after the editor exits; unknown keys are errors.</p>
@@ -170,7 +188,7 @@ silo config check</code></pre>
           <dl class="command-list">
             <div>
               <dt><code>silo containers list [--json]</code><span>Alias: <code>ls</code></span></dt>
-              <dd>List Silo-owned containers with their full ID, lifecycle, state, and canonical project path. <code>--json</code> emits an array of objects with <code>id</code>, <code>type</code>, <code>state</code>, and <code>project</code> fields.</dd>
+              <dd>List Silo-owned containers with their id, shared or isolated type, state, and project path. <code>--json</code> prints the same fields. An empty list says <code>No Silo containers.</code></dd>
             </div>
             <div>
               <dt><code>silo containers delete &lt;selector&gt; [--force]</code><span>Alias: <code>rm</code></span></dt>
@@ -192,7 +210,7 @@ silo containers rm silo-a0b1c2d3e4f5678901234567 --force</code></pre>
           <dl class="command-list">
             <div>
               <dt><code>silo state list [--json]</code><span>Alias: <code>ls</code></span></dt>
-              <dd>List every Silo-managed state directory with its stable ID, scope, logical name, project, and host path. <code>--json</code> emits an array of objects with <code>id</code>, <code>scope</code>, <code>name</code>, <code>project</code>, and <code>source</code> fields; <code>project</code> is <code>null</code> for user state.</dd>
+              <dd>List every Silo-managed state directory with its id, scope, name, project, and host path. User-scoped entries have no project. <code>--json</code> uses <code>null</code> for that field. An empty list says <code>No Silo managed state.</code></dd>
             </div>
             <div>
               <dt><code>silo state delete &lt;selector&gt;</code><span>Alias: <code>rm</code></span></dt>
@@ -219,7 +237,7 @@ agent = ["codex", "--model", "gpt-5"]</code></pre>
 
 silo agent --full-auto
 # Runs codex --model gpt-5 --full-auto</code></pre>
-          <p>Quick names must contain a non-whitespace character, cannot begin with <code>-</code>, and cannot shadow built-in commands such as <code>run</code>, <code>config</code>, or <code>help</code>. Each command array must begin with a non-whitespace executable. Use <code>silo run -- &lt;command&gt;</code> when no shortcut exists.</p>
+          <p>Quick names must contain a non-whitespace character, cannot begin with <code>-</code>, and cannot shadow a built-in command: <code>config</code>, <code>image</code>, <code>run</code>, <code>start</code>, <code>stop</code>, <code>containers</code>, <code>state</code>, or <code>help</code>. Each command array must begin with a non-whitespace executable. Use <code>silo run -- &lt;command&gt;</code> when no shortcut exists. Quick commands use the shared lifecycle, so a running container keeps the environment, resources, and mounts it was created with.</p>
         </section>
       </article>
     </main>

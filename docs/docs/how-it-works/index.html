@@ -3,7 +3,11 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="How Silo discovers projects, identifies containers, coordinates sessions, resolves storage, and provides restricted host ports.">
+    <meta name="description" content="How Silo discovers projects, identifies containers, remaps the host user, forwards environment names, resolves storage, and provides restricted host ports.">
+    <meta property="og:title" content="How it works — Silo">
+    <meta property="og:description" content="How Silo discovers projects, identifies containers, remaps the host user, forwards environment names, resolves storage, and provides restricted host ports.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://serg-cs.github.io/silo/docs/how-it-works/">
     <meta name="theme-color" content="#fcc010">
     <link rel="canonical" href="https://serg-cs.github.io/silo/docs/how-it-works/">
     <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
@@ -21,22 +25,49 @@
     </div></header>
 
     <main class="docs-layout" id="main">
-      <aside class="docs-sidebar" aria-label="Documentation navigation"><p class="docs-sidebar-title">Documentation</p><nav aria-label="Documentation sections">
-        <a href="../">Start here</a><a href="../concepts/">Concepts</a><a href="../configuration/">Configuration</a><a href="./" aria-current="page">How it works</a><a href="../tips/">Tips &amp; troubleshooting</a>
-      </nav></aside>
+      <aside class="docs-sidebar" aria-label="Documentation">
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">Documentation</p>
+          <nav aria-label="Documentation sections">
+            <a href="../">Getting started</a>
+            <a href="../concepts/">Concepts</a>
+            <a href="../configuration/">Configuration</a>
+            <a href="../commands/">Commands</a>
+            <a href="./" aria-current="page">How it works</a>
+            <a href="../tips/">Tips &amp; troubleshooting</a>
+          </nav>
+        </div>
+        <div class="sidebar-group">
+          <p class="docs-sidebar-title">On this page</p>
+          <nav class="toc-nav" aria-label="On this page">
+            <a href="#run-flow">Run flow</a>
+            <a href="#image-contract">Image publication</a>
+            <a href="#identity">Identity</a>
+            <a href="#host-identity">Host user</a>
+            <a href="#environment">Environment</a>
+            <a href="#reuse">Reuse</a>
+            <a href="#shared-lifecycle">Shared lifecycle</a>
+            <a href="#isolated-lifecycle">Isolated lifecycle</a>
+            <a href="#mount-resolution">Mounts</a>
+            <a href="#read-only-overlays">Read-only overlays</a>
+            <a href="#host-ports">Host ports</a>
+            <a href="#runtime-boundary">Runtime boundary</a>
+          </nav>
+        </div>
+      </aside>
 
       <article class="doc-content">
         <header class="doc-header">
           <p class="eyebrow">Under the hood</p>
           <h1>How Silo works.</h1>
-          <p>Silo is a focused host-side coordinator. It delegates virtual machines and OCI images to Apple's runtime while making project identity, concurrent sessions, storage, and host ports deterministic.</p>
+          <p>This page is optional. <a href="../concepts/">Concepts</a>, <a href="../configuration/">configuration</a>, and the <a href="../commands/">command reference</a> cover everyday use. Continue here only if you want the implementation: how a command becomes a session, how images are published, and how mounts and host ports are set up.</p>
         </header>
 
         <section id="run-flow">
           <h2><a href="#run-flow">From command to workspace</a></h2>
           <ol>
             <li><strong>Discover.</strong> Canonicalize the current directory, prefer the nearest <code>.silo.toml</code> marker, otherwise ask Git for its top-level working tree, and silently fall back to the current directory.</li>
-            <li><strong>Configure.</strong> Let <code>config-rs</code> merge global TOML followed by project TOML and fill omitted field defaults, then apply invocation resource flags.</li>
+            <li><strong>Configure.</strong> Merge the global file, then the project file, fill omitted defaults, and apply command flags.</li>
             <li><strong>Validate.</strong> Reject unknown or unreachable entries, then resolve the lifecycle, image contract, binds, managed state, read-only workspace paths, container settings, and host ports.</li>
             <li><strong>Prepare.</strong> Confirm the image/runtime state and establish managed storage and SSH host-port assets where needed.</li>
             <li><strong>Run.</strong> Reuse or create the shared project container, or create a one-shot isolated container, then attach the requested shell or command.</li>
@@ -47,13 +78,10 @@
 
         <section id="image-contract">
           <h2><a href="#image-contract">Image build and publication</a></h2>
-          <p>An image build uses two invocations in one freshly cleared builder. Silo first builds its embedded runtime base with <code>--pull</code> and <code>--no-cache</code>, validates it, and keeps it under a temporary tag. It then composes the same base instructions into the derivative under an internal stage name. The derivative can reuse only the base layers completed during this build lifecycle; Silo does not retain a base cache between builds. The stable base tag is an output for users, never an input sent to a registry resolver.</p>
-          <p>The derivative preserves a deliberate base-and-extras split. Without <code>image.dockerfile</code>, Silo adds its embedded extras workstation and publishes <code>silo:latest</code>. A custom Dockerfile replaces those extras, keeps its containing directory as the build context, and must contain exactly one stage beginning with a literal <code>FROM silo-base:latest</code>. Silo rewrites that instruction to the internal base stage.</p>
-          <p>The base candidate is tagged <code>silo-build:base-staging</code> and the derivative candidate <code>silo-build:staging</code>. Silo starts that candidate through the normal entrypoint and checks the expected user, home, core lifecycle helpers, and supported shells. Both candidates must build and pass their startup checks before either stable tag is updated. A build or startup-check failure therefore leaves both previous images unchanged. Before publication, Silo aliases any existing <code>silo-base:latest</code> and selected derivative to <code>silo-build:obsolete-base</code> and <code>silo-build:obsolete</code>. Apple's image store is keyed by name, so those reclaim tags keep a handle after the stable names move. Silo then publishes the base as <code>silo-base:latest</code>, followed by the selected derivative. These are separate tag updates: if derivative publication fails, Silo reports that the base has already been published. Before deleting a temporary tag, Silo inspects it and verifies that Apple resolved it to the exact staging reference. Reclaim-tag deletion accepts the short reclaim name or Apple's registry-normalized form of it, requires the captured previous digest, and deletes the stored reference. Apple can otherwise resolve an absent name to a published image through its retained build-name annotation. A missing tag, a different resolved name, or a different digest causes Silo to skip deletion. Other inspection or deletion failures are reported; Silo does not silently treat failed cleanup as an absent tag. Silo attempts this cleanup on success and ordinary failures; an interrupted build may leave temporary tags for cleanup before reuse.</p>
-          <p><code>silo image update</code> rebuilds only that selected tool layer on the local <code>silo-base:latest</code> already published by <code>silo image build</code>. It sends the tool Dockerfile with <code>FROM silo-base:latest</code> unchanged, so the local base tag is the parent, and it passes <code>--no-cache</code> without <code>--pull</code>. Silo inspects the local base first and stops when that tag is missing, before a resolver can look for it in a registry. The candidate is still tagged <code>silo-build:staging</code>, smoke-tested, and published only as <code>silo:latest</code> or the configured custom tag. <code>silo-base:latest</code> stays as published, and the user-global builder is left in place. The extras <code>brew install</code> runs again against the formula versions already present in the base: that image sets <code>HOMEBREW_NO_AUTO_UPDATE=1</code>, and the extras Dockerfile does not run <code>brew update</code>. The entrypoint, lifecycle helper, sshd config, Ubuntu packages, and base shells remain those baked into the published base, so a Silo upgrade still requires <code>silo image build</code>. A running container keeps the image it was created from until a later command creates a new one.</p>
-          <p>Silo serializes <code>silo image build</code> and <code>silo image update</code> on one user-global lock because they share Apple's builder and the stable image tags. A full build force-deletes that builder before and after its lifecycle; update does not. No persistent Silo build cache is retained across full builds. Image cleanup after a full build is limited to the reclaim tags for the previous Silo base and derivative that build replaced. Update reclaims only the previous derivative tag. When a running container still references that image, update warns and leaves the reclaim tag in place; the stable tag has already moved.</p>
-          <div class="note"><p>No-cache behavior, reproducible inputs, and builder cleanup are separate concerns. Pinning the upstream base, installer, and package inputs would improve repeatability without adding a cache or changing the base-and-extras design. Builder deletion remains user-global because Apple exposes a single builder; image cleanup does not use <code>container image prune</code>.</p></div>
-          <div class="note"><p>Custom Dockerfiles are trusted project inputs. The smoke test catches obvious incompatibilities; it is not a filesystem policy or a sandbox for root-level build instructions.</p></div>
+          <p><code>silo image build</code> builds the runtime base, checks it, then builds the tool layer on top. With no <code>image.dockerfile</code>, that layer is the default extras image, published as <code>silo:latest</code>. A custom Dockerfile replaces the extras and must be a single stage starting with a literal <code>FROM silo-base:latest</code>. Silo rewrites that line so the name is not sent to a registry.</p>
+          <p>Both images have to build and pass a short startup check before either stable tag moves. A zero exit status means that happened. If publishing the tool image fails after the base tag has already moved, Silo says so and leaves <code>silo-base:latest</code> updated. A running container keeps the image it was created from until the next one is created.</p>
+          <p><code>silo image update</code> rebuilds only the tool layer, using the <code>silo-base:latest</code> already on the machine. It does not refresh the entrypoint or the base packages, so a Silo upgrade still needs <code>silo image build</code>. Update also leaves Apple's builder alone. A full build clears that builder, which is shared with any image work you do directly through <code>container</code>.</p>
+          <div class="note"><p>Builds do not keep a cache, and the same Silo source can produce a different image later because Ubuntu, Homebrew, and the formulae move. A custom Dockerfile is trusted: the startup check looks for the <code>silo</code> user, home, helpers, and shells, and stops there.</p></div>
         </section>
 
         <section id="identity">
@@ -62,6 +90,17 @@
           <p>Silo writes four labels: owner, canonical project root, lifecycle, and a unique instance token. Before it joins, stops, replaces, or deletes a container, it validates those labels against the runtime ID and rejects anything that does not match the selected instance.</p>
           <div class="note"><p>A matching name alone is never sufficient evidence that Silo owns a container or network.</p></div>
           <p>Management commands inventory only unambiguously Silo-owned resources. They report malformed entries as warnings rather than guessing.</p>
+        </section>
+
+        <section id="host-identity">
+          <h2><a href="#host-identity">Host user ids</a></h2>
+          <p>Silo passes its own user and group ids into the container as <code>SILO_UID</code> and <code>SILO_GID</code>. The entrypoint applies them to the <code>silo</code> user before your command starts, which is why new files belong to the Mac account that launched Silo. Names beginning with <code>SILO_</code> are reserved for that handoff. See <a href="../concepts/#ownership">file ownership</a>.</p>
+        </section>
+
+        <section id="environment">
+          <h2><a href="#environment">Environment forwarding</a></h2>
+          <p>Allowlisted names are applied only when a container is created. Silo passes each name as <code>--env NAME</code>, with no <code>NAME=value</code> argument, so the value remains in the environment of the creating process and is read by Apple's runtime. Isolated creation and shared creation use the same allowlist.</p>
+          <p>Attaching to a running shared container uses <code>container exec</code>. That command sets <code>HOME</code> and does not pass the allowlist again, so a later shell cannot refresh names or values. Stopping the container and creating it again reads the environment of the new <code>silo</code> process.</p>
         </section>
 
         <section id="reuse">
@@ -73,11 +112,8 @@
 
         <section id="shared-lifecycle">
           <h2><a href="#shared-lifecycle">Shared session handoff</a></h2>
-          <p>The Silo base runs a small supervisor as PID 1. Before starting an arbitrary user command, the host waits for an explicit guest readiness marker and reserves a session token through a safe helper.</p>
-          <p>The reservation closes a subtle race: without it, the supervisor could decide the container was idle after host inspection but just before the command attached. Only the reservation helper is retried; Silo never replays the user's command automatically.</p>
-          <p>Once attached, a guest wrapper owns the session lease for the command and its children. The supervisor observes reservations and active leases and exits only when both reach zero. This allows shells, tests, and agents to overlap without one process shutting down another's container.</p>
-          <p><code>silo start</code> consumes the same safe reservation into a runtime-only persistence marker. While that marker exists, the supervisor remains alive with no sessions; <code>silo run</code> continues to reserve and attach sessions through the normal path. <code>silo stop</code> uses the guarded stop handshake, or bypasses it with <code>--force</code>.</p>
-          <p>When Silo receives an interrupt, termination, hangup, or quit signal, it forwards the signal to the attached runtime process, waits for cleanup, and restores the host terminal state.</p>
+          <p>The base image runs a small supervisor as PID 1. Before your command starts, Silo reserves a session so the container cannot decide it is idle in the gap between checking and attaching. Only that reservation is retried. Your command is never replayed.</p>
+          <p>The reservation becomes a lease for the command and its children. The supervisor stays up while any lease, or a <code>silo start</code> marker, is present, so one shell can exit without stopping another. <code>silo stop</code> waits for those leases unless you pass <code>--force</code>. An interrupt on the Mac is forwarded to the attached process, and Silo restores your terminal afterward.</p>
         </section>
 
         <section id="isolated-lifecycle">
@@ -95,8 +131,8 @@
 
         <section id="read-only-overlays">
           <h2><a href="#read-only-overlays">Read-only project overlays</a></h2>
-          <p>For each configured relative path, Silo canonicalizes the host directory and mounts it separately at the corresponding path inside the writable project tree. Missing paths and duplicates are skipped. A present file, broken symlink, or symlink that escapes the project is skipped and warned about. Malformed paths fail validation. Only effective directories inside the canonical project root participate in writable-overlap validation.</p>
-          <p>This is a focused guardrail, not a full sandbox policy. Tools can still edit source files, while configuration validation prevents a read-write bind or managed-state mount from replacing protected content or hiding its read-only overlay behind a writable parent.</p>
+          <p>Each usable directory in <code>workspace.read_only</code> is mounted again, read-only, on top of the writable project. Missing paths are skipped. A file or a path that leaves the project is skipped with a warning. A writable bind or state mount may not cover one of these paths or sit on top of it.</p>
+          <p>Apple's filesystem share treats a nested directory as covering neighbors whose names start with its name, so a <code>.git</code> overlay would hide <code>.github</code>. Silo remounts those neighboring directories read-write. Files are left as they are.</p>
         </section>
 
         <section id="host-ports">
