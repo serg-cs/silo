@@ -79,7 +79,7 @@ pub(crate) struct Workspace {
 impl Default for Workspace {
     fn default() -> Self {
         Self {
-            read_only: vec![PathBuf::from(".git")],
+            read_only: vec![PathBuf::from(".git"), PathBuf::from(".jj")],
         }
     }
 }

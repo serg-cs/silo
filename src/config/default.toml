@@ -8,7 +8,7 @@
 # container.sudo = true
 # shell = "zsh"
 # env_vars = ["OPENAI_API_KEY", "AWS_PROFILE"]
-workspace.read_only = [".git"]
+workspace.read_only = [".git", ".jj"]
 
 # https://serg-cs.github.io/silo/docs/configuration/#host-ports
 # host_ports = [5432, 8080]

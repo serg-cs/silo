@@ -104,10 +104,9 @@ container.memory = "6G"</code></pre>
 
         <section id="project-writes">
           <h2><a href="#project-writes">Choose protected paths for the workflow</a></h2>
-          <p>Silo leaves the working tree writable while protecting existing Git metadata by default. If agents or other tools should modify Git metadata, disable the project overlays in the project file:</p>
+          <p>Silo leaves the working tree writable while protecting existing Git and Jujutsu metadata by default. If agents or other tools should modify that metadata, disable the project overlays in the project file:</p>
           <pre data-copy><code>workspace.read_only = []</code></pre>
-          <p>Use literal relative paths to protect additional directories, for example <code>workspace.read_only = [".git", ".github"]</code>. Missing paths are skipped. A present file, broken symlink, or path that leaves the project is skipped with a warning because Apple container bind mounts require safe directory sources; <code>silo config check</code> reports those warnings and rejects malformed entries.</p>
-          <p>Keep <code>.jj</code> writable when using Jujutsu in the container: read commands such as <code>jj status</code> still need metadata locks and can fail against a read-only overlay.</p>
+          <p>Use literal relative paths to protect additional directories, for example <code>workspace.read_only = [".git", ".jj", ".github"]</code>. Missing paths are skipped. A present file, broken symlink, or path that leaves the project is skipped with a warning because Apple container bind mounts require safe directory sources; <code>silo config check</code> reports those warnings and rejects malformed entries.</p>
         </section>
 
         <section id="inspect-first">

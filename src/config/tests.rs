@@ -231,7 +231,7 @@ fn host_ports_render_as_a_sorted_unique_allowlist() {
     assert_eq!(config.host_ports, BTreeSet::from([5432, 8080]));
     assert_eq!(
         toml::to_string_pretty(&config).expect("host ports serialize"),
-        "host_ports = [\n    5432,\n    8080,\n]\n\n[workspace]\nread_only = [\".git\"]\n"
+        "host_ports = [\n    5432,\n    8080,\n]\n\n[workspace]\nread_only = [\n    \".git\",\n    \".jj\",\n]\n"
     );
 }
 
@@ -274,7 +274,10 @@ fn removed_forward_table_is_rejected() {
 fn default_config_serializes_without_empty_tables() {
     let text = toml::to_string_pretty(&Config::default()).expect("default config serializes");
 
-    assert_eq!(text, "[workspace]\nread_only = [\".git\"]\n");
+    assert_eq!(
+        text,
+        "[workspace]\nread_only = [\n    \".git\",\n    \".jj\",\n]\n"
+    );
 }
 
 #[test]
