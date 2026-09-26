@@ -28,17 +28,26 @@ count_live_reservations() {
 case "${1:-}" in
     init)
         trap 'exit 0' HUP INT QUIT TERM
+        exec 9>"$lock"
         attempt=0
         while [ ! -e "$runtime/armed" ]; do
-            if [ "$(count_live_reservations)" -ne 0 ]; then
-                sleep 0.1
-                continue
+            # Count under the lock so a renew cannot retire the only lease
+            # this snapshot can see.
+            if flock --exclusive --nonblock 9; then
+                live=$(count_live_reservations)
+                if [ "$live" -ne 0 ]; then
+                    flock --unlock 9
+                    sleep 0.1
+                    continue
+                fi
+                attempt=$((attempt + 1))
+                if [ "$attempt" -ge 100 ]; then
+                    exit 0
+                fi
+                flock --unlock 9
             fi
-            attempt=$((attempt + 1))
-            [ "$attempt" -lt 100 ] || exit 0
             sleep 0.1
         done
-        exec 9>"$lock"
         while :; do
             if [ -e "$persistent" ]; then
                 sleep 0.1
@@ -54,14 +63,34 @@ case "${1:-}" in
         done
         ;;
     reserve)
-        [ "$#" -eq 1 ] || exit 64
+        [ "$#" -eq 1 ] || [ "$#" -eq 2 ] || exit 64
+        previous=${2:-}
+        case "$previous" in
+            *[!0-9A-Za-z]*) exit 64 ;;
+        esac
         temporary=$(mktemp "$reservations/.pending.XXXXXX")
         token=${temporary##*.pending.}
+        # 30s lease. The host renews after 20s while an address is still missing.
         printf '%s\n' "$(($(date +%s) + 30))" > "$temporary"
+        # Publish the new lease first, then drop the previous one while init
+        # cannot be counting.
         mv -f "$temporary" "$reservations/$token"
-        printf '%s\n' "$token"
         exec 9>"$lock"
         flock --shared 9
+        if [ -n "$previous" ]; then
+            rm -f "$reservations/$previous"
+        fi
+        printf '%s\n' "$token"
+        ;;
+    release)
+        [ "$#" -eq 2 ] || exit 64
+        token=$2
+        case "$token" in
+            *[!0-9A-Za-z]*|'') exit 64 ;;
+        esac
+        # A joined session holds the lock until its command exits. Deleting
+        # this token must not wait for that.
+        rm -f "$reservations/$token"
         ;;
     session)
         [ "$#" -ge 3 ] || exit 64
@@ -104,7 +133,7 @@ case "${1:-}" in
         cat >/dev/null
         ;;
     *)
-        echo 'usage: silo-lifecycle {init|reserve|session|persist|stop-guard}' >&2
+        echo 'usage: silo-lifecycle {init|reserve|session|persist|stop-guard|release}' >&2
         exit 64
         ;;
 esac

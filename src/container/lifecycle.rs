@@ -3,11 +3,12 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal;
+use std::net::Ipv4Addr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
@@ -263,6 +264,15 @@ pub(crate) fn start_shared_container(config: &Config, project: &Project) -> Resu
     }
 }
 
+/// Guest `reserve` writes a 30s lease (`silo-lifecycle.sh`). Renew while an
+/// address is still missing, with time left before that lease ends.
+const RESERVATION_RENEW_AFTER: Duration = Duration::from_secs(20);
+/// `ssh -o ConnectTimeout` is 10s, and the session still has to consume the token.
+/// Refresh a lease that no longer covers both.
+const RESERVATION_HANDOFF_AFTER: Duration = Duration::from_secs(10);
+/// Guest init leaves about ten seconds after the last lease disappears.
+const RESERVATION_IDLE_EXIT: Duration = Duration::from_secs(15);
+
 /// Ensures a shared container and protects it with a reservation through handoff.
 fn prepare_shared_handoff(config: &Config, project: &Project, deadline: Instant) -> Result<String> {
     loop {
@@ -273,33 +283,31 @@ fn prepare_shared_handoff(config: &Config, project: &Project, deadline: Instant)
             ));
         }
         let tunnel = ensure_shared_container(project, config)?;
-        let requires_address = tunnel.is_some();
-        let Some(inspection) = wait_for_guest_ready(project, requires_address)? else {
+        // Init exits about ten seconds after readiness unless a reservation
+        // exists. Reserve before waiting for an address: that address can
+        // arrive after the idle exit, and `--rm` would then delete the container.
+        let Some(inspection) = wait_for_guest_ready(project)? else {
             continue;
         };
-        let Some(reservation) = reserve_shared_session(project)? else {
+        let Some(mut reservation) = reserve_shared_session(project, None)? else {
             continue;
         };
         // Only the creator owns prepared host-port assets; joins leave the
         // running instance unchanged. The reservation protects this setup.
         if let Some(tunnel) = tunnel {
-            let address = inspection.ipv4_address.ok_or_else(|| {
-                anyhow!(
-                    "container `{}` did not expose an IPv4 address for host ports",
-                    project.id
-                )
-            })?;
+            let Some(address) =
+                wait_for_guest_address(project, &mut reservation, inspection.ipv4_address)?
+            else {
+                continue;
+            };
             tunnel.ensure(address)?;
         }
         return Ok(reservation);
     }
 }
 
-/// Waits until the shared container reports readiness and its inspection is usable.
-fn wait_for_guest_ready(
-    project: &Project,
-    require_address: bool,
-) -> Result<Option<ContainerInspection>> {
+/// Waits until the shared container publishes guest readiness.
+fn wait_for_guest_ready(project: &Project) -> Result<Option<ContainerInspection>> {
     let deadline = Instant::now() + GUEST_READY_TIMEOUT;
     loop {
         let output = guest_ready_command(project).output().map_err(spawn_error)?;
@@ -313,16 +321,154 @@ fn wait_for_guest_ready(
                 return Ok(None);
             }
         }
-        if output.status.success() && (!require_address || inspection.ipv4_address.is_some()) {
+        if output.status.success() {
             return Ok(Some(inspection));
         }
         if Instant::now() >= deadline {
             return Err(anyhow!(
-                "container `{}` did not publish guest readiness and networking within {} seconds: {}",
+                "container `{}` did not publish guest readiness within {} seconds: {}",
                 project.id,
                 GUEST_READY_TIMEOUT.as_secs(),
                 stderr
             ));
+        }
+        thread::sleep(CONFLICT_RETRY_INTERVAL);
+    }
+}
+
+/// Waits until the container has an IPv4 address.
+///
+/// Renews `reservation` while the address is missing, and again before return
+/// when the remaining lease cannot cover tunnel setup and handoff. A timeout
+/// does not take another lease. `current` is used when readiness already
+/// observed an address. A missing container asks the caller to retry handoff.
+fn wait_for_guest_address(
+    project: &Project,
+    reservation: &mut String,
+    current: Option<Ipv4Addr>,
+) -> Result<Option<Ipv4Addr>> {
+    if let Some(address) = current {
+        return Ok(Some(address));
+    }
+    // Any exit except a handed-off address drops the lease. Otherwise a retry
+    // joins this container and never opens the tunnel.
+    let mut lease = LeaseGuard::new(project, reservation);
+    let deadline = Instant::now() + GUEST_READY_TIMEOUT;
+    let mut leased_at = Instant::now();
+    loop {
+        let Some(inspection) = inspect_container(&project.id)? else {
+            return Ok(None);
+        };
+        match inspection.state {
+            ContainerState::Running => validate_shared_ownership(&inspection, project)?,
+            ContainerState::Stopped | ContainerState::Stopping => {
+                return Ok(None);
+            }
+        }
+        if let Some(address) = inspection.ipv4_address {
+            if leased_at.elapsed() >= RESERVATION_HANDOFF_AFTER
+                && !renew_for_lease(project, reservation, &mut leased_at, &mut lease)?
+            {
+                return Ok(None);
+            }
+            lease.keep();
+            return Ok(Some(address));
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "container `{}` did not expose an IPv4 address for host ports within {} seconds",
+                project.id,
+                GUEST_READY_TIMEOUT.as_secs(),
+            ));
+        }
+        if leased_at.elapsed() >= RESERVATION_RENEW_AFTER
+            && !renew_for_lease(project, reservation, &mut leased_at, &mut lease)?
+        {
+            return Ok(None);
+        }
+        thread::sleep(CONFLICT_RETRY_INTERVAL);
+    }
+}
+
+/// Renews the guest lease and remembers the token that must be released on failure.
+fn renew_for_lease(
+    project: &Project,
+    reservation: &mut String,
+    leased_at: &mut Instant,
+    lease: &mut LeaseGuard<'_>,
+) -> Result<bool> {
+    if !renew_shared_reservation(project, reservation, leased_at)? {
+        return Ok(false);
+    }
+    lease.note(reservation);
+    Ok(true)
+}
+
+/// Replaces `reservation` with a new guest lease.
+///
+/// `false` means the container disappeared and the caller should retry handoff.
+fn renew_shared_reservation(
+    project: &Project,
+    reservation: &mut String,
+    leased_at: &mut Instant,
+) -> Result<bool> {
+    match reserve_shared_session(project, Some(reservation))? {
+        Some(renewed) => {
+            *reservation = renewed;
+            *leased_at = Instant::now();
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Drops the lease on failure so a retry does not join a container with no tunnel.
+struct LeaseGuard<'a> {
+    project: &'a Project,
+    token: String,
+    keep: bool,
+}
+
+impl<'a> LeaseGuard<'a> {
+    fn new(project: &'a Project, reservation: &str) -> Self {
+        Self {
+            project,
+            token: reservation.to_string(),
+            keep: false,
+        }
+    }
+
+    fn note(&mut self, reservation: &str) {
+        self.token = reservation.to_string();
+    }
+
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for LeaseGuard<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            release_reservation(self.project, &self.token);
+        }
+    }
+}
+
+/// Removes this attempt's lease and waits for the idle exit that follows.
+fn release_reservation(project: &Project, reservation: &str) {
+    // Failure here still leaves the wait: the container may be running.
+    let _ = release_reservation_command(project, reservation).output();
+    let deadline = Instant::now() + RESERVATION_IDLE_EXIT;
+    loop {
+        if let Ok(inspection) = inspect_container(&project.id) {
+            match inspection.as_ref().map(|inspection| inspection.state) {
+                None | Some(ContainerState::Stopped | ContainerState::Stopping) => return,
+                Some(ContainerState::Running) => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return;
         }
         thread::sleep(CONFLICT_RETRY_INTERVAL);
     }
@@ -340,10 +486,10 @@ fn guest_ready_command(project: &Project) -> Command {
 /// Establishes a transient guest-side reservation before the user command is
 /// submitted. If PID 1 wins the idle race, only this safe helper is retried;
 /// the arbitrary user command is never replayed.
-fn reserve_shared_session(project: &Project) -> Result<Option<String>> {
+fn reserve_shared_session(project: &Project, previous: Option<&str>) -> Result<Option<String>> {
     let deadline = Instant::now() + CONFLICT_RETRY_TIMEOUT;
     loop {
-        let output = session_reserve_command(project)
+        let output = session_reserve_command(project, previous)
             .output()
             .map_err(spawn_error)?;
         if output.status.success() {
@@ -379,13 +525,27 @@ fn reserve_shared_session(project: &Project) -> Result<Option<String>> {
     }
 }
 
-pub(super) fn session_reserve_command(project: &Project) -> Command {
+pub(super) fn session_reserve_command(project: &Project, previous: Option<&str>) -> Command {
     let mut command = Command::new(CONTAINER_BIN);
     command
         .args(["exec", "--user", "silo"])
         .arg(&project.id)
         .arg(LIFECYCLE_COMMAND)
         .arg("reserve");
+    if let Some(previous) = previous {
+        command.arg(previous);
+    }
+    command
+}
+
+fn release_reservation_command(project: &Project, reservation: &str) -> Command {
+    let mut command = Command::new(CONTAINER_BIN);
+    command
+        .args(["exec", "--user", "silo"])
+        .arg(&project.id)
+        .arg(LIFECYCLE_COMMAND)
+        .arg("release")
+        .arg(reservation);
     command
 }
 

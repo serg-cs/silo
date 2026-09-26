@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -168,6 +169,114 @@ fn guest_lifecycle_persistence_keeps_an_idle_container_running() {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guest_reserve_replaces_the_previous_token() {
+    let dir = test_dir("guest-renew");
+    let runtime = dir.path().join("runtime");
+    let reservations = runtime.join("reservations");
+    let script = dir.path().join("silo-lifecycle");
+    fs::write(&script, LIFECYCLE).expect("lifecycle script writes");
+    fs::create_dir_all(&reservations).expect("reservation directory creates");
+
+    let first = Command::new("sh")
+        .arg(&script)
+        .arg("reserve")
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("first reservation runs");
+    assert!(first.status.success());
+    let previous = String::from_utf8(first.stdout)
+        .expect("token is UTF-8")
+        .trim()
+        .to_string();
+    assert!(reservations.join(&previous).is_file());
+
+    let renewed = Command::new("sh")
+        .arg(&script)
+        .args(["reserve", &previous])
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("renewed reservation runs");
+    assert!(renewed.status.success());
+    let current = String::from_utf8(renewed.stdout)
+        .expect("token is UTF-8")
+        .trim()
+        .to_string();
+    assert_ne!(current, previous);
+    assert!(!reservations.join(&previous).exists());
+    assert!(reservations.join(&current).is_file());
+
+    let released = Command::new("sh")
+        .arg(&script)
+        .args(["release", &current])
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("release runs");
+    assert!(released.status.success());
+    assert!(!reservations.join(&current).exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guest_release_does_not_wait_for_a_joined_session() {
+    let dir = test_dir("guest-release-during-session");
+    let runtime = dir.path().join("runtime");
+    let reservations = runtime.join("reservations");
+    let script = dir.path().join("silo-lifecycle");
+    fs::write(&script, LIFECYCLE).expect("lifecycle script writes");
+    fs::create_dir_all(&reservations).expect("reservation directory creates");
+
+    let session_token = reserve_token(&script, &runtime);
+    let held = runtime.join("held");
+    let release_flag = runtime.join("release-session");
+    let mut session = Command::new("sh")
+        .arg(&script)
+        .args(["session", &session_token, "sh", "-c"])
+        .arg("touch \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done")
+        .arg("session")
+        .arg(&held)
+        .arg(&release_flag)
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .spawn()
+        .expect("session starts");
+    let ready = Instant::now() + Duration::from_secs(2);
+    while !held.exists() {
+        assert!(Instant::now() < ready, "session did not take the lock");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let creator = reserve_token(&script, &runtime);
+    let started = Instant::now();
+    let released = Command::new("sh")
+        .arg(&script)
+        .args(["release", &creator])
+        .env("SILO_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("release runs");
+    assert!(released.status.success());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(!reservations.join(&creator).exists());
+
+    fs::write(&release_flag, "").expect("session releases");
+    let _ = session.wait();
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_token(script: &Path, runtime: &Path) -> String {
+    let reservation = Command::new("sh")
+        .arg(script)
+        .arg("reserve")
+        .env("SILO_RUNTIME_DIR", runtime)
+        .output()
+        .expect("reservation runs");
+    assert!(reservation.status.success());
+    String::from_utf8(reservation.stdout)
+        .expect("token is UTF-8")
+        .trim()
+        .to_string()
 }
 
 #[cfg(target_os = "linux")]

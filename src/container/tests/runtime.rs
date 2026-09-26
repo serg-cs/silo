@@ -192,7 +192,7 @@ fn isolated_cleanup_deletes_only_the_current_instance() {
 #[test]
 fn session_commands_use_the_consolidated_guest_lifecycle() {
     let project = test_project("/tmp/project");
-    let reserve = session_reserve_command(&project);
+    let reserve = session_reserve_command(&project, None);
     let reserve_args: Vec<&str> = reserve
         .get_args()
         .map(|argument| argument.to_str().expect("argument is UTF-8"))
