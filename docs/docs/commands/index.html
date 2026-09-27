@@ -109,7 +109,7 @@ silo --version</code></pre>
 silo run -- cargo test --workspace
 silo run --isolated -- ./scripts/check.sh
 silo run --cpus 8 --memory 12G -- cargo build
-silo run --sudo -- apt-get update</code></pre>
+silo run --sudo -- sudo apt-get update</code></pre>
           <div class="note"><p>The separator is required. <code>silo run cargo test</code> is not a command Silo understands.</p></div>
           <div class="note"><p>CPU, memory, sudo, and <code>env_vars</code> apply when the container is created. Joining one that is already running leaves those settings as they are. Stop it and start again to pick up a change.</p></div>
         </section>

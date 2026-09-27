@@ -48,6 +48,7 @@
             <a href="#environment">Environment</a>
             <a href="#read-only-boundary">Read-only paths</a>
             <a href="#custom-images">Custom images</a>
+            <a href="#boundary">What Silo isolates</a>
           </nav>
         </div>
       </aside>
@@ -141,6 +142,27 @@ RUN brew install go
 USER root</code></pre>
           <p>The Dockerfile needs exactly one stage, and that <code>FROM</code> line has to be literal. Silo rewrites it so the name is not looked up in a registry. The file's directory is the build context. Because this replaces the extras layer, reinstall Codex, Claude Code, or anything else from the default image that you still want.</p>
           <div class="warning"><p>A custom Dockerfile is trusted. Keep the <code>silo</code> user, entrypoint, and shells working. Silo checks those on startup and leaves the rest to you.</p></div>
+        </section>
+
+        <section id="boundary">
+          <h2><a href="#boundary">What Silo isolates, and what it doesn't</a></h2>
+          <p>Silo decides what reaches the container from your Mac. It does not restrict what a tool does with that access, so it is not a sandbox for code you would not otherwise run.</p>
+          <p>Kept out of the container unless you configure it:</p>
+          <ul>
+            <li>Mac files outside the project, other than binds and managed state.</li>
+            <li>Host environment variables not named in <code>env_vars</code>.</li>
+            <li>Services on the Mac's loopback interface, other than <code>host_ports</code>.</li>
+            <li>Other projects' containers and project state.</li>
+          </ul>
+          <p>Available to every process in the container:</p>
+          <ul>
+            <li>The whole project, writable, except <code>workspace.read_only</code> paths.</li>
+            <li>Read-write binds and all managed state. User state is shared with every project that mounts the same name.</li>
+            <li>The values of forwarded environment variables, including API keys.</li>
+            <li>The network. Outbound internet access is not restricted.</li>
+            <li>Root inside the container when sudo is enabled.</li>
+            <li>In shared mode, the processes and temporary files of every other session in the same container.</li>
+          </ul>
         </section>
 
         <nav class="page-links" aria-label="Adjacent documentation pages">

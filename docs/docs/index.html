@@ -68,7 +68,7 @@
           <h2><a href="#requirements">Requirements</a></h2>
           <p>An Apple silicon Mac running macOS 26 or later, with:</p>
           <ul>
-            <li><a href="https://github.com/apple/container" target="_blank" rel="noopener noreferrer">Apple container</a></li>
+            <li><a href="https://github.com/apple/container" target="_blank" rel="noopener noreferrer">Apple container</a> 1.0.0 or later</li>
             <li><a href="https://www.rust-lang.org/tools/install" target="_blank" rel="noopener noreferrer">Rust</a> 1.91 or newer, with Cargo</li>
           </ul>
           <p>Silo starts the container service when a command needs it.</p>
@@ -108,7 +108,12 @@ silo image build</code></pre>
         <section id="uninstall">
           <h2><a href="#uninstall">Uninstall</a></h2>
           <pre data-copy><code>cargo uninstall silo</code></pre>
-          <p>That removes the binary. Images, containers, and saved state stay behind. Clear containers and state with <code>silo containers</code> and <code>silo state</code> before uninstalling if you want them gone. Where that state lives is described in <a href="./concepts/#state">state</a>.</p>
+          <p>That removes the binary. Images, containers, configuration, and saved state stay behind. To remove them too, do this before uninstalling:</p>
+          <pre data-copy><code>silo containers                  # delete each with: silo containers delete &lt;id&gt; --force
+container image list             # Silo images are silo-base:latest, silo:latest, and silo:custom-…
+container image delete silo:latest silo-base:latest
+rm -rf ~/.config/silo ~/.local/state/silo</code></pre>
+          <p>The last line deletes all managed state along with the configuration. If you set <code>XDG_CONFIG_HOME</code> or <code>XDG_STATE_HOME</code>, remove <code>silo</code> under those directories instead. Where state lives is described in <a href="./concepts/#state">state</a>.</p>
         </section>
 
         <nav class="page-links page-links-next" aria-label="Next documentation page">

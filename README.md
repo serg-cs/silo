@@ -18,7 +18,7 @@ Silo gives each project a clean container workspace without making every session
 
 ## Quick start
 
-Silo requires an Apple silicon Mac running macOS 26 or later, [Apple container](https://github.com/apple/container), and [Rust](https://www.rust-lang.org/tools/install) 1.91 or newer. [Getting started](https://serg-cs.github.io/silo/docs/) covers the image build and the first workspace.
+Silo requires an Apple silicon Mac running macOS 26 or later, [Apple container](https://github.com/apple/container) 1.0.0 or later, and [Rust](https://www.rust-lang.org/tools/install) 1.91 or newer. [Getting started](https://serg-cs.github.io/silo/docs/) covers the image build and the first workspace.
 
 ```sh
 cargo install --git https://github.com/serg-cs/silo --locked
@@ -27,12 +27,8 @@ silo image build
 silo run
 ```
 
-Run `silo image build` again after upgrading Silo so the local runtime matches
-the installed binary. `silo image update` rebuilds the tool layer on the base
-already published; an upgraded Silo still needs a full build so the entrypoint,
-lifecycle helper, and sshd config match the installed binary.
-
-The [documentation](https://serg-cs.github.io/silo/docs/) is the manual: getting started, concepts, the TOML schema, every command, and troubleshooting.
+Run `silo image build` again after upgrading Silo so the image matches the
+installed binary.
 
 ## License
 

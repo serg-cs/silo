@@ -139,7 +139,7 @@ container.memory = "6G"</code></pre>
         <section id="sudo">
           <h2><a href="#sudo">Enable elevation deliberately</a></h2>
           <p>The Silo base keeps sudo access disabled by default. Enable it persistently for a project with <code>container.sudo = true</code>, or opt in for one invocation:</p>
-          <pre data-copy><code>silo run --sudo -- apt-get update</code></pre>
+          <pre data-copy><code>silo run --sudo -- sudo apt-get update</code></pre>
           <p>Sudo is a container creation setting. In shared mode, concurrent sessions use the same <code>silo</code> user and therefore share the access selected when the container was created. A changed setting applies after recreation. Use <code>--isolated --sudo</code> when elevation must be confined to a one-shot container. The policy applies equally to default and custom derivatives.</p>
         </section>
 
