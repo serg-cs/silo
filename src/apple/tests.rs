@@ -53,12 +53,21 @@ fn inspection_requires_complete_current_mount_inventory() {
 
     let missing_source = inspection_json("silo-test", "running", r#"[{"destination":"/cache"}]"#);
     assert!(parse_container_inspection(missing_source.as_bytes(), "silo-test").is_err());
+}
 
-    let empty_source = inspection_json("silo-test", "running", r#"[{"source":""}]"#);
-    let error = parse_container_inspection(empty_source.as_bytes(), "silo-test")
-        .expect_err("empty mount sources fail closed")
-        .to_string();
-    assert!(error.contains("without a source"), "{error}");
+#[test]
+fn inspection_drops_mounts_without_a_host_source() {
+    let json = inspection_json(
+        "buildkit",
+        "running",
+        r#"[
+            {"destination":"/run","options":[],"source":"","type":{"tmpfs":{}}},
+            {"destination":"/exports","options":[],"source":"/builder/","type":{"virtiofs":{}}}
+        ]"#,
+    );
+    let parsed = parse_container_inspection(json.as_bytes(), "buildkit")
+        .expect("mounts without a host source parse");
+    assert_eq!(parsed.mount_sources, [PathBuf::from("/builder/")]);
 }
 
 #[test]

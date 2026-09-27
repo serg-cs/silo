@@ -225,14 +225,11 @@ fn parse_container_inspection(stdout: &[u8], id: &str) -> Result<ContainerInspec
         .configuration
         .mounts
         .into_iter()
-        .map(|mount| {
-            ensure!(
-                !mount.source.is_empty(),
-                "container inspect returned a mount without a source for `{id}`"
-            );
-            Ok(PathBuf::from(mount.source))
-        })
-        .collect::<Result<_>>()?;
+        // In-VM mounts such as tmpfs have no host path, so they can never
+        // reference managed state.
+        .filter(|mount| !mount.source.is_empty())
+        .map(|mount| PathBuf::from(mount.source))
+        .collect();
     Ok(ContainerInspection {
         state,
         ipv4_address,
