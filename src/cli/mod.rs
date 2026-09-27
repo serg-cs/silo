@@ -95,8 +95,6 @@ pub(crate) enum ConfigCommand {
         #[arg(long)]
         global: bool,
     },
-    /// Print the bundled starter configuration.
-    Default,
     /// Print the active configuration file paths in precedence order.
     Path,
     /// Validate the effective configuration for the current project.

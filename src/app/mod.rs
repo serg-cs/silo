@@ -127,7 +127,6 @@ fn run_config_command(command: Option<&ConfigCommand>) -> anyhow::Result<ExitCod
             validate_config(&config, &project_root, ValidationProfile::Check)?;
             config_command::print_valid()
         }
-        Some(ConfigCommand::Default) => config_command::print_default(),
     }
 }
 

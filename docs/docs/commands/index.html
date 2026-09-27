@@ -169,7 +169,6 @@ silo stop</code></pre>
             <div><dt><code>silo config list [--json]</code><span>Alias: <code>ls</code></span></dt><dd>Print the merged configuration as TOML, or as JSON with <code>--json</code>. Settings that still match the built-in defaults are left out. The <code>workspace</code> table is always included.</dd></div>
             <div><dt><code>silo config edit</code></dt><dd>Open the active project configuration, or the global file when no project file exists.</dd></div>
             <div><dt><code>silo config edit --global</code></dt><dd>Always open or create the global configuration.</dd></div>
-            <div><dt><code>silo config default</code></dt><dd>Print the bundled starter configuration without reading project or filesystem state.</dd></div>
             <div><dt><code>silo config path</code></dt><dd>Print the active configuration files, global first, then the project file. When neither file exists, report that the built-in defaults are in use.</dd></div>
             <div><dt><code>silo config check</code></dt><dd>Run the full side-effect-free preflight, including custom-image rules and host filesystem resolution.</dd></div>
           </dl>

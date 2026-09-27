@@ -21,12 +21,6 @@ pub(super) fn print_effective(config: &Config, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Prints the embedded starter config without consulting filesystem state.
-pub(super) fn print_default() -> Result<ExitCode> {
-    write_stdout(DEFAULT_CONFIG)?;
-    Ok(ExitCode::SUCCESS)
-}
-
 /// Reports a successful validation after all loader warnings have been
 /// emitted.
 pub(super) fn print_valid() -> Result<ExitCode> {

@@ -69,12 +69,6 @@ fn json_is_restricted_to_explicit_list_commands() {
 #[test]
 fn config_parses_management_subcommands() {
     assert!(matches!(
-        parse(&["silo", "config", "default"]),
-        Command::Config {
-            command: Some(ConfigCommand::Default)
-        }
-    ));
-    assert!(matches!(
         parse(&["silo", "config", "path"]),
         Command::Config {
             command: Some(ConfigCommand::Path)
