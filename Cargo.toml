@@ -2,9 +2,7 @@
 name = "silo"
 version = "0.1.0"
 authors = ["Sergio Castaño Sánchez"]
-description = "Project-scoped Linux workspaces for coding agents and developer tools on macOS"
 edition = "2024"
-rust-version = "1.91"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/serg-cs/silo"
@@ -13,14 +11,3 @@ repository = "https://github.com/serg-cs/silo"
 pedantic = "deny"
 
 [dependencies]
-anyhow = "1"
-base64 = "0.23.1"
-clap = { version = "4.6.6", features = ["derive"] }
-config = { version = "0.15.25", default-features = false, features = ["toml"] }
-libc = "0.2"
-parse-dockerfile = { version = "0.1.8", default-features = false }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.11"
-tempfile = "3"
-toml = "1.1.4"
